@@ -7,22 +7,7 @@
 #include "../memory/vm.h"
 #include "../ppu/ppu_memory.h"
 #include <string.h>
-#include <stdio.h>
-#include <stdlib.h>
 
-/* Cond-layer trace (env YZ_COND_TRACE, 2026-07-02 diag — the CRI boot-stall
- * hunt): logs waits/signals on low-id conds (the CRI dialog/vsync/mixer set)
- * with the guest tid + the associated mutex owner at call time, and flags any
- * signal that BLOCKS acquiring the mutex CS. Real lv2 sys_cond_signal never
- * blocks on the mutex, so every BLOCKED-ON line names a hold-and-wait pair
- * our signal-under-CS emulation introduced. REMOVE when the stall closes. */
-static int cond_trace_on(void)
-{
-    static int on = -1;
-    if (on < 0) { const char* e = getenv("YZ_COND_TRACE"); on = (e && *e) ? 1 : 0; }
-    return on;
-}
-extern uint32_t yz_thread_current_id(void);
 
 /* ---------------------------------------------------------------------------
  * Globals
@@ -68,7 +53,7 @@ static void write_be32(uint32_t addr, uint32_t val)
     *p = val;
 }
 
-/* Committed-waiter tid registry (item-K fix 1, see sys_cond.h). All three
+/* Committed-waiter tid registry (see sys_cond.h). All three
  * helpers require the cond's sig lock to be held by the caller. */
 static void cond_waiter_add(sys_cond_info* c, uint64_t tid)
 {
@@ -98,13 +83,12 @@ static int cond_waiter_present(const sys_cond_info* c, uint64_t tid)
  *
  * r3 = pointer to receive cond ID (u32*)
  * r4 = mutex_id to associate with
- * r5 = pointer to attribute struct
+ * r5 = pointer to attribute struct (not read)
  * -----------------------------------------------------------------------*/
 int64_t sys_cond_create(ppu_context* ctx)
 {
     uint32_t id_out_addr = LV2_ARG_PTR(ctx, 0);
     uint32_t mutex_id    = LV2_ARG_U32(ctx, 1);
-    uint32_t attr_addr   = LV2_ARG_PTR(ctx, 2);
 
     /* Validate the associated mutex */
     if (mutex_id == 0 || mutex_id > SYS_MUTEX_MAX)
@@ -126,8 +110,7 @@ int64_t sys_cond_create(ppu_context* ctx)
     sys_cond_info* c = &g_sys_conds[slot];
 #ifdef _WIN32
     /* preserve the internal sig lock across slot recycling (a CS must never
-     * be re-Initialized while potentially referenced; churn-safety per the
-     * lwcond slots) */
+     * be re-Initialized while potentially referenced) */
     int sig_was_init = c->sig_cs_init;
     CRITICAL_SECTION sig_saved = c->sig_cs;
 #else
@@ -145,18 +128,10 @@ int64_t sys_cond_create(ppu_context* ctx)
     c->active   = 1;
     c->mutex_id = mutex_id;
 
-    /* item-K fix 6 support: count this cond against its mutex so
-     * sys_mutex_destroy can return the documented EPERM while associated
-     * conds exist (Lv2 Reference p.173). Serialized against other cond
+    /* Count this cond against its mutex so sys_mutex_destroy can return EPERM
+     * while associated conds exist. Serialized against other cond
      * create/destroy by the cond table lock held here. */
     g_sys_mutexes[mutex_id - 1].cond_count++;
-
-    /* Read name from attribute if provided */
-    if (attr_addr != 0) {
-        uint8_t* attr_raw = (uint8_t*)vm_to_host(attr_addr);
-        /* name is typically at offset 8 in the cond attr struct */
-        memcpy(c->name, attr_raw + 8, 8);
-    }
 
 #ifdef _WIN32
     InitializeConditionVariable(&c->cv);
@@ -193,11 +168,10 @@ int64_t sys_cond_destroy(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_ESRCH;
     }
 
-    /* Lv2 Reference p.181: EBUSY when a PPU thread is waiting on this cond.
-     * Destroying anyway strands the parked waiter forever, and the slot's
-     * later recycling lets the stale waiter drive the new cond's
-     * committed/pending counters negative (2026-08-04 doc-conformance
-     * audit) -- after which every signal on the recycled cond is dropped. */
+    /* EBUSY when a PPU thread is waiting on this cond. Destroying anyway
+     * strands the parked waiter forever, and the slot's later recycling lets
+     * the stale waiter drive the new cond's committed/pending counters
+     * negative, after which every signal on the recycled cond is dropped. */
     if (c->committed > 0) {
         cond_table_unlock();
         return (int64_t)(int32_t)CELL_EBUSY;
@@ -208,9 +182,9 @@ int64_t sys_cond_destroy(ppu_context* ctx)
 #endif
     /* Windows CONDITION_VARIABLE doesn't need destruction */
 
-    /* item-K fix 6 support: release this cond's claim on its mutex (see
-     * sys_cond_create). Guarded against a mutex slot that was itself already
-     * destroyed/recycled out from under us. */
+    /* Release this cond's claim on its mutex (see sys_cond_create). Guarded
+     * against a mutex slot that was itself already destroyed/recycled out
+     * from under us. */
     if (c->mutex_id >= 1 && c->mutex_id <= SYS_MUTEX_MAX) {
         sys_mutex_info* m = &g_sys_mutexes[c->mutex_id - 1];
         if (m->active && m->cond_count > 0)
@@ -233,8 +207,8 @@ int64_t sys_cond_wait(ppu_context* ctx)
     uint32_t cond_id    = LV2_ARG_U32(ctx, 0);
     uint64_t timeout_us = LV2_ARG_U64(ctx, 1);
 
-    /* Batch fixes item 8: clamp the guest timeout to 48 bits so the QPC
-     * deadline multiply / ms-DWORD conversion below can't overflow. */
+    /* Cap very large guest timeouts so the microsecond-to-millisecond and
+     * timespec conversions below stay in range. */
     if (timeout_us > ((1ull << 48) - 1)) timeout_us = (1ull << 48) - 1;
 
     if (cond_id == 0 || cond_id > SYS_COND_MAX)
@@ -252,11 +226,10 @@ int64_t sys_cond_wait(ppu_context* ctx)
     if (!m->active)
         return (int64_t)(int32_t)CELL_ESRCH;
 
-    /* Audit item 1c (2026-07-03, user-confirmed; RPCS3 sys_cond.cpp:416-419,
-     * 479-481): the caller must currently own the associated mutex. lv2
-     * returns CELL_EPERM otherwise instead of touching the mutex/CS state --
-     * a non-owner caller releasing/re-acquiring a CS it never entered is UB
-     * on Win32 and corrupts whatever the real owner had saved. */
+    /* The caller must currently own the associated mutex. lv2 returns
+     * CELL_EPERM otherwise instead of touching the mutex/CS state: a
+     * non-owner caller releasing/re-acquiring a CS it never entered is UB on
+     * Win32 and corrupts whatever the real owner had saved. */
     uint64_t caller_tid = ctx->thread_id;
     if (m->owner_tid != caller_tid) {
         return (int64_t)(int32_t)CELL_EPERM;
@@ -265,46 +238,22 @@ int64_t sys_cond_wait(ppu_context* ctx)
     /* The caller must hold the associated mutex. We need to release it
      * atomically with the wait and re-acquire it on wake. */
 
-    int ct = cond_trace_on() && cond_id <= 16;
-    if (ct) {
-        static long n = 0;
-        if (n < 4000) { n++;
-            /* s29 cond-4 rider: the cri_dlg work flag P->[0x4] (0x1661474) is a
-             * PULSE — a polling peek misses it (s29peek: zero changes all boot);
-             * read it event-driven at the trace points instead. wC0 = the
-             * loop-exit flag arg+0x50. */
-            if (cond_id == 4)
-                /* s30 rider extension (s30_staging_decision.md §4.1): seq =
-                 * 0x16614B8, cmd OPD = 0x16614B0 (names the staged command
-                 * class per pulse; 0x1356188 = the read handler). */
-                fprintf(stderr, "[cond] t%u WAIT-enter cond=4 mutex=%u owner=t%u cnt=%d w474=%08X wC0=%08X seq=%08X cmd=%08X\n",
-                        yz_thread_current_id(), mutex_id,
-                        (uint32_t)m->owner_tid, m->lock_count,
-                        vm_read32(0x1661474u), vm_read32(0x16614C0u),
-                        vm_read32(0x16614B8u), vm_read32(0x16614B0u));
-            else
-                fprintf(stderr, "[cond] t%u WAIT-enter cond=%u mutex=%u owner=t%u cnt=%d\n",
-                        yz_thread_current_id(), cond_id, mutex_id,
-                        (uint32_t)m->owner_tid, m->lock_count);
-            fflush(stderr); }
-    }
 
-    /* Save and fully clear ownership info. Audit item 1c (RPCS3
-     * sys_cond.cpp:448 lock_count.exchange(0), :587 lock_count.release()):
-     * a recursive mutex held N times must release ALL N host-CS entries
-     * before parking, not just one -- SleepConditionVariableCS only leaves
-     * the CS ONCE, so a recursive holder (lock_count > 1) previously left
-     * the CS held N-1 times after "releasing" it, permanently blocking every
-     * other thread's EnterCriticalSection. Loop the Leave to match every
-     * guest-side Enter recorded by sys_mutex_lock/trylock (sys_mutex.c). */
+    /* Save and fully clear ownership info. A recursive mutex held N times
+     * releases all N host-CS entries before parking, not just one:
+     * SleepConditionVariableCS only leaves the CS once, so a recursive holder
+     * (lock_count > 1) would otherwise keep the CS held N-1 times after
+     * "releasing" it, permanently blocking every other thread's
+     * EnterCriticalSection. Loop the Leave to match every guest-side Enter
+     * recorded by sys_mutex_lock/trylock (sys_mutex.c). */
     uint64_t saved_owner = m->owner_tid;
     int saved_count = m->lock_count;
     m->owner_tid = 0;
     m->lock_count = 0;
 
 #ifdef _WIN32
-    /* Batch fixes item 8: never let a converted ms value land on 0xFFFFFFFF
-     * (INFINITE) -- cap at 0xFFFFFFFE. */
+    /* Never let a converted ms value land on 0xFFFFFFFF (INFINITE); cap at
+     * 0xFFFFFFFE. */
     DWORD ms;
     if (timeout_us == 0) {
         ms = INFINITE;
@@ -313,15 +262,15 @@ int64_t sys_cond_wait(ppu_context* ctx)
         ms = (ms64 > 0xFFFFFFFEull) ? 0xFFFFFFFEu : (DWORD)ms64;
     }
 
-    /* RENDEZVOUS (2026-07-03, see sys_cond.h): COMMIT under the internal
-     * sig lock BEFORE releasing the guest mutex — from this instant a signal
-     * lands in `pending` and cannot be lost, matching lv2's wait-entry
-     * enqueue. Then fully release the guest mutex (ALL N recursion levels),
-     * park on the CV against the sig lock, consume one pending on wake, and
-     * re-acquire the guest mutex. */
+    /* Rendezvous (see sys_cond.h): commit under the internal sig lock before
+     * releasing the guest mutex. From this instant a signal lands in
+     * `pending` and cannot be lost, matching lv2's wait-entry enqueue. Then
+     * fully release the guest mutex (all N recursion levels), park on the CV
+     * against the sig lock, consume one pending on wake, and re-acquire the
+     * guest mutex. */
     EnterCriticalSection(&c->sig_cs);
     c->committed++;
-    cond_waiter_add(c, caller_tid);   /* item-K fix 1: visible to signal_to */
+    cond_waiter_add(c, caller_tid);   /* visible to signal_to */
 
     for (int i = 0; i < saved_count; i++) {
         LeaveCriticalSection(&m->cs);
@@ -330,7 +279,7 @@ int64_t sys_cond_wait(ppu_context* ctx)
     BOOL ok = TRUE;
     if (timeout_us > 0 && timeout_us < 1000) {
         /* Sub-ms timed wait: safe to poll (rather than park on the CV) because
-         * a signal COMMITS to c->pending under sig_cs — it cannot be lost
+         * a signal commits to c->pending under sig_cs, so it cannot be lost
          * while we yield. A floored-to-1ms CV wait would round up to the OS
          * timer tick and inflate micro-timeouts ~50x. */
         int64_t deadline = lv2_usec_deadline(timeout_us);
@@ -360,7 +309,7 @@ int64_t sys_cond_wait(ppu_context* ctx)
     cond_waiter_remove(c, caller_tid);
     LeaveCriticalSection(&c->sig_cs);
 
-    /* Re-acquire ALL N recursion levels of the guest mutex. */
+    /* Re-acquire all N recursion levels of the guest mutex. */
     for (int i = 0; i < saved_count; i++) {
         EnterCriticalSection(&m->cs);
     }
@@ -369,30 +318,16 @@ int64_t sys_cond_wait(ppu_context* ctx)
     m->owner_tid = saved_owner;
     m->lock_count = saved_count;
 
-    if (ct) {
-        static long n2 = 0;
-        if (n2 < 4000) { n2++;
-            if (cond_id == 4)
-                fprintf(stderr, "[cond] t%u WAIT-exit cond=4 %s w474=%08X wC0=%08X seq=%08X cmd=%08X\n",
-                        yz_thread_current_id(), !ok ? "TIMEOUT" : "ok",
-                        vm_read32(0x1661474u), vm_read32(0x16614C0u),
-                        vm_read32(0x16614B8u), vm_read32(0x16614B0u));
-            else
-                fprintf(stderr, "[cond] t%u WAIT-exit cond=%u %s\n",
-                        yz_thread_current_id(), cond_id,
-                        !ok ? "TIMEOUT" : "ok");
-            fflush(stderr); }
-    }
 
     if (!ok) {
         return (int64_t)(int32_t)CELL_ETIMEDOUT;
     }
 #else
-    /* RENDEZVOUS (see Win32 path): commit under the sig lock before the full
+    /* Rendezvous (see Win32 path): commit under the sig lock before the full
      * guest-mutex release; park against the sig lock; consume one pending. */
     pthread_mutex_lock(&c->sig_mtx);
     c->committed++;
-    cond_waiter_add(c, caller_tid);   /* item-K fix 1: visible to signal_to */
+    cond_waiter_add(c, caller_tid);   /* visible to signal_to */
 
     for (int i = 0; i < saved_count; i++) {
         pthread_mutex_unlock(&m->mtx);
@@ -443,24 +378,6 @@ int64_t sys_cond_wait(ppu_context* ctx)
  * r3 = cond_id
  * -----------------------------------------------------------------------*/
 
-/* s36 force-wake diagnostic (YZ_FORCE_WAKE): signal a cond from a WATCHDOG
- * thread to un-park a starved CRI consumer (mirrors the rendezvous core of
- * sys_cond_signal). Only wakes a committed waiter; a no-waiter call is a no-op. */
-void yz_force_cond_signal(uint32_t cond_id)
-{
-    if (cond_id == 0 || cond_id > SYS_COND_MAX) return;
-    sys_cond_info* c = &g_sys_conds[cond_id - 1];
-    if (!c->active) return;
-#ifdef _WIN32
-    EnterCriticalSection(&c->sig_cs);
-    if (c->committed > c->pending) { c->pending++; WakeConditionVariable(&c->cv); }
-    LeaveCriticalSection(&c->sig_cs);
-#else
-    pthread_mutex_lock(&c->sig_mtx);
-    if (c->committed > c->pending) { c->pending++; pthread_cond_signal(&c->cv); }
-    pthread_mutex_unlock(&c->sig_mtx);
-#endif
-}
 
 int64_t sys_cond_signal(ppu_context* ctx)
 {
@@ -473,36 +390,14 @@ int64_t sys_cond_signal(ppu_context* ctx)
     if (!c->active)
         return (int64_t)(int32_t)CELL_ESRCH;
 
-    /* s29: the trace logged ONLY the wait side — the cond-4 signaler was
-     * invisible (and LV2:first dedups per (tid,sc), hiding later-cond calls).
-     * Log the signal side under the same gate/cap. */
-    if (cond_trace_on() && cond_id <= 16) {
-        static long sn = 0;
-        if (sn < 4000) { sn++;
-            /* lr names the guest CALL SITE (the s29 cond-4 staging hunt:
-             * which t1 function stages cri_dlg work — it stops at ~t=106 s
-             * while t1 itself keeps iterating, scratch/s29sig.err). */
-            if (cond_id == 4)
-                fprintf(stderr, "[cond] t%u SIGNAL cond=4 committed=%d pending=%d w474=%08X wC0=%08X seq=%08X cmd=%08X\n",
-                        yz_thread_current_id(), c->committed, c->pending,
-                        vm_read32(0x1661474u), vm_read32(0x16614C0u),
-                        vm_read32(0x16614B8u), vm_read32(0x16614B0u));
-            else
-                fprintf(stderr, "[cond] t%u SIGNAL cond=%u committed=%d pending=%d lr=0x%08llX\n",
-                        yz_thread_current_id(), cond_id, c->committed, c->pending,
-                        (unsigned long long)ctx->lr); }
-    }
 
-    /* FAITHFUL lv2 semantics, revision 2 (2026-07-03 s8): real sys_cond_signal
-     * NEVER acquires the guest mutex (the 3f1377c fix stands — the former
-     * mutex-CS guard caused hold-and-wait). BUT "signal between a waiter's
-     * release and park is permitted loss" was WRONG for one window: lv2
-     * enqueues the waiter at WAIT-SYSCALL ENTRY, so a signal after that entry
-     * is always delivered. The internal sig lock + committed/pending counters
-     * reproduce that (held for nanoseconds — no guest-visible hold-and-wait);
-     * a signal with no committed waiter is still a faithful discard.
-     * Measured root: the CRI staging pump's completion wake vanished in this
-     * window = the post-asset-scan boot freeze. */
+    /* Matches lv2 semantics: sys_cond_signal never acquires the guest mutex
+     * (a mutex-CS guard would cause hold-and-wait). lv2 enqueues the waiter
+     * at wait-syscall entry, so a signal after that entry is always
+     * delivered, including in the window between the waiter releasing the
+     * mutex and parking. The internal sig lock + committed/pending counters
+     * reproduce that (held for nanoseconds, no guest-visible hold-and-wait);
+     * a signal with no committed waiter is discarded, as on lv2. */
 #ifdef _WIN32
     EnterCriticalSection(&c->sig_cs);
     if (c->committed > c->pending) {
@@ -538,15 +433,9 @@ int64_t sys_cond_signal_all(ppu_context* ctx)
     if (!c->active)
         return (int64_t)(int32_t)CELL_ESRCH;
 
-    if (cond_trace_on() && cond_id <= 16) {
-        static long sn = 0;
-        if (sn < 4000) { sn++;
-            fprintf(stderr, "[cond] t%u SIGNAL-ALL cond=%u committed=%d pending=%d\n",
-                    yz_thread_current_id(), cond_id, c->committed, c->pending); }
-    }
 
-    /* FAITHFUL lv2 semantics, revision 2 (see sys_cond_signal): rendezvous
-     * broadcast — serve every committed waiter; never touch the guest mutex. */
+    /* Rendezvous broadcast (see sys_cond_signal): serve every committed
+     * waiter; never touch the guest mutex. */
 #ifdef _WIN32
     EnterCriticalSection(&c->sig_cs);
     c->pending = c->committed;
@@ -568,19 +457,19 @@ int64_t sys_cond_signal_all(ppu_context* ctx)
  * r3 = cond_id
  * r4 = ppu_thread_id (target)
  *
- * 2026-08-05 item-K fix 1 -- ORACLE(Lv2 Reference p.184): CELL_OK when the
- * signal is delivered; ESRCH for an un-issued cond ID; EPERM when "the
- * specified PPU thread is not waiting on the condition variable". Membership
- * comes from the waiter-tid registry the wait path maintains under the sig
- * lock, so the check is race-free against wait entry/exit.
+ * Returns CELL_OK when the signal is delivered; ESRCH for an un-issued cond
+ * ID; EPERM when the specified PPU thread is not waiting on the condition
+ * variable. Membership comes from the waiter-tid registry the wait path
+ * maintains under the sig lock, so the check is race-free against wait
+ * entry/exit.
  *
  * Delivery approximation (documented deviation): the rendezvous core wakes
- * committed waiters through a shared pending counter, so with MULTIPLE
+ * committed waiters through a shared pending counter, so with multiple
  * simultaneous waiters an arbitrary committed waiter may consume the signal
  * instead of the targeted one (real lv2 wakes exactly the target). The
- * validation/error contract and the delivery COUNT are exact; single-waiter
- * behavior (the common signal_to idiom) is exact. A per-thread directed-wake
- * channel is the follow-up if a title measurably depends on targeting.
+ * validation/error contract and the delivery count are exact; single-waiter
+ * behavior (the common signal_to idiom) is exact. Exact targeting would need
+ * a per-thread directed-wake channel.
  * -----------------------------------------------------------------------*/
 int64_t sys_cond_signal_to(ppu_context* ctx)
 {
@@ -594,13 +483,6 @@ int64_t sys_cond_signal_to(ppu_context* ctx)
     if (!c->active)
         return (int64_t)(int32_t)CELL_ESRCH;
 
-    if (cond_trace_on() && cond_id <= 16) {
-        static long sn = 0;
-        if (sn < 4000) { sn++;
-            fprintf(stderr, "[cond] t%u SIGNAL-TO cond=%u target=t%u committed=%d pending=%d\n",
-                    yz_thread_current_id(), cond_id, (uint32_t)target_tid,
-                    c->committed, c->pending); }
-    }
 
 #ifdef _WIN32
     EnterCriticalSection(&c->sig_cs);
@@ -610,7 +492,7 @@ int64_t sys_cond_signal_to(ppu_context* ctx)
     }
     if (c->committed > c->pending) {
         c->pending++;
-        /* Broadcast so the TARGET is guaranteed to wake and re-check; extra
+        /* Broadcast so the target is guaranteed to wake and re-check; extra
          * wakes are benign (waiters loop on pending and re-sleep). */
         WakeAllConditionVariable(&c->cv);
     }

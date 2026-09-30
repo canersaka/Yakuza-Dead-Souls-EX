@@ -4,24 +4,16 @@
  * URI parsing/building, percent-encoding, form-url encoding, Base64.
  * Pure C, no external dependencies.
  *
- * Conformance notes (2026-08-05 rework against the SDK 4.75 oracles):
- *  - cellHttpUtilParseUri writes the documented 28-byte guest CellHttpUri
- *    (five BE guest EAs + BE port, ORACLE(cell/http/util.h:12-20)) using
- *    the documented two-pass pool idiom; the old code discarded
- *    pool/size/required and wrote a 2704-byte host struct over the guest
- *    28-byte struct (audit 2026-08-04 HIGH: guest heap corruption).
- *  - Default ports per scheme: ORACLE(libhttp_util-Reference_e.pdf p.10):
- *    http 80, https 443, ftp 21, ssh 22, gopher 70, imap 143, rtsp 554.
- *  - BuildUri takes the SDK argument order (uri, buf, len, required,
- *    flags) and honors the four NO_* flags (ORACLE(cell/http/util.h:93-98,
- *    Reference p.22)).
- *  - Escape/Unescape/FormUrl* always write *required when supplied
- *    (two-pass sizing; audit MEDIUM: previously NO_BUFFER without
- *    *required).
- *  - Base64Encoder/Decoder use the SDK 3-argument prototypes and return
- *    the output byte count (ORACLE(cell/http/util.h:60-61, Reference
- *    p.36-37)).
- *  - Error values from ORACLE(cell/http/error.h:471-499) (0x80711001-100a).
+ * - cellHttpUtilParseUri writes the 28-byte guest CellHttpUri (five BE
+ *   guest EAs + BE port) with a two-pass pool idiom (pool, size and
+ *   required are all honored).
+ * - Default ports per scheme: http 80, https 443, ftp 21, ssh 22,
+ *   gopher 70, imap 143, rtsp 554.
+ * - BuildUri honors the four NO_* flags.
+ * - Escape/Unescape/FormUrl* always write *required when supplied
+ *   (two-pass sizing).
+ * - Base64Encoder/Decoder return the output byte count.
+ * - Error values are 0x80711001-100a.
  */
 
 #include "cellHttpUtil.h"
@@ -53,8 +45,7 @@ static int is_unreserved(u8 c)
     return (c == '-' || c == '_' || c == '.' || c == '~');
 }
 
-/* Default port for a scheme.
- * ORACLE(libhttp_util-Reference_e.pdf p.10). Unknown scheme -> 0. */
+/* Default port for a scheme. Unknown scheme -> 0. */
 static u32 uri_default_port(const char* scheme, u32 scheme_len)
 {
     struct { const char* name; u32 port; } table[] = {
@@ -130,9 +121,8 @@ s32 cellHttpUtilParseUri(CellHttpUri* uri, const char* str,
     if (port == 0)
         port = uri_default_port(scheme_start, scheme_len);
 
-    /* Path includes query/fragment: ORACLE(libhttp_util-Reference p.4):
-     * "path: Path name, including the filename query string and its
-     * components". Empty path is stored as "/" (INFERRED). */
+    /* The path includes the query string and its components. An empty
+     * path is stored as "/". */
     const char* path_start = (*p != '\0') ? p : "/";
     u32 path_len = (u32)strlen(path_start);
 
@@ -230,7 +220,7 @@ s32 cellHttpUtilBuildUri(const CellHttpUri* uri, char* buf, u32 len,
     if (!uri)
         return (s32)CELL_HTTP_UTIL_ERROR_NO_BUFFER;
 
-    /* Guest struct fields: BE EAs / BE port (ORACLE(cell/http/util.h)). */
+    /* Guest struct fields: BE EAs / BE port. */
     u32 scheme_ea = ps3_bswap32(uri->scheme);
     u32 host_ea   = ps3_bswap32(uri->hostname);
     u32 user_ea   = ps3_bswap32(uri->username);
@@ -266,8 +256,8 @@ s32 cellHttpUtilBuildUri(const CellHttpUri* uri, char* buf, u32 len,
     }
     ub_append_str(&b, host);
     if (port != 0) {
-        /* Reference p.22 example includes the port even at its scheme
-         * default ("http://...:80/...") -> include whenever set (INFERRED). */
+        /* The port is included whenever set, even at its scheme default
+         * ("http://...:80/..."). */
         char pbuf[12];
         snprintf(pbuf, sizeof(pbuf), ":%u", port);
         ub_append_str(&b, pbuf);
@@ -335,8 +325,7 @@ s32 cellHttpUtilUnescapeUri(u8* out, u32 size, const char* in, u32* required)
 
     u32 in_len = (u32)strlen(in);
 
-    /* sizing pass (unescaped characters pass through unchanged --
-     * ORACLE(libhttp_util-Reference p.33 Notes)) */
+    /* sizing pass (unescaped characters pass through unchanged) */
     u32 need = 0;
     for (u32 i = 0; i < in_len; i++) {
         if (in[i] == '%' && i + 2 < in_len &&
@@ -377,7 +366,7 @@ s32 cellHttpUtilUnescapeUri(u8* out, u32 size, const char* in, u32* required)
 /* ---------------------------------------------------------------------------
  * application/x-www-form-urlencoded codec
  *
- * SDK prototype is a plain buffer codec (ORACLE(cell/http/util.h:55-56)):
+ * SDK prototype is a plain buffer codec:
  * space -> '+', unreserved passthrough, everything else %XX.
  * -----------------------------------------------------------------------*/
 
@@ -457,9 +446,9 @@ s32 cellHttpUtilFormUrlDecode(u8* out, u32 size, const char* in, u32* required)
 }
 
 /* ---------------------------------------------------------------------------
- * Base64 -- SDK 3-argument prototypes, return output byte count
- * (ORACLE(cell/http/util.h:60-61), Reference p.36-37: caller allocates
- * exactly CELL_HTTP_UTIL_BASE64_ENC/DEC_BUF_SIZE bytes; no NUL is written).
+ * Base64: SDK 3-argument prototypes, return output byte count
+ * (caller allocates exactly CELL_HTTP_UTIL_BASE64_ENC/DEC_BUF_SIZE bytes;
+ * no NUL is written).
  * -----------------------------------------------------------------------*/
 
 static const char s_b64_table[] =

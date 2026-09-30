@@ -17,11 +17,7 @@ extern "C" {
 /* ---------------------------------------------------------------------------
  * Constants
  * -----------------------------------------------------------------------*/
-/* s23 conformance fix: PATH_MAX was 1055 (copy-pasted from the SYSCACHE
- * header's CELL_SYSCACHE_PATH_MAX); the real content-path constant is 128
- * (RPCS3 cellGame.cpp:943 vm::ptr<char[CELL_GAME_PATH_MAX]> with
- * CELL_GAME_PATH_MAX=128) and guest buffers are sized to it -- the old value
- * let our snprintf/strncpy bound writes 8x past the guest's real array. */
+/* Guest path buffers are CELL_GAME_PATH_MAX bytes; bound all copies to it. */
 #define CELL_GAME_PATH_MAX          128
 #define CELL_GAME_DIRNAME_SIZE      32
 
@@ -30,7 +26,7 @@ extern "C" {
 #define CELL_GAME_GAMETYPE_GAMEDATA 3
 #define CELL_GAME_GAMETYPE_HOME     4
 
-/* Boot status */
+/* Content attribute flags */
 #define CELL_GAME_ATTRIBUTE_PATCH           (1 << 0)
 #define CELL_GAME_ATTRIBUTE_APP_HOME        (1 << 1)
 #define CELL_GAME_ATTRIBUTE_DEBUG           (1 << 2)
@@ -40,12 +36,9 @@ extern "C" {
 #define CELL_GAME_ATTRIBUTE_CUSTOM_DATA_MESSAGE (1 << 6)
 #define CELL_GAME_ATTRIBUTE_WEB_BROWSER     (1 << 8)
 
-/* PARAM.SFO parameter IDs -- s23 conformance fix: this is ONE unified enum
- * (RPCS3 cellGame.h CELL_GAME_PARAMID_*), not disjoint int/string ranges.
- * The old invented scheme (ints 100-104, strings 200-203) made the game's
- * real GetParamString(101 = VERSION, bufsize 6) hit the unknown-id path and
- * return "" every boot (measured s23boot1.out:214). Types: 0/1/100/101/105/
- * 106 are strings; 102/103/104 are ints. */
+/* PARAM.SFO parameter IDs: one unified enum, not disjoint int/string ranges
+ * (GetParamString(101 = VERSION) is a real call). Types: 0/1/100/101/105/106
+ * are strings; 102/103/104 are ints. */
 #define CELL_GAME_PARAMID_TITLE                  0
 #define CELL_GAME_PARAMID_TITLE_DEFAULT          1
 #define CELL_GAME_PARAMID_TITLE_ID              100
@@ -59,10 +52,9 @@ extern "C" {
 /* Size info mode */
 #define CELL_GAME_SIZEKB_NOTCALC    (-1)
 
-/* Error dialog types (cellGameContentErrorDialog). ORACLE(SDK
- * sysutil_gamecontent.h enum + Game_Content-Reference p.31): the _EXIT
- * variants additionally issue the game-termination request event after the
- * dialog closes. */
+/* Error dialog types (cellGameContentErrorDialog): the _EXIT variants
+ * additionally issue the game-termination request event after the dialog
+ * closes. */
 #define CELL_GAME_ERRDIALOG_BROKEN_GAMEDATA        0
 #define CELL_GAME_ERRDIALOG_BROKEN_HDDGAME         1
 #define CELL_GAME_ERRDIALOG_NOSPACE                2
@@ -73,14 +65,10 @@ extern "C" {
 /* ---------------------------------------------------------------------------
  * Return / error codes
  *
- * 2026-08-05 doc-conformance fix: the old values were fabricated as
- * (CELL_ERROR_BASE_SYSUTIL_GAME | n) with a dense 0x01.. numbering on base
- * 0x8002B600. The real module base is 0x8002cb00 and the offsets are SPARSE
- * (04-09, 20-28, 50). Every value below is verbatim from the SDK header
- * ORACLE(sysutil_game_common.h:17-39); do not re-derive them from a base|n
- * scheme. RET_* are documented non-error positive results
- * (Game_Content-Reference p.9: DataCheck returns RET_NONE(2) for missing
- * content "without handling this as an error").
+ * The module base is 0x8002cb00 and the offsets are sparse (04-09, 20-28,
+ * 50), so the values cannot be derived from a base|n scheme. RET_* are
+ * documented non-error positive results (DataCheck returns RET_NONE(2) for
+ * missing content).
  * -----------------------------------------------------------------------*/
 #define CELL_GAME_RET_OK               (0)
 #define CELL_GAME_RET_CANCEL           (1)   /* operation canceled */
@@ -113,7 +101,7 @@ typedef struct CellGameContentSize {
     s32 sysSizeKB;
 } CellGameContentSize;
 
-/* Mirrors RPCS3's CellGameSetInitParams (input to cellGameCreateGameData). */
+/* CellGameSetInitParams (input to cellGameCreateGameData). */
 typedef struct CellGameSetInitParams {
     char title[128];
     char titleId[10];
@@ -126,21 +114,12 @@ typedef struct CellGameSetInitParams {
  * Configuration (call before game boots)
  * -----------------------------------------------------------------------*/
 
-/* Set the game's title ID (e.g., "BLUS30443") */
-void cellGame_set_title_id(const char* title_id);
-
 /* Read TITLE_ID/TITLE/APP_VER from the game's PARAM.SFO at boot (robust title id
  * for all path building). Falls back to defaults if the SFO can't be read. */
 void cellGame_init_from_paramsfo(const char* sfo_path);
 
 /* Central title-id accessor (so other modules don't hardcode placeholders). */
 const char* cellGame_get_title_id(void);
-
-/* Set the game's title string */
-void cellGame_set_title(const char* title);
-
-/* Set the content info path root */
-void cellGame_set_content_path(const char* path);
 
 /* ---------------------------------------------------------------------------
  * Functions
@@ -164,10 +143,10 @@ s32 cellGameDeleteGameData(const char* dirName);
 
 /* Fatal-content error dialog. Logs the template message, posts the
  * game-termination request event for the _EXIT types, returns
- * CELL_GAME_RET_OK (Game_Content-Reference pp.31-33). No UI. */
+ * CELL_GAME_RET_OK. No UI. */
 s32 cellGameContentErrorDialog(s32 type, s32 errNeedSizeKB, const char* dirName);
 
-/* cellGameSetExitParam — see cellGameExec.h for correct signature */
+/* cellGameSetExitParam: see cellGameExec.h for the signature */
 
 s32 cellGameGetSizeKB(s32* sizeKB);
 

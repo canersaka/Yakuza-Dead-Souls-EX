@@ -11,7 +11,6 @@
 #include "sysNet.h"
 #include "../../include/ps3emu/endian.h"
 
-#include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 
@@ -59,19 +58,12 @@ typedef struct {
 
 static net_socket_slot s_sockets[SYS_NET_MAX_SOCKETS];
 static int s_net_initialized = 0;
-/* Per-thread errno (libnet-Reference p.117: "Error values are retained
- * separately per thread"; was a process-global). */
+/* Per-thread errno: error values are retained separately per thread. */
 #ifdef _MSC_VER
 static __declspec(thread) int s_net_errno = 0;
 #else
 static _Thread_local int s_net_errno = 0;
 #endif
-
-/* Static hostent for gethostbyname (PS3 uses a static buffer) */
-static sys_net_hostent s_hostent;
-static char s_hostent_name[256];
-static uint32_t s_hostent_addr;
-static uint32_t s_hostent_addr_list[2];  /* addr + NULL */
 
 /* ---------------------------------------------------------------------------
  * Helpers
@@ -108,8 +100,8 @@ static int translate_host_error(void)
     int err = host_errno;
 #ifdef _WIN32
     /* Winsock WSAE* codes are WSABASEERR(10000) + the BSD errno numbering
-     * that PS3 libnet publishes (ORACLE netex/errno.h: CELL 0x80010200+n
-     * with n identical to BSD; e.g. WSAEHOSTUNREACH 10065 -> 65). The
+     * that PS3 libnet publishes (CELL 0x80010200+n with n identical to
+     * BSD; e.g. WSAEHOSTUNREACH 10065 -> 65). The
      * named cases document the codes our calls actually produce; the
      * arithmetic fallback covers the rest of the shared numbering. */
     switch (err) {
@@ -153,6 +145,7 @@ static int translate_host_error(void)
 #endif
 }
 
+#ifdef _WIN32
 /* MSG_DONTWAIT poll-then-call helper (Windows has no per-call nonblocking
  * flag and FIONBIO can't emulate it per-call): zero-timeout readiness check
  * on one socket. dir 0 = readable, 1 = writable. Returns 1 ready / 0 not. */
@@ -168,6 +161,7 @@ static int sock_ready(host_socket_t fd, int dir)
                    NULL, &tv);
     return r == 1;
 }
+#endif
 
 static void to_host_sockaddr(struct sockaddr_in* dst, const sys_net_sockaddr* src)
 {
@@ -196,18 +190,15 @@ int32_t sys_net_initialize_network_ex(void* param)
 {
     (void)param;
 
-    if (s_net_initialized) {
-        printf("[sys_net] Already initialized\n");
+    if (s_net_initialized)
         return CELL_OK;
-    }
 
 #ifdef _WIN32
     WSADATA wsa;
     int err = WSAStartup(MAKEWORD(2, 2), &wsa);
     if (err != 0) {
-        printf("[sys_net] WSAStartup failed: %d\n", err);
         /* Non-BSD module API surface: CELL code, not -1+errno
-         * (libnet-Reference p.28: nonzero CELL value = error). */
+         * (any nonzero CELL value is an error). */
         return SYS_NET_ERROR_ENOMEM;
     }
 #endif
@@ -219,7 +210,6 @@ int32_t sys_net_initialize_network_ex(void* param)
     }
 
     s_net_initialized = 1;
-    printf("[sys_net] Network initialized\n");
     return CELL_OK;
 }
 
@@ -242,7 +232,6 @@ int32_t sys_net_finalize_network(void)
 #endif
 
     s_net_initialized = 0;
-    printf("[sys_net] Network finalized\n");
     return CELL_OK;
 }
 
@@ -253,8 +242,7 @@ int32_t sys_net_finalize_network(void)
 int32_t sys_net_bnet_socket(int32_t domain, int32_t type, int32_t protocol)
 {
     if (!s_net_initialized) {
-        /* BSD shape like every other guard here: -1 + errno (was a raw
-         * CELL-ish value returned as a "descriptor"). */
+        /* BSD shape like every other guard here: -1 + errno. */
         s_net_errno = SYS_NET_EINVAL;
         return -1;
     }
@@ -281,7 +269,6 @@ int32_t sys_net_bnet_socket(int32_t domain, int32_t type, int32_t protocol)
     }
 
     s_sockets[slot].host_fd = fd;
-    printf("[sys_net] socket(%d, %d, %d) -> fd %d\n", domain, type, protocol, slot);
     return slot;
 }
 
@@ -416,9 +403,8 @@ int32_t sys_net_bnet_send(int32_t s, const void* buf, uint32_t len, int32_t flag
     if (flags & SYS_NET_MSG_PEEK)     host_flags |= MSG_PEEK;
 #endif
 #ifdef _WIN32
-    /* 2026-08-05 item D4: Windows has no per-call MSG_DONTWAIT (the macro
-     * is 0 above) -- poll-then-call so a blocking socket returns EAGAIN
-     * instead of blocking (libnet-Reference p.58 error contract). */
+    /* Windows has no per-call MSG_DONTWAIT (the macro is 0 above), so
+     * poll first: a blocking socket returns EAGAIN instead of blocking. */
     if ((flags & SYS_NET_MSG_DONTWAIT) && !s_sockets[s].nonblocking &&
         !sock_ready(s_sockets[s].host_fd, 1)) {
         s_net_errno = SYS_NET_EWOULDBLOCK;
@@ -550,12 +536,12 @@ int32_t sys_net_bnet_setsockopt(int32_t s, int32_t level, int32_t optname,
         return 0;
     }
 
-    /* 2026-08-05 doc-conformance item D3: translate the caller's real
-     * level (the old code hardcoded SOL_SOCKET, turning TCP_NODELAY(1)
-     * into Winsock SO_DEBUG(1)); marshal guest big-endian option values
-     * explicitly; convert the SND/RCVTIMEO 16-byte BE timeval to the
-     * host form; unknown (level,optname) -> ENOPROTOOPT. PS3
-     * IPPROTO_TCP/IP numbers equal the host's, so those pass through. */
+    /* Translate the caller's real level (forcing SOL_SOCKET would turn
+     * TCP_NODELAY(1) into Winsock SO_DEBUG(1)); marshal guest big-endian
+     * option values explicitly; convert the SND/RCVTIMEO 16-byte BE
+     * timeval to the host form; unknown (level,optname) -> ENOPROTOOPT.
+     * PS3 IPPROTO_TCP/IP numbers equal the host's, so those pass
+     * through. */
     if (!optval || optlen < 4) { s_net_errno = SYS_NET_EINVAL; return -1; }
 
     if (level == SYS_NET_SOL_SOCKET &&
@@ -649,9 +635,9 @@ int32_t sys_net_bnet_getsockopt(int32_t s, int32_t level, int32_t optname,
     }
     if (!optval || !optlen) { s_net_errno = SYS_NET_EINVAL; return -1; }
 
-    /* 2026-08-05 item D3 (mirror of setsockopt): honor the real level,
-     * marshal BE out-values, convert the TIMEO DWORD back to a guest
-     * 16-byte BE timeval, ENOPROTOOPT for unknown combos. */
+    /* Mirror of setsockopt: honor the real level, marshal BE out-values,
+     * convert the TIMEO DWORD back to a guest 16-byte BE timeval, ENOPROTOOPT
+     * for unknown combos. */
     if (level == SYS_NET_SOL_SOCKET &&
         (optname == SYS_NET_SO_SNDTIMEO || optname == SYS_NET_SO_RCVTIMEO)) {
         if (*optlen < 16) { s_net_errno = SYS_NET_EINVAL; return -1; }
@@ -835,8 +821,8 @@ int32_t sys_net_bnet_poll(sys_net_pollfd* fds, uint32_t nfds, int32_t timeout_ms
 }
 
 /* Guest fd_set: 32 big-endian u32 words = 1024 fd bits, bit (1<<(fd&31))
- * within word fd/32 (ORACLE sys/select.h). Guest timeval: { s64 sec;
- * s64 usec; } big-endian, 16 bytes (ORACLE sys/time.h). */
+ * within word fd/32. Guest timeval: { s64 sec;
+ * s64 usec; } big-endian, 16 bytes. */
 #define SYS_NET_FDSET_WORDS 32
 
 static int guest_fd_isset(const uint32_t* set, int fd)
@@ -851,10 +837,8 @@ static void guest_fd_set_bit(uint32_t* set, int fd)
 int32_t sys_net_bnet_select(int32_t nfds, void* readfds, void* writefds,
                             void* exceptfds, void* timeout)
 {
-    /* 2026-08-05 doc-conformance item D2: was an unconditional
-     * return-0-"timeout" no-op -- readiness loops spun forever
-     * (libnet-Reference p.80-81: real select semantics; NULL timeout
-     * blocks, NULL set = direction unchecked, return = ready count). */
+    /* Real select semantics: NULL timeout blocks, NULL set = direction
+     * unchecked, return = ready count. */
     if (nfds <= 0 || nfds > SYS_NET_MAX_SOCKETS) {
         s_net_errno = SYS_NET_EINVAL;
         return -1;
@@ -894,7 +878,7 @@ int32_t sys_net_bnet_select(int32_t nfds, void* readfds, void* writefds,
     if (!any) {
         /* No live sockets selected: sleep out the timeout (a host select
          * with empty sets errors on Winsock). NULL timeout would block
-         * forever -- treat as EINVAL rather than hang. */
+         * forever, so it is treated as EINVAL rather than a hang. */
         if (!ptv) { s_net_errno = SYS_NET_EINVAL; return -1; }
 #ifdef _WIN32
         Sleep((DWORD)(htv.tv_sec * 1000 + htv.tv_usec / 1000));
@@ -961,35 +945,10 @@ uint32_t sys_net_bnet_gethostbyname(const char* name)
     if (!name) return 0;
 
     struct hostent* he = gethostbyname(name);
-    if (!he) {
-        printf("[sys_net] gethostbyname('%s') failed\n", name);
+    if (!he)
         return 0;
-    }
 
-    /* Copy into our static buffer */
-    strncpy(s_hostent_name, he->h_name, sizeof(s_hostent_name) - 1);
-    s_hostent_name[sizeof(s_hostent_name) - 1] = '\0';
-
-    if (he->h_addr_list && he->h_addr_list[0]) {
-        memcpy(&s_hostent_addr, he->h_addr_list[0], 4);
-    }
-
-    /*
-     * Note: In a real implementation, these would be guest VM pointers.
-     * For now we return a host pointer cast. The recompiled code will
-     * need adapter functions to handle this properly.
-     */
-    s_hostent_addr_list[0] = s_hostent_addr;
-    s_hostent_addr_list[1] = 0;
-
-    s_hostent.h_addrtype = he->h_addrtype;
-    s_hostent.h_length = he->h_length;
-
-    printf("[sys_net] gethostbyname('%s') -> %u.%u.%u.%u\n", name,
-           (s_hostent_addr >> 0) & 0xFF, (s_hostent_addr >> 8) & 0xFF,
-           (s_hostent_addr >> 16) & 0xFF, (s_hostent_addr >> 24) & 0xFF);
-
-    /* Return non-zero to indicate success (PS3 returns pointer) */
+    /* Nonzero on success; no guest hostent is produced. */
     return 1;
 }
 
@@ -997,8 +956,8 @@ uint32_t sys_net_bnet_gethostbyname(const char* name)
  * Thread-local errno
  * -----------------------------------------------------------------------*/
 
-/* Real export name carries the leading underscore (libnet-Reference
- * p.117); renamed 2026-08-05 so the NID scan binds it when imported. */
+/* The real export name carries the leading underscore, which the NID scan
+ * needs in order to bind it when imported. */
 int32_t* _sys_net_errno_loc(void)
 {
     return &s_net_errno;

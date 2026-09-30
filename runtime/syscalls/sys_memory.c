@@ -3,84 +3,55 @@
  */
 
 #include "sys_memory.h"
-#include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 
 /* ---------------------------------------------------------------------------
  * Globals
  * -----------------------------------------------------------------------*/
-sys_mem_alloc_info       g_sys_mem_allocs[SYS_MEMORY_ALLOC_MAX];
-sys_mem_container_info   g_sys_mem_containers[SYS_MEMORY_CONTAINER_MAX];
-sys_mmapper_shared_info  g_sys_mmapper_shared[SYS_MMAPPER_SHARED_MAX];
+static sys_mem_alloc_info       g_sys_mem_allocs[SYS_MEMORY_ALLOC_MAX];
+static sys_mem_container_info   g_sys_mem_containers[SYS_MEMORY_CONTAINER_MAX];
+static sys_mmapper_shared_info  g_sys_mmapper_shared[SYS_MMAPPER_SHARED_MAX];
 
 /* Bump allocator for main memory pool.
  * Starts after a reasonable offset to avoid the low addresses used by ELF. */
-uint32_t g_sys_mem_bump_ptr = 0;
+static uint32_t g_sys_mem_bump_ptr = 0;
 
 /* Total user memory size (default 213 MB, after kernel reservation) */
 #define SYS_MEM_USER_TOTAL  (213 * 1024 * 1024)
 
 /* Guest window handed out by sys_memory_allocate / sys_mmapper.
- * 0x40000000+ matches where the real lv2 places these allocations (verified
- * against an RPCS3 boot log of Yakuza: Dead Souls); the window is outside
- * the pre-committed main region, so pages are committed on demand. */
+ * 0x40000000+ matches where the real lv2 places these allocations; the
+ * window is outside the pre-committed main region, so pages are committed
+ * on demand. */
 #define SYS_MEM_ALLOC_BASE  0x40000000u
 #define SYS_MEM_ALLOC_END   0x50000000u
 
 static uint32_t s_total_allocated = 0;
 
 /* ---------------------------------------------------------------------------
- * M1/M7 (2026-07-09): user-memory accounting.
+ * User-memory accounting.
  *
- * sys_memory_get_user_memory_size(352) reported total/avail computed only
- * from OUR OWN sys_memory_allocate bookkeeping (s_total_allocated); it never
- * billed the ELF's own footprint (segments + primary stack, charged by real
- * lv2 before the game's first instruction even runs -- RPCS3
- * Emu/Cell/PPUModule.cpp:2798) or sys_vm's psize (billed against the same
- * lv2_memory_container on real HW -- RPCS3 Emu/Cell/lv2/sys_vm.cpp:91,
- * `ct->take(psize)`). Measured against this exact title's RPCS3.log:
- *   line 61476: get_user_memory_size() -> Avail=0xBD20000, Total=0xD500000
- *     (i.e. 0x17E0000 already consumed before the first guest instruction --
- *     ELF segments + primary stack)
- *   line 61484-61486: sys_vm_memory_map(psize=0x7a50000) follows
- *   line 62755: get_user_memory_size() -> Avail=0x17fc000 (down sharply,
- *     consistent with psize + other allocations being billed against Total)
+ * sys_memory_get_user_memory_size(352) reports total/avail computed from
+ * our own sys_memory_allocate bookkeeping (s_total_allocated) plus external
+ * charges: the ELF's own footprint (segments + primary stack) and sys_vm's
+ * psize. The ELF footprint (0x17E0000) is charged once, so the first query
+ * reports Avail=0xBD20000 of Total=0xD500000.
  * s_external_consumed is the charge ledger fed by sys_memory_account();
- * s_total_allocated already covers our own sys_memory_allocate() bookkeeping.
- *
- * Kill-switch YZ_NO_MEMACCT: this changes a value the game reads (Avail),
- * so it's gated for A/B safety -- when set, get_user_memory_size reports the
- * old numbers (ignores s_external_consumed and skips the ELF charge) and
- * sys_memory_allocate's ENOMEM ceiling reverts to address-window-only.
+ * s_total_allocated covers our own sys_memory_allocate() bookkeeping.
  * -----------------------------------------------------------------------*/
 static uint64_t s_external_consumed = 0;
 
-static int memacct_disabled(void)
-{
-    static int d = -1;
-    if (d < 0) {
-        d = getenv("YZ_NO_MEMACCT") ? 1 : 0;
-        fprintf(stderr, "[sys_memory] memacct armed (user-memory accounting %s)\n",
-                d ? "DISABLED by YZ_NO_MEMACCT" : "on");
-        fflush(stderr);
-    }
-    return d;
-}
 
 void sys_memory_account(uint32_t bytes)
 {
-    if (memacct_disabled())
-        return;
     s_external_consumed += bytes;
 }
 
-/* ELF footprint charge (M1), applied lazily the first time the game queries
- * get_user_memory_size. Documented constant rather than walking the loader's
- * segment table (yakuza/main.cpp) -- cites a direct measurement of this
- * exact title: real HW reports Avail=0xBD20000 of Total=0xD500000 before the
- * first guest instruction runs, i.e. 0xD500000-0xBD20000 = 0x17E0000 consumed
- * by ELF segments + primary stack (RPCS3.log:61476). */
+/* ELF footprint charge, applied lazily the first time the game queries
+ * get_user_memory_size. A fixed constant rather than a walk of the loader's
+ * segment table: 0xD500000-0xBD20000 = 0x17E0000 consumed by ELF segments +
+ * primary stack. */
 #define SYS_MEM_ELF_FOOTPRINT  0x17E0000u
 static int s_elf_charged = 0;
 
@@ -119,14 +90,8 @@ int64_t sys_memory_allocate(ppu_context* ctx)
     uint32_t flags     = LV2_ARG_U32(ctx, 1);
     uint32_t addr_out  = LV2_ARG_PTR(ctx, 2);
 
-    fprintf(stderr, "[sys_memory] allocate(size=0x%X, flags=0x%X)\n",
-            size, flags);
-
-    /* M5 fix (2026-07-09): flags must be exactly one of the two page-size
-     * bits, or 0 (defaults to 1M, NOT 64K -- RPCS3 sys_memory.cpp:123-126:
-     * `flags == SYS_MEMORY_PAGE_SIZE_1M ? 0x100000 : flags ==
-     * SYS_MEMORY_PAGE_SIZE_64K ? 0x10000 : flags == 0 ? 0x100000 : 0`, and
-     * `if (!align) return CELL_EINVAL`). */
+    /* flags must be exactly one of the two page-size bits, or 0 (defaults
+     * to 1M, not 64K); any other value returns CELL_EINVAL. */
     uint32_t alignment;
     if (flags == 0) {
         alignment = 0x100000; /* 1 MB (spec default) */
@@ -158,10 +123,9 @@ int64_t sys_memory_allocate(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_ENOMEM;
     }
 
-    /* M1 fix: also enforce the real 213MB user-memory budget, not just the
-     * 256MB bump-allocator address window (sys_memory.c:27-28 vs :21) --
-     * YZ_NO_MEMACCT restores the old address-window-only ceiling for A/B. */
-    if (!memacct_disabled()) {
+    /* Enforce the real 213MB user-memory budget, not just the 256MB
+     * bump-allocator address window. */
+    {
         uint64_t projected = (uint64_t)s_total_allocated + s_external_consumed + (uint64_t)size;
         if (projected > (uint64_t)SYS_MEM_USER_TOTAL) {
             bump_unlock();
@@ -187,7 +151,6 @@ int64_t sys_memory_allocate(ppu_context* ctx)
     a->active       = 1;       /* claim the slot before unlocking */
     a->addr         = alloc_addr;
     a->size         = size;
-    a->container_id = 0;
     a->page_size    = alignment;  /* 0x100000 (1M) or 0x10000 (64K) */
 
     bump_unlock();
@@ -198,8 +161,6 @@ int64_t sys_memory_allocate(ppu_context* ctx)
         a->active = 0;
         return (int64_t)(int32_t)CELL_ENOMEM;
     }
-
-    fprintf(stderr, "[sys_memory] allocate -> 0x%08X\n", alloc_addr);
 
     if (addr_out != 0) {
         write_be32(addr_out, alloc_addr);
@@ -237,10 +198,8 @@ int64_t sys_memory_get_user_memory_size(ppu_context* ctx)
 {
     uint32_t out_addr = LV2_ARG_PTR(ctx, 0);
 
-    fprintf(stderr, "[sys_memory] get_user_memory_size()\n");
-
-    /* M1: charge the ELF footprint exactly once, lazily, on first query
-     * (see SYS_MEM_ELF_FOOTPRINT above). No-op when accounting is disabled. */
+    /* Charge the ELF footprint exactly once, lazily, on first query
+     * (see SYS_MEM_ELF_FOOTPRINT above). */
     if (!s_elf_charged) {
         s_elf_charged = 1;
         sys_memory_account(SYS_MEM_ELF_FOOTPRINT);
@@ -248,11 +207,9 @@ int64_t sys_memory_get_user_memory_size(ppu_context* ctx)
 
     if (out_addr != 0) {
         uint32_t total = SYS_MEM_USER_TOTAL;
-        /* M7: floor at 0 instead of underflowing a uint32 subtraction when
+        /* Floor at 0 instead of underflowing a uint32 subtraction when
          * consumed > total (can happen transiently with padding/rounding). */
-        uint64_t consumed = memacct_disabled()
-            ? (uint64_t)s_total_allocated
-            : (uint64_t)s_total_allocated + s_external_consumed;
+        uint64_t consumed = (uint64_t)s_total_allocated + s_external_consumed;
         uint32_t avail = (consumed >= total) ? 0 : (uint32_t)(total - consumed);
         write_be32(out_addr + 0, total);
         write_be32(out_addr + 4, avail);
@@ -265,17 +222,15 @@ int64_t sys_memory_get_user_memory_size(ppu_context* ctx)
  * sys_memory_get_page_attribute (syscall 351 / 0x15F)
  *
  * r3 = address to query
- * r4 = pointer to sys_page_attr_t (rpcs3/rpcs3/Emu/Cell/lv2/sys_memory.h):
+ * r4 = pointer to sys_page_attr_t:
  *        +0x00 attribute    (u64)
  *        +0x08 access_right (u64)
- *        +0x10 page_size    (u32)  , the field titles actually check
+ *        +0x10 page_size    (u32)  the field the game inspects
  *        +0x14 pad          (u32)
  *
- * Was misnumbered 358 and unregistered, so it fell through to the return-0
- * stub without ever filling the output struct, callers reading page_size
- * got stack garbage. Values below mirror RPCS3's fast-path constants
- * (SYS_MEMORY_PROT_READ_WRITE / SYS_MEMORY_ACCESS_RIGHT_PPU_THR); page_size
- * reports the queried region's actual allocation granularity.
+ * attribute and access_right use the fixed values SYS_MEMORY_PROT_READ_WRITE
+ * and SYS_MEMORY_ACCESS_RIGHT_PPU_THR; page_size reports the queried
+ * region's actual allocation granularity.
  * -----------------------------------------------------------------------*/
 int64_t sys_memory_get_page_attribute(ppu_context* ctx)
 {
@@ -326,7 +281,6 @@ int64_t sys_memory_container_create(ppu_context* ctx)
     sys_mem_container_info* c = &g_sys_mem_containers[slot];
     c->active     = 1;
     c->total_size = size;
-    c->used_size  = 0;
 
     uint32_t container_id = (uint32_t)(slot + 1);
     if (id_out_addr != 0) {
@@ -363,15 +317,11 @@ int64_t sys_memory_container_destroy(ppu_context* ctx)
  *                                     u32 available_user_memory }
  * r4 = container_id
  *
- * 2026-08-05 item-K fix 7 -- the old handler read r3 as the container id and
- * r4 as the pointer (2026-08-04 audit: a conforming call always got ESRCH).
- * ORACLE(SDK sys/memory.h:318-324): sys_memory_container_get_size(
- * sys_memory_info_t* mem_info, sys_memory_container_t cid) with
- * system_call_2(..., (uint32_t)mem_info, cid) -- pointer in r3, cid in r4;
- * struct is {total_user_memory, available_user_memory} (memory.h:45-48), so
- * the second field is AVAILABLE (total - used), not used
- * (ORACLE(Lv2 Reference p.49): "obtains the maximum size and available
- * size"). */
+ * The syscall is sys_memory_container_get_size(sys_memory_info_t* mem_info,
+ * sys_memory_container_t cid): pointer in r3, container id in r4. The struct
+ * is {total_user_memory, available_user_memory}, so the second field is the
+ * available size, not the used size. Containers are size bookkeeping only
+ * (nothing allocates from them), so available equals total. */
 int64_t sys_memory_container_get_size(ppu_context* ctx)
 {
     uint32_t out_addr     = LV2_ARG_PTR(ctx, 0);
@@ -385,10 +335,8 @@ int64_t sys_memory_container_get_size(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_ESRCH;
 
     if (out_addr != 0) {
-        uint32_t avail = (c->total_size >= c->used_size)
-                       ? (c->total_size - c->used_size) : 0;
         write_be32(out_addr + 0, c->total_size);
-        write_be32(out_addr + 4, avail);
+        write_be32(out_addr + 4, c->total_size);
     }
 
     return CELL_OK;
@@ -462,7 +410,6 @@ int64_t sys_mmapper_free_address(ppu_context* ctx)
  * -----------------------------------------------------------------------*/
 int64_t sys_mmapper_allocate_shared_memory(ppu_context* ctx)
 {
-    uint64_t key      = LV2_ARG_U64(ctx, 0);
     uint32_t size     = LV2_ARG_U32(ctx, 1);
     /* uint32_t flags = LV2_ARG_U32(ctx, 2); */
     uint32_t id_out   = LV2_ARG_PTR(ctx, 3);
@@ -477,8 +424,6 @@ int64_t sys_mmapper_allocate_shared_memory(ppu_context* ctx)
     sys_mmapper_shared_info* s = &g_sys_mmapper_shared[slot];
     s->active = 1;
     s->size   = VM_ALIGN_UP(size, VM_PAGE_SIZE);
-    s->key    = key;
-    s->addr   = 0;
 
     uint32_t shm_id = (uint32_t)(slot + 1);
     if (id_out != 0) {
@@ -513,7 +458,6 @@ int64_t sys_mmapper_map_shared_memory(ppu_context* ctx)
     if (rc != CELL_OK)
         return (int64_t)(int32_t)rc;
 
-    s->addr = addr;
     memset(vm_to_host(addr), 0, s->size);
 
     return CELL_OK;
@@ -530,13 +474,9 @@ void sys_memory_init(lv2_syscall_table* tbl)
     g_sys_mem_bump_ptr = 0;
     s_total_allocated  = 0;
 
-    /* Commit the whole window up front. On real hardware the user lpar is
-     * mapped beyond the game's current allocations, and Sony's own code
-     * relies on it: the SPURS kernel's boot code GETs a resume-context
-     * probe from spurs+0xD0000 — memory the game only sys_memory-allocates
-     * a few milliseconds later (a benign race on real HW; the kernel
-     * validates the contents and treats garbage as a cold boot). Host
-     * pages still materialize lazily on first touch. */
+    /* Commit the whole window up front: guest code (the SPURS kernel probe)
+     * reads memory from allocations made shortly afterwards. Host pages
+     * still materialize lazily on first touch. */
     vm_commit(SYS_MEM_ALLOC_BASE, SYS_MEM_ALLOC_END - SYS_MEM_ALLOC_BASE);
 
     lv2_syscall_register(tbl, SYS_MEMORY_ALLOCATE,             sys_memory_allocate);

@@ -7,7 +7,6 @@
  */
 
 #include "sceNpBasic.h"
-#include <stdio.h>
 #include <string.h>
 
 /* ---------------------------------------------------------------------------
@@ -28,7 +27,6 @@ s32 sceNpBasicInit(void* poolMem, u32 poolSize)
 {
     (void)poolMem;
     (void)poolSize;
-    printf("[sceNpBasic] Init(poolSize=%u)\n", poolSize);
 
     if (s_initialized)
         return (s32)SCE_NP_BASIC_ERROR_ALREADY_INITIALIZED;
@@ -43,8 +41,6 @@ s32 sceNpBasicInit(void* poolMem, u32 poolSize)
 
 s32 sceNpBasicTerm(void)
 {
-    printf("[sceNpBasic] Term()\n");
-
     if (!s_initialized)
         return (s32)SCE_NP_BASIC_ERROR_NOT_INITIALIZED;
 
@@ -58,8 +54,6 @@ s32 sceNpBasicRegisterHandler(SceNpBasicEventHandler handler,
                                SceNpBasicPresenceHandler presenceHandler,
                                void* arg)
 {
-    printf("[sceNpBasic] RegisterHandler()\n");
-
     if (!s_initialized)
         return (s32)SCE_NP_BASIC_ERROR_NOT_INITIALIZED;
 
@@ -71,8 +65,6 @@ s32 sceNpBasicRegisterHandler(SceNpBasicEventHandler handler,
 
 s32 sceNpBasicUnregisterHandler(void)
 {
-    printf("[sceNpBasic] UnregisterHandler()\n");
-
     if (!s_initialized)
         return (s32)SCE_NP_BASIC_ERROR_NOT_INITIALIZED;
 
@@ -119,8 +111,6 @@ s32 sceNpBasicGetFriendPresence(const SceNpOnlineId* onlineId,
 
 s32 sceNpBasicSetPresence(const SceNpBasicPresence* presence)
 {
-    printf("[sceNpBasic] SetPresence()\n");
-
     if (!s_initialized)
         return (s32)SCE_NP_BASIC_ERROR_NOT_INITIALIZED;
 
@@ -134,11 +124,9 @@ s32 sceNpBasicSetPresence(const SceNpBasicPresence* presence)
 s32 sceNpBasicSendMessage(const SceNpOnlineId* to,
                            const void* body, u32 bodySize)
 {
+    (void)to;
     (void)body;
     (void)bodySize;
-
-    printf("[sceNpBasic] SendMessage(to=%.16s)\n",
-           to ? to->data : "(null)");
 
     if (!s_initialized)
         return (s32)SCE_NP_BASIC_ERROR_NOT_INITIALIZED;
@@ -150,12 +138,10 @@ s32 sceNpBasicSendMessageAttachment(const SceNpOnlineId* to,
                                       const char* subject,
                                       const void* data, u32 dataSize)
 {
+    (void)to;
+    (void)subject;
     (void)data;
     (void)dataSize;
-
-    printf("[sceNpBasic] SendMessageAttachment(to=%.16s, subj=%s)\n",
-           to ? to->data : "(null)",
-           subject ? subject : "(null)");
 
     if (!s_initialized)
         return (s32)SCE_NP_BASIC_ERROR_NOT_INITIALIZED;
@@ -166,11 +152,9 @@ s32 sceNpBasicSendMessageAttachment(const SceNpOnlineId* to,
 s32 sceNpBasicSendInGameInvitation(const SceNpOnlineId* to,
                                      const void* data, u32 dataSize)
 {
+    (void)to;
     (void)data;
     (void)dataSize;
-
-    printf("[sceNpBasic] SendInGameInvitation(to=%.16s)\n",
-           to ? to->data : "(null)");
 
     if (!s_initialized)
         return (s32)SCE_NP_BASIC_ERROR_NOT_INITIALIZED;
@@ -207,8 +191,7 @@ s32 sceNpBasicGetBlockListEntryCount(u32* count)
 
 s32 sceNpBasicAddBlockListEntry(const SceNpOnlineId* onlineId)
 {
-    printf("[sceNpBasic] AddBlockListEntry(%.16s)\n",
-           onlineId ? onlineId->data : "(null)");
+    (void)onlineId;
 
     if (!s_initialized)
         return (s32)SCE_NP_BASIC_ERROR_NOT_INITIALIZED;

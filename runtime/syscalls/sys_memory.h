@@ -31,7 +31,6 @@ typedef struct sys_mem_alloc_info {
     int      active;
     uint32_t addr;
     uint32_t size;
-    int32_t  container_id;  /* 0 = main pool */
     uint32_t page_size;     /* 0x100000 (1M) or 0x10000 (64K), from the alloc flags */
 } sys_mem_alloc_info;
 
@@ -39,28 +38,18 @@ typedef struct sys_mem_alloc_info {
 typedef struct sys_mem_container_info {
     int      active;
     uint32_t total_size;
-    uint32_t used_size;
 } sys_mem_container_info;
 
 /* Shared memory object */
 typedef struct sys_mmapper_shared_info {
     int      active;
     uint32_t size;
-    uint32_t addr;   /* mapped address, 0 if not mapped */
-    uint64_t key;
 } sys_mmapper_shared_info;
 
-extern sys_mem_alloc_info       g_sys_mem_allocs[SYS_MEMORY_ALLOC_MAX];
-extern sys_mem_container_info   g_sys_mem_containers[SYS_MEMORY_CONTAINER_MAX];
-extern sys_mmapper_shared_info  g_sys_mmapper_shared[SYS_MMAPPER_SHARED_MAX];
-extern uint32_t                 g_sys_mem_bump_ptr;  /* bump allocator pointer */
-
-/* M1/M7 (2026-07-09): external memory accounting -- lets other subsystems
- * (e.g. sys_vm's psize) charge bytes against the same 213MB user-memory
- * budget that sys_memory_get_user_memory_size reports, the way real HW bills
- * every physical-memory consumer against one lv2_memory_container (RPCS3
- * rpcs3/rpcs3/Emu/Cell/lv2/sys_memory.h's lv2_memory_container::take/free).
- * No-op when YZ_NO_MEMACCT is set (A/B kill-switch; see sys_memory.c). */
+/* External memory accounting: lets other subsystems (e.g. sys_vm's psize)
+ * charge bytes against the same 213MB user-memory budget that
+ * sys_memory_get_user_memory_size reports, the way lv2 bills every
+ * physical-memory consumer against one memory container. */
 void sys_memory_account(uint32_t bytes);
 
 /* Syscall handlers */

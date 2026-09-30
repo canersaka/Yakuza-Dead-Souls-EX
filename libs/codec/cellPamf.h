@@ -35,18 +35,10 @@ extern "C" {
 #define CELL_PAMF_STREAM_TYPE_AC3            4   /* AC3 audio */
 #define CELL_PAMF_STREAM_TYPE_USER_DATA      5   /* User data */
 
-/* Codec type constants */
-#define CELL_PAMF_CODEC_TYPE_AVC             0x1B
-#define CELL_PAMF_CODEC_TYPE_M2V             0x02
-#define CELL_PAMF_CODEC_TYPE_ATRAC3PLUS      0xDC
-#define CELL_PAMF_CODEC_TYPE_LPCM            0x80
-#define CELL_PAMF_CODEC_TYPE_AC3             0x81
-
 /* ---------------------------------------------------------------------------
  * PAMF header magic
  * -----------------------------------------------------------------------*/
 #define CELL_PAMF_MAGIC         0x50414D46   /* "PAMF" */
-#define CELL_PAMF_VERSION       0x00040100   /* v4.1.0 */
 
 /* ---------------------------------------------------------------------------
  * Types
@@ -101,13 +93,6 @@ typedef struct CellPamfEp {
     u32 pts;              /* presentation timestamp (90kHz) */
     u32 rpnOffset;        /* byte offset from data start */
 } CellPamfEp;
-
-typedef struct CellPamfStreamInfo {
-    u8  streamType;
-    u8  streamIndex;
-    u8  streamId;
-    u8  reserved;
-} CellPamfStreamInfo;
 
 /* ---------------------------------------------------------------------------
  * Functions

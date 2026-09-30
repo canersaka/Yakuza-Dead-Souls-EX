@@ -45,14 +45,11 @@ typedef struct sys_event_t {
 #define SYS_PPU_QUEUE   1
 #define SYS_SPU_QUEUE   2
 
-/* sys_event_queue_destroy mode (audit sec.5 item 4; RPCS3 sys_event.h:21) */
+/* sys_event_queue_destroy mode */
 #define SYS_EVENT_QUEUE_DESTROY_FORCE  1
 
 typedef struct sys_event_queue_info {
     int      active;
-    uint32_t protocol;
-    int32_t  type;
-    char     name[8];
     uint64_t key;
 
     /* Circular buffer */
@@ -62,12 +59,11 @@ typedef struct sys_event_queue_info {
     int          tail;
     int          count;
     /* Count of threads currently parked in sys_event_queue_receive on this
-     * queue (audit sec.5 item 4: destroy needs this to decide EBUSY vs
-     * proceeding). Modified only under `lock`. */
+     * queue (destroy needs this to decide EBUSY vs proceeding). Modified
+     * only under `lock`. */
     int          waiters;
     /* Set by sys_event_queue_destroy(mode=FORCE) so parked receivers wake
-     * and return CELL_ECANCELED instead of CELL_ESRCH (RPCS3
-     * sys_event.cpp:273 forced-destroy path). */
+     * and return CELL_ECANCELED instead of CELL_ESRCH. */
     int          force_destroyed;
 
 #ifdef _WIN32
@@ -87,11 +83,8 @@ extern sys_event_queue_info g_sys_event_queues[SYS_EVENT_QUEUE_MAX];
  * -----------------------------------------------------------------------*/
 #define SYS_EVENT_PORT_MAX  256
 
-#define SYS_EVENT_PORT_LOCAL  1
-
 typedef struct sys_event_port_info {
     int      active;
-    int32_t  type;
     uint64_t name;
     int32_t  connected_queue;  /* queue index+1, 0 = not connected */
 } sys_event_port_info;
@@ -103,10 +96,8 @@ extern sys_event_port_info g_sys_event_ports[SYS_EVENT_PORT_MAX];
  * -----------------------------------------------------------------------*/
 #define SYS_EVENT_FLAG_MAX  256
 
-/* sys_event_flag_attribute_t::type (batch fixes item 9a). s23 fix: the real
- * values are 0x10000/0x20000 (RPCS3 sys_event_flag.h:9-10), NOT 0x1/0x2 --
- * the wrong constants rejected every valid create (measured: the game passes
- * type=0x20000 = WAITER_MULTIPLE with the corrected attr-offset parse). */
+/* sys_event_flag_attribute_t::type. The values are 0x10000/0x20000, not
+ * 0x1/0x2 (the game passes type=0x20000 = WAITER_MULTIPLE). */
 #define SYS_SYNC_WAITER_SINGLE   0x10000
 #define SYS_SYNC_WAITER_MULTIPLE 0x20000
 
@@ -118,21 +109,16 @@ extern sys_event_port_info g_sys_event_ports[SYS_EVENT_PORT_MAX];
 
 typedef struct sys_event_flag_info {
     int      active;
-    uint32_t protocol;
     uint32_t type;       /* single / multi waiter */
-    char     name[8];
     uint64_t pattern;    /* 64-bit flag word */
-    /* Batch fixes item 9(b)/(c): count of threads parked in
-     * sys_event_flag_wait, so a SYS_SYNC_WAITER_SINGLE flag can reject a
-     * second concurrent waiter (RPCS3 sys_event_flag.cpp:170-173) and destroy
-     * can refuse to tear down a flag with parked waiters (:103-108). */
+    /* Count of threads parked in sys_event_flag_wait, so a
+     * SYS_SYNC_WAITER_SINGLE flag can reject a second concurrent waiter and
+     * destroy can refuse to tear down a flag with parked waiters. */
     int      waiters;
-    /* Batch fixes item 9(d), reworked per Lv2 Reference p.232: cancellation
-     * applies only to threads waiting AT THE TIME of the cancel call. A
-     * sticky flag poisoned every later wait with CELL_ECANCELED forever
-     * (2026-08-04 doc-conformance audit); a generation counter scopes it:
-     * waiters snapshot cancel_gen at park time and report ECANCELED only if
-     * it changed while they were parked. */
+    /* Cancellation applies only to threads waiting at the time of the cancel
+     * call; a sticky flag would poison every later wait with CELL_ECANCELED.
+     * A generation counter scopes it: waiters snapshot cancel_gen at park
+     * time and report ECANCELED only if it changed while they were parked. */
     unsigned cancel_gen;
 
 #ifdef _WIN32
@@ -178,9 +164,8 @@ int64_t sys_event_flag_cancel(ppu_context* ctx);
 /* Registration */
 void sys_event_init(lv2_syscall_table* tbl);
 
-/* Public helper for non-syscall callers (e.g. SPU group/thread bridges
- * that need to notify PPU code of completion). Pushes an event into
- * the queue identified by queue_id. Returns 0 on success, -1 if the
+/* Public helper for non-syscall callers (used by audio and SPU event
+ * delivery). Pushes an event into the queue identified by queue_id. Returns 0 on success, -1 if the
  * queue is unknown/inactive or full. */
 int sys_event_queue_push_by_id(uint32_t queue_id,
                                uint64_t source, uint64_t data1,

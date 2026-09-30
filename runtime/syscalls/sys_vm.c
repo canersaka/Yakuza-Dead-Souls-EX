@@ -7,7 +7,7 @@
  * vsize satisfies the contract exactly: every page is always resident and
  * the paging-control syscalls (touch/lock/flush/...) are trivially done.
  *
- * Call contract verified against the Yakuza EBOOT itself (func_00072510):
+ * Call contract, as issued by the game's memory-arena setup:
  *   r3 = vsize   (the game rounds it up to a 32 MB multiple first)
  *   r4 = psize   (the game rounds it up to a 64 KB multiple first)
  *   r5 = cid     (memory container, 0xFFFFFFFF = none)
@@ -15,9 +15,9 @@
  *   r7 = policy  (1 = auto recommended)
  *   r8 = guest u32* that receives the mapped base address
  * The game reads the u32 back, passes it to sys_vm_touch (306) and uses it
- * as a heap arena base. RPCS3's sys_vm.cpp used as a read-only cross-check.
+ * as a heap arena base.
  *
- * sys_vm_test (311) and sys_vm_get_statistics (312) are intentionally NOT
+ * sys_vm_test (311) and sys_vm_get_statistics (312) are intentionally not
  * registered: both write result structs whose layout we have not verified
  * from a primary source, and the default table handler logs any call loudly
  * instead of corrupting memory with a guessed layout.
@@ -25,7 +25,6 @@
 
 #include "sys_vm.h"
 #include "sys_memory.h"
-#include <stdio.h>
 #include <string.h>
 
 /* ---------------------------------------------------------------------------
@@ -73,16 +72,12 @@ int64_t sys_vm_memory_map(ppu_context* ctx)
         vsize > (SYS_VM_REGION_END - SYS_VM_REGION_BASE))
         return (int64_t)(int32_t)CELL_EINVAL;
 
-    /* M8 (partial -- see analyst report): real lv2 additionally rejects
-     * psize < 1M, but ONLY when reached via syscall 300 (sys_vm_memory_map)
-     * and not 313 (sys_vm_memory_map_different), which shares this handler.
-     * RPCS3 sys_vm.cpp:61: `if (ppu.gpr[11] == 300 && psize < 0x10'0000)
-     * return CELL_EINVAL;`. psize's granularity itself is fixed at 64K
-     * regardless of the flag arg on real HW (sys_vm.cpp:56) -- the audit's
-     * "derive granularity from flag" / "psize >= 257MB -> ENOMEM" clauses
-     * were NOT found anywhere in the in-repo RPCS3 oracle (sys_vm.cpp,
-     * sys_memory.cpp, lv2_memory_container); left unimplemented pending
-     * re-verification (see report). */
+    /* Real lv2 additionally rejects psize < 1M, but only when reached via
+     * syscall 300 (sys_vm_memory_map) and not 313
+     * (sys_vm_memory_map_different), which shares this handler. psize's
+     * granularity itself is fixed at 64K regardless of the flag arg on real
+     * HW. Deriving the granularity from the flag, or failing psize >= 257MB
+     * with ENOMEM, is not implemented since neither behavior is confirmed. */
     if ((uint32_t)ctx->gpr[11] == SYS_VM_MEMORY_MAP && psize < 0x100000u)
         return (int64_t)(int32_t)CELL_EINVAL;
 
@@ -111,15 +106,11 @@ int64_t sys_vm_memory_map(ppu_context* ctx)
     if (addr_out != 0)
         write_be32(addr_out, base);
 
-    /* M1: bill psize against the same user-memory budget sys_memory reports
-     * (real HW: ct->take(psize) against the process's lv2_memory_container,
-     * RPCS3 sys_vm.cpp:91; measured on this title, RPCS3.log:61484-61486 +
-     * :62755 -- Avail drops sharply after this call). No-op under
-     * YZ_NO_MEMACCT. */
+    /* Bill psize against the same user-memory budget sys_memory reports
+     * (real HW takes psize from the process's memory container, so the
+     * available amount drops sharply after this call). */
     sys_memory_account(psize);
 
-    fprintf(stderr, "[sys_vm] memory_map(vsize=0x%X, psize=0x%X) -> 0x%08X\n",
-            vsize, psize, base);
     return CELL_OK;
 }
 
@@ -141,7 +132,6 @@ int64_t sys_vm_unmap(ppu_context* ctx)
      * is bump-allocated, so the range is never handed out again. */
     m->active = 0;
 
-    fprintf(stderr, "[sys_vm] unmap(0x%08X)\n", addr);
     return CELL_OK;
 }
 

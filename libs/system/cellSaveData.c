@@ -13,9 +13,6 @@
 #include <string.h>
 #include <stdlib.h>
 #include <sys/stat.h>
-#include <errno.h>
-#include <time.h>
-#include <limits.h>
 
 #ifdef _WIN32
 #  include <windows.h>
@@ -68,12 +65,8 @@ static void build_save_path(char* buf, size_t buf_size, const char* dirName)
 #endif
 }
 
-/* dirNamePrefix may hold multiple '|'-separated prefixes (Save_Data-Reference
- * p.5, p.100); a directory matches if it starts with ANY of them. The old
- * single strncmp compared the whole "A|B" string literally and enumerated
- * nothing -- and this enumeration feeds cellSaveDataListAutoLoad, the New
- * Game gate (2026-08-04 doc-conformance audit). Defined below the file-op
- * helpers; declared here for the enumerators. */
+/* dirNamePrefix may hold several '|'-separated prefixes; a directory matches
+ * if it starts with any of them. Defined below the file-op helpers. */
 static int savedata_prefix_match(const char* name, const char* prefix);
 
 static int dir_exists(const char* path)
@@ -103,9 +96,9 @@ static int dir_exists(const char* path)
  *   CellSaveDataStatGet:     1704 bytes
  *   CellSaveDataStatSet:     12 bytes
  *
- * We use a fixed scratch region at 0x024E0000 (128 KB, just before the
- * cmdbuf region at 0x02500000). Only one savedata operation is in flight
- * at a time, so a bump allocator is sufficient.
+ * We use a fixed guest scratch region at 0x024E0000 (128 KB). Only one
+ * savedata operation is in flight at a time, so a bump allocator is
+ * sufficient.
  * -----------------------------------------------------------------------*/
 
 #define SAVEDATA_SCRATCH_BASE  0x024E0000u
@@ -311,7 +304,7 @@ static void copy_psf_string(char* dst, size_t dst_size,
 }
 
 /* PARAM.SFO is a little-endian PSF container even on the big-endian PPU.
- * RPCS3 stores secure-file classification as integer entries named
+ * Secure-file classification is stored as integer entries named
  * "*<filename>"; the host files themselves are already decrypted. */
 static int parse_binary_param_sfo(const unsigned char* data, size_t size,
                                   SaveDataMetadata* meta)
@@ -495,37 +488,7 @@ static void marshal_statget_init(uint32_t addr, int is_new, const char* dirName,
     vm_write32(addr + 1624, stats ? (u32)bytes_to_kb(stats->system_bytes) : 0);
     vm_write32(addr + 1628, stats ? stats->file_count : 0);
     vm_write32(addr + 1632, 0);              /* fileListNum */
-    vm_write32(addr + 1636, 0);              /* fileList ptr (NULL — no files) */
-}
-
-/* Dispatch funcStat callback via the guest-caller hook.
- * Returns the cbResult.result value the callback wrote, or
- * CELL_SAVEDATA_CBRESULT_ERR_FAILURE if no dispatcher is installed. */
-static s32 dispatch_func_stat(uint32_t func_opd, int is_new, const char* dirName,
-                              uint32_t userdata)
-{
-    if (!g_ps3_guest_caller) return CELL_SAVEDATA_CBRESULT_ERR_FAILURE;
-
-    scratch_reset();
-    uint32_t cb_ea  = scratch_alloc(SAVEDATA_CBRESULT_SIZE);
-    uint32_t get_ea = scratch_alloc(SAVEDATA_STATGET_SIZE);
-    uint32_t set_ea = scratch_alloc(SAVEDATA_STATSET_SIZE);
-    if (!cb_ea || !get_ea || !set_ea) {
-        printf("[cellSaveData] scratch alloc failed\n");
-        return CELL_SAVEDATA_CBRESULT_ERR_FAILURE;
-    }
-
-    marshal_cbresult_init(cb_ea, CELL_SAVEDATA_CBRESULT_OK_NEXT, userdata);
-    marshal_statget_init(get_ea, is_new, dirName, NULL, NULL);
-    /* StatSet zero-init by scratch_alloc */
-
-    printf("[cellSaveData] dispatching funcStat OPD=0x%08X (cb=0x%X get=0x%X set=0x%X, isNew=%d)\n",
-           func_opd, cb_ea, get_ea, set_ea, is_new);
-    g_ps3_guest_caller(func_opd, cb_ea, get_ea, set_ea, 0, 0, 0, 0, 0);
-
-    s32 result = marshal_cbresult_read_result(cb_ea);
-    printf("[cellSaveData] funcStat returned cbResult.result=%d\n", result);
-    return result;
+    vm_write32(addr + 1636, 0);              /* fileList ptr (NULL: no files) */
 }
 
 /* Enumerate save directories matching a prefix. Returns count, fills dirList up to max. */
@@ -694,13 +657,8 @@ static u32 enumerate_save_files(const char* save_path,
             HOST_STAT_T st;
             if (HOST_STAT(full, &st) != 0)
                 continue;
-#ifdef _WIN32
-            if (st.st_mode & _S_IFDIR)
-                continue;
-#else
             if (S_ISDIR(st.st_mode))
                 continue;
-#endif
             if (is_system_file(de->d_name))
                 continue;
             if (stats)
@@ -731,7 +689,6 @@ static u32 enumerate_save_files(const char* save_path,
     return count;
 }
 
-/* Execute file callback: read/write/delete files in the save directory */
 static int savedata_prefix_match(const char* name, const char* prefix)
 {
     if (!prefix || !prefix[0])
@@ -748,6 +705,7 @@ static int savedata_prefix_match(const char* name, const char* prefix)
     return 0;
 }
 
+/* Execute file callback: read/write/delete files in the save directory */
 static s32 process_file_op(const char* save_path, CellSaveDataFileSet* set)
 {
     if (!set || !is_safe_component(set->fileName, CELL_SAVEDATA_FILENAME_SIZE - 1))
@@ -766,12 +724,10 @@ static s32 process_file_op(const char* save_path, CellSaveDataFileSet* set)
         FILE* fp = fopen(file_path, "rb");
         if (!fp) {
             printf("[cellSaveData] file read: cannot open '%s'\n", file_path);
-            /* Save_Data-Overview p.21 / Reference p.105 (0x8002920a): a data
-             * file the game asked to READ but which does not exist terminates
-             * the utility with CELL_SAVEDATA_ERROR_FAILURE. Reporting a
-             * successful 0-byte transfer here let the game proceed on an
-             * uninitialized buffer (2026-08-04 doc-conformance audit). -2 is
-             * the caller's file-not-found sentinel. */
+            /* A READ of a missing file fails the whole operation with
+             * CELL_SAVEDATA_ERROR_FAILURE; reporting a successful 0-byte
+             * transfer would let the game proceed on an uninitialized
+             * buffer. -2 is the caller's sentinel for that case. */
             return -2;
         }
         if (set->fileOffset > 0) {
@@ -1395,12 +1351,12 @@ s32 cellSaveDataDelete2(u32 container)
 }
 
 /* ---------------------------------------------------------------------------
- * Old / non-_2 variants — same wrapper pattern as the _2 versions, with
- * the same guest-callback caveat.
+ * Non-_2 variants: same wrapper pattern as the _2 versions, with the same
+ * guest-callback caveat.
  *
- * Older PS3 SDK builds (e.g. our flOw NPUA80001 dump) link the original
- * cellSaveDataAutoSave / AutoLoad / Delete instead of the _2 variants
- * RPCS3's flOw build uses. Same semantics, different NID.
+ * Older SDK builds import the original cellSaveDataAutoSave / AutoLoad /
+ * Delete entry points instead of the _2 variants; same behaviour, different
+ * NID.
  * -----------------------------------------------------------------------*/
 s32 cellSaveDataAutoSave(u32 version, const char* dirName,
                           u32 errDialog,

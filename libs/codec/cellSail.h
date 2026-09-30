@@ -2,7 +2,7 @@
  * ps3recomp - cellSail HLE
  *
  * High-level media player wrapping PAMF/demux/decode pipeline.
- * Stub — player lifecycle tracked, no actual media playback.
+ * Stub: player and descriptor handles are tracked; no media is decoded.
  */
 
 #ifndef PS3RECOMP_CELL_SAIL_H
@@ -19,8 +19,6 @@ extern "C" {
 #define CELL_SAIL_ERROR_NOT_INITIALIZED       0x80610701
 #define CELL_SAIL_ERROR_ALREADY_INITIALIZED   0x80610702
 #define CELL_SAIL_ERROR_INVALID_ARGUMENT      0x80610703
-#define CELL_SAIL_ERROR_INVALID_STATE         0x80610704
-#define CELL_SAIL_ERROR_NOT_SUPPORTED         0x80610705
 #define CELL_SAIL_ERROR_NOT_FOUND             0x80610706
 #define CELL_SAIL_ERROR_OUT_OF_MEMORY         0x80610707
 
@@ -30,15 +28,9 @@ extern "C" {
 /* Player state */
 #define CELL_SAIL_PLAYER_STATE_CLOSED     0
 #define CELL_SAIL_PLAYER_STATE_INITIALIZED 1
-#define CELL_SAIL_PLAYER_STATE_BOOT_TRANSITION 2
 #define CELL_SAIL_PLAYER_STATE_RUNNING    3
 #define CELL_SAIL_PLAYER_STATE_PAUSE      4
 #define CELL_SAIL_PLAYER_STATE_FINISHED   5
-
-/* Stream types */
-#define CELL_SAIL_STREAM_VIDEO   0
-#define CELL_SAIL_STREAM_AUDIO   1
-#define CELL_SAIL_STREAM_USER    2
 
 /* Types */
 typedef u32 CellSailPlayerHandle;
@@ -129,16 +121,13 @@ typedef struct CellSailMemAllocator {
     void* arg;
 } CellSailMemAllocator;
 
-/* Mirrors RPCS3's CellSailMemAllocatorFuncs: a guest struct of two callback
- * pointers, passed as one pointer arg (not two separate function pointers). */
+/* Guest struct of two callback pointers, passed as one pointer arg (not two
+ * separate function pointers). */
 typedef struct CellSailMemAllocatorFuncs {
     void* pAlloc;
     void* pFree;
 } CellSailMemAllocatorFuncs;
 
-/* Named pFuncs (not "callbacks") so the import-bridge generator's naming
- * heuristic (gen_imports.py param_marshal) treats this as a real guest
- * struct pointer needing host-pointer translation, not a raw callback value. */
 s32 cellSailMemAllocatorInitialize(CellSailMemAllocator* allocator,
                                      CellSailMemAllocatorFuncs* pFuncs);
 

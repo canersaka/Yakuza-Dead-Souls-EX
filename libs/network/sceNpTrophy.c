@@ -7,19 +7,16 @@
  * JSON format (hand-written, no external dependency):
  * { "trophies": [ { "id": N, "timestamp": T }, ... ] }
  *
- * Timestamps (2026-08-05 flow fixes): T is a CellRtcTick -- microseconds
- * since 0001-01-01 00:00:00. ORACLE(librtc-Reference_e.pdf p.5 "CellRtcTick"
- * + pp.19-20 cellRtcGetTick/SetTick: "cumulative time in terms of 1
- * microsecond units starting from 0001/01/01 00:00:00"). Files written by
- * older builds stored Unix SECONDS; those are migrated on load (any nonzero
- * value < 1e12 is treated as seconds -- Unix seconds stay < ~2e9 for
- * centuries while any tick for a date >= 1970 is >= 6.2e16) and rewritten
- * as ticks on the next save.
+ * Timestamps: T is a CellRtcTick, microseconds since 0001-01-01 00:00:00.
+ * Files that hold Unix seconds are migrated on load (any nonzero value
+ * < 1e12 is treated as seconds; Unix seconds stay < ~2e9 for centuries
+ * while any tick for a date >= 1970 is >= 6.2e16) and rewritten as ticks
+ * on the next save.
  *
- * Trophy configuration (2026-08-05): real trophy count, grades, hidden
- * flags and the platinum trophy id are parsed from the game's installed
- * trophy pack (TROPDIR/{commId}_{num}/TROPHY.TRP -> TROPCONF.SFM). When no
- * pack is present the legacy 128-trophy default remains in effect.
+ * Trophy configuration: real trophy count, grades, hidden flags and the
+ * platinum trophy id are parsed from the game's installed trophy pack
+ * (TROPDIR/{commId}_{num}/TROPHY.TRP -> TROPCONF.SFM). When no pack is
+ * present a 128-trophy default is used.
  */
 
 #include "sceNpTrophy.h"
@@ -32,12 +29,10 @@
 
 #ifdef _WIN32
 #include <direct.h>
-#include <io.h>
 #define mkdir_p(path) _mkdir(path)
 #define PATH_SEP '\\'
 #else
 #include <sys/stat.h>
-#include <unistd.h>
 #define mkdir_p(path) mkdir(path, 0755)
 #define PATH_SEP '/'
 #endif
@@ -130,12 +125,8 @@ static void trophy_get_filepath(const SceNpCommunicationId* commId,
 /* ---------------------------------------------------------------------------
  * Timestamp conversion: persisted + API timestamps are CellRtcTick values.
  *
- * ORACLE(librtc-Reference_e.pdf p.5 "CellRtcTick": "Cumulative number of
- * Ticks from 0001/01/01 00:00:00"; pp.19-20 cellRtcGetTick/cellRtcSetTick:
- * "cumulative time in terms of 1 microsecond units starting from
- * 0001/01/01 00:00:00"). Seconds between 0001-01-01 and 1970-01-01:
- * 62135596800 (the same constant libs/misc's cellRtc uses; verified by
- * computation in the 2026-08-04 cellRtc audit).
+ * A CellRtcTick counts microseconds since 0001/01/01 00:00:00. Seconds
+ * between 0001-01-01 and 1970-01-01: 62135596800.
  * -----------------------------------------------------------------------*/
 
 #define TROPHY_RTC_EPOCH_DIFF_SEC 62135596800ULL
@@ -167,15 +158,14 @@ static u64 trophy_normalize_timestamp(u64 persisted)
 /* ---------------------------------------------------------------------------
  * Trophy configuration (TROPHY.TRP -> TROPCONF.SFM)
  *
- * TROPHY.TRP is a flat big-endian container. Layout verified by direct
- * inspection of the title's own pack, MEASURED(gamedata/dev_bdvd/PS3_GAME/
- * TROPDIR/NPWR02712_00/TROPHY.TRP): magic 0xDCA24D00 at +0x00, version at
- * +0x04, file size (be64) at +0x08, entry count (be32) at +0x10, entry size
- * (be32, 0x40) at +0x14; entry table starts at +0x40 with, per entry,
- * name[32] then be64 offset then be64 size. TROPCONF.SFM inside it is XML:
+ * TROPHY.TRP is a flat big-endian container: magic 0xDCA24D00 at +0x00,
+ * version at +0x04, file size (be64) at +0x08, entry count (be32) at
+ * +0x10, entry size (be32, 0x40) at +0x14; entry table starts at +0x40
+ * with, per entry, name[32] then be64 offset then be64 size. TROPCONF.SFM
+ * inside it is XML:
  *   <trophy id="000" hidden="yes" ttype="P" pid="-1"/>
  * ttype: P/G/S/B grade; pid: platinum-group id ("-1" on the platinum
- * itself). This title's set: 49 trophies, 1P/3G/7S/38B, platinum id 0.
+ * itself).
  * -----------------------------------------------------------------------*/
 
 #define TROPHY_TRP_MAGIC     0xDCA24D00u
@@ -227,8 +217,8 @@ static char* trophy_read_tropconf(const SceNpCommunicationId* commId)
 
     /* Same {data}_{num:02} directory convention the XMB uses; resolve the
      * guest path through cellFs so a relocated content root keeps working,
-     * with the literal default-mapping path as fallback (e.g. unit tests
-     * that never initialise cellFs mappings). */
+     * with the default-mapping path as fallback when cellFs has no mapping
+     * for it. */
     snprintf(ps3_path, sizeof(ps3_path),
              "/dev_bdvd/PS3_GAME/TROPDIR/%s_%02u/TROPHY.TRP",
              commId->data, (unsigned)commId->num);
@@ -239,14 +229,14 @@ static char* trophy_read_tropconf(const SceNpCommunicationId* commId)
 
     fp = fopen(trp_path, "rb");
     if (!fp) {
-        printf("[sceNpTrophy] no trophy pack at %s (keeping default trophy count)\n",
-               trp_path);
+        fprintf(stderr, "[sceNpTrophy] no trophy pack at %s (keeping default trophy count)\n",
+                trp_path);
         return NULL;
     }
 
     if (fread(hdr, 1, sizeof(hdr), fp) != sizeof(hdr) ||
         trophy_read_be32(hdr + 0x00) != TROPHY_TRP_MAGIC) {
-        printf("[sceNpTrophy] %s: bad TRP header\n", trp_path);
+        fprintf(stderr, "[sceNpTrophy] %s: bad TRP header\n", trp_path);
         fclose(fp);
         return NULL;
     }
@@ -254,8 +244,8 @@ static char* trophy_read_tropconf(const SceNpCommunicationId* commId)
     entry_count = trophy_read_be32(hdr + 0x10);
     entry_size  = trophy_read_be32(hdr + 0x14);
     if (entry_size < 0x30 || entry_size > 0x100 || entry_count > 4096) {
-        printf("[sceNpTrophy] %s: implausible TRP entry table (%u x 0x%X)\n",
-               trp_path, entry_count, entry_size);
+        fprintf(stderr, "[sceNpTrophy] %s: implausible TRP entry table (%u x 0x%X)\n",
+                trp_path, entry_count, entry_size);
         fclose(fp);
         return NULL;
     }
@@ -287,7 +277,7 @@ static char* trophy_read_tropconf(const SceNpCommunicationId* commId)
 
     fclose(fp);
     if (!conf)
-        printf("[sceNpTrophy] %s: TROPCONF.SFM not found/readable\n", trp_path);
+        fprintf(stderr, "[sceNpTrophy] %s: TROPCONF.SFM not found/readable\n", trp_path);
     return conf;
 }
 
@@ -343,15 +333,13 @@ static int trophy_load_config(TrophyContext* ctx)
     free(conf);
 
     if (max_id_plus1 == 0) {
-        printf("[sceNpTrophy] TROPCONF.SFM parsed but no <trophy> entries; "
-               "keeping default count %u\n", ctx->total_trophies);
+        fprintf(stderr, "[sceNpTrophy] TROPCONF.SFM parsed but no <trophy> entries; "
+                "keeping default count %u\n", ctx->total_trophies);
         return 0;
     }
 
     ctx->total_trophies = max_id_plus1;
     ctx->have_config = 1;
-    printf("[sceNpTrophy] trophy config: %u trophies, platinum id %d\n",
-           ctx->total_trophies, ctx->platinum_id);
     return 1;
 }
 
@@ -395,8 +383,8 @@ static void trophy_save(TrophyContext* ctx)
 
     fp = fopen(filepath, "w");
     if (!fp) {
-        printf("[sceNpTrophy] WARNING: Could not save trophies to %s\n",
-               filepath);
+        fprintf(stderr, "[sceNpTrophy] WARNING: Could not save trophies to %s\n",
+                filepath);
         return;
     }
 
@@ -426,7 +414,7 @@ static void trophy_load(TrophyContext* ctx)
         return; /* no saved data, all locked */
 
     /*
-     * Simple JSON parser -- look for "id": N and "timestamp": T patterns.
+     * Simple JSON parser: look for "id": N and "timestamp": T patterns.
      * This avoids any external JSON library dependency.
      */
     while (fgets(line, sizeof(line), fp)) {
@@ -443,15 +431,13 @@ static void trophy_load(TrophyContext* ctx)
                     sscanf(ts_pos, "\"timestamp\": %llu",
                            (unsigned long long*)&ts);
                 ctx->unlocked[tid] = 1;
-                /* Legacy files stored Unix seconds; new files store
-                 * CellRtcTick microseconds (see file header). */
+                /* Stamps may be Unix seconds or CellRtcTick microseconds;
+                 * normalize to ticks (see file header). */
                 ctx->unlock_time[tid] = trophy_normalize_timestamp(ts);
             }
         }
     }
     fclose(fp);
-
-    printf("[sceNpTrophy] Loaded trophy data from %s\n", filepath);
 }
 
 static u32 trophy_count_unlocked(TrophyContext* ctx)
@@ -478,8 +464,6 @@ s32 sceNpTrophyInit(void* poolPtr, u32 poolSize, u32 containerId, u64 options)
 {
     (void)poolPtr; (void)poolSize; (void)containerId; (void)options;
 
-    printf("[sceNpTrophy] Init()\n");
-
     if (s_trophy_initialized)
         return SCE_NP_TROPHY_ERROR_ALREADY_INITIALIZED;
 
@@ -491,8 +475,6 @@ s32 sceNpTrophyInit(void* poolPtr, u32 poolSize, u32 containerId, u64 options)
 
 s32 sceNpTrophyTerm(void)
 {
-    printf("[sceNpTrophy] Term()\n");
-
     if (!s_trophy_initialized)
         return SCE_NP_TROPHY_ERROR_NOT_INITIALIZED;
 
@@ -521,8 +503,8 @@ s32 sceNpTrophyCreateContext(SceNpTrophyContext* context,
     if (!context || !commId)
         return SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT;
 
-    /* NP_Trophy-Reference p.35: the only defined option bit is
-     * CREATE_CONTEXT_READ_ONLY; undefined bits -> NOT_SUPPORTED. */
+    /* The only defined option bit is CREATE_CONTEXT_READ_ONLY; undefined
+     * bits -> NOT_SUPPORTED. */
     if (options & ~SCE_NP_TROPHY_OPTIONS_CREATE_CONTEXT_READ_ONLY)
         return SCE_NP_TROPHY_ERROR_NOT_SUPPORTED;
 
@@ -536,8 +518,6 @@ s32 sceNpTrophyCreateContext(SceNpTrophyContext* context,
             s_contexts[i].read_only =
                 (options & SCE_NP_TROPHY_OPTIONS_CREATE_CONTEXT_READ_ONLY) ? 1 : 0;
             trophy_store_be32(context, (u32)i);
-            printf("[sceNpTrophy] CreateContext(commId=\"%s\"%s) -> ctx=%d\n",
-                   commId->data, s_contexts[i].read_only ? ", READ_ONLY" : "", i);
             return CELL_OK;
         }
     }
@@ -558,7 +538,6 @@ s32 sceNpTrophyDestroyContext(SceNpTrophyContext context)
         trophy_save(&s_contexts[context]);
 
     s_contexts[context].in_use = 0;
-    printf("[sceNpTrophy] DestroyContext(ctx=%d)\n", context);
     return CELL_OK;
 }
 
@@ -574,7 +553,6 @@ s32 sceNpTrophyCreateHandle(SceNpTrophyHandle* handle)
         if (!s_handles[i].in_use) {
             s_handles[i].in_use = 1;
             trophy_store_be32(handle, (u32)i);
-            printf("[sceNpTrophy] CreateHandle() -> handle=%d\n", i);
             return CELL_OK;
         }
     }
@@ -592,32 +570,22 @@ s32 sceNpTrophyDestroyHandle(SceNpTrophyHandle handle)
         return SCE_NP_TROPHY_ERROR_INVALID_HANDLE;
 
     s_handles[handle].in_use = 0;
-    printf("[sceNpTrophy] DestroyHandle(handle=%d)\n", handle);
     return CELL_OK;
 }
 
 /* Dispatch one status callback into guest code and return its (s32) result.
  *
- * Guest signature (ORACLE np/trophy.h:123-129):
+ * Guest signature:
  *   int cb(SceNpTrophyContext context, SceNpTrophyStatus status,
  *          int completed, int total, void *arg)   -> r3..r7, result in r3.
  *
  * `statusCb` is the raw guest OPD address and `arg` the raw guest pointer
- * (the import bridge passes both untranslated -- import_bridges_gen.cpp
- * yz_imp_sceNpTrophyRegisterContext).
+ * (the import bridge passes both untranslated).
  *
- * Delivery deviation, recorded: NP_Trophy-Reference p.23 routes these
- * callbacks through the cellSysutilCheckCallback pump (RegisterContext
- * blocks on a subthread while the main thread pumps). Our sysutil queue
- * only carries the 3-arg sysutil signature, and every module-specific
- * callback in this tree (cellMsgDialog, cellSaveData, cellGcm handlers)
- * dispatches synchronously through the guest-caller hook instead. We follow
- * that convention: in-order synchronous calls on the caller thread. Since
- * RegisterContext is documented blocking (Reference p.44 Notes), the guest
- * still observes every callback complete before the function returns; only
- * the thread affinity of the callback body differs.
+ * Status callbacks run synchronously on the calling thread, like the other
+ * module callbacks (cellMsgDialog, cellSaveData, cellGcm).
  *
- * Returns 0 ("continue") when no guest caller is installed (unit tests). */
+ * Returns 0 (continue) when no guest caller is installed. */
 static s32 trophy_dispatch_status_cb(SceNpTrophyStatusCallback statusCb,
                                      void* arg, s32 context, u32 status,
                                      s32 completed, s32 total)
@@ -657,7 +625,7 @@ s32 sceNpTrophyRegisterContext(SceNpTrophyContext context,
                                void* callbackArg,
                                u64 options)
 {
-    (void)options;   /* REGISTER_CONTEXT_SHOW_ERROR_EXIT: no dialog UI here */
+    (void)options;   /* SHOW_ERROR_EXIT bit is ignored: no dialog UI here */
 
     if (!s_trophy_initialized)
         return SCE_NP_TROPHY_ERROR_NOT_INITIALIZED;
@@ -670,7 +638,7 @@ s32 sceNpTrophyRegisterContext(SceNpTrophyContext context,
         !s_handles[handle].in_use)
         return SCE_NP_TROPHY_ERROR_INVALID_HANDLE;
 
-    /* NP_Trophy-Reference p.42: NULL statusCb -> INVALID_ARGUMENT. */
+    /* NULL statusCb -> INVALID_ARGUMENT. */
     if (!statusCb)
         return SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT;
 
@@ -688,13 +656,12 @@ s32 sceNpTrophyRegisterContext(SceNpTrophyContext context,
 
     trophy_load_state(ctx);
 
-    /* Documented status sequence (NP_Trophy-Reference pp.22-23): the first
-     * callback reports the install status; SETUP, PROGRESS xN and FINALIZE
-     * follow; COMPLETE terminates. completed/total feed the game's progress
-     * bar. A negative return from ANY call -- including COMPLETE ("normal
-     * termination when a non-negative number is returned in response to a
-     * processing completion notification") -- aborts registration and the
-     * function returns PROCESSING_ABORTED. */
+    /* Documented status sequence: the first callback reports the install
+     * status; SETUP, PROGRESS xN and FINALIZE follow; COMPLETE terminates.
+     * completed/total feed the game's progress bar. A negative return from
+     * any call, including COMPLETE (normal termination requires a
+     * non-negative return to the completion notification), aborts
+     * registration and the function returns PROCESSING_ABORTED. */
     const s32 total = (s32)ctx->total_trophies;
     struct { u32 status; s32 completed; } seq[8];
     int nseq = 0;
@@ -711,20 +678,11 @@ s32 sceNpTrophyRegisterContext(SceNpTrophyContext context,
         s32 cb_ret = trophy_dispatch_status_cb(statusCb, callbackArg,
                                                context, seq[i].status,
                                                seq[i].completed, total);
-        if (cb_ret < 0) {
-            printf("[sceNpTrophy] RegisterContext(ctx=%d): callback returned %d "
-                   "at status %u -> PROCESSING_ABORTED\n",
-                   context, cb_ret, seq[i].status);
+        if (cb_ret < 0)
             return SCE_NP_TROPHY_ERROR_PROCESSING_ABORTED;
-        }
     }
 
     ctx->registered = 1;
-
-    printf("[sceNpTrophy] RegisterContext(ctx=%d, handle=%d) -> registered "
-           "(%u trophies%s)\n",
-           context, handle, ctx->total_trophies,
-           ctx->have_config ? "" : ", default count -- no trophy pack");
     return CELL_OK;
 }
 
@@ -746,7 +704,6 @@ s32 sceNpTrophyGetRequiredDiskSpace(SceNpTrophyContext context,
 
     /* Typical trophy pack size */
     trophy_store_be64(reqSpace, 1024 * 1024); /* 1 MB */
-    printf("[sceNpTrophy] GetRequiredDiskSpace(ctx=%d) -> 1MB\n", context);
     return CELL_OK;
 }
 
@@ -782,15 +739,15 @@ s32 sceNpTrophyGetGameInfo(SceNpTrophyContext context,
             trophy_store_be32(&details->numSilver,   n[SCE_NP_TROPHY_GRADE_SILVER]);
             trophy_store_be32(&details->numBronze,   n[SCE_NP_TROPHY_GRADE_BRONZE]);
         } else {
-            /* No trophy pack: keep the legacy placeholder set. */
+            /* No trophy pack: report a placeholder set. */
             trophy_store_be32(&details->numTrophies, 32);
             trophy_store_be32(&details->numPlatinum, 1);
             trophy_store_be32(&details->numGold, 2);
             trophy_store_be32(&details->numSilver, 8);
             trophy_store_be32(&details->numBronze, 21);
         }
-        /* Real title/description live in TROP.SFM; not parsed (this entry
-         * point is not imported by the current title). */
+        /* Title and description come from TROP.SFM, which is not parsed;
+         * placeholders are returned. */
         strncpy(details->title, "PS3 Game",
                 SCE_NP_TROPHY_GAME_TITLE_MAX_SIZE - 1);
         strncpy(details->description, "Trophy set",
@@ -806,7 +763,7 @@ s32 sceNpTrophyGetGameInfo(SceNpTrophyContext context,
                 if (ctx->unlocked[i] && ctx->grade[i] <= SCE_NP_TROPHY_GRADE_BRONZE)
                     u[ctx->grade[i]]++;
         } else {
-            u[SCE_NP_TROPHY_GRADE_BRONZE] = unlocked;   /* legacy estimate */
+            u[SCE_NP_TROPHY_GRADE_BRONZE] = unlocked;   /* estimate */
         }
         trophy_store_be32(&data->unlockedTrophies, unlocked);
         trophy_store_be32(&data->unlockedPlatinum, u[SCE_NP_TROPHY_GRADE_PLATINUM]);
@@ -815,7 +772,6 @@ s32 sceNpTrophyGetGameInfo(SceNpTrophyContext context,
         trophy_store_be32(&data->unlockedBronze,   u[SCE_NP_TROPHY_GRADE_BRONZE]);
     }
 
-    printf("[sceNpTrophy] GetGameInfo(ctx=%d)\n", context);
     return CELL_OK;
 }
 
@@ -848,8 +804,8 @@ s32 sceNpTrophyGetTrophyInfo(SceNpTrophyContext context,
         trophy_store_be32(&details->trophyGrade,
                           ctx->have_config ? (u32)ctx->grade[trophyId]
                                            : SCE_NP_TROPHY_GRADE_BRONZE);
-        /* Real name/description live in TROP.SFM; not parsed (this entry
-         * point is not imported by the current title). */
+        /* Name and description come from TROP.SFM, which is not parsed;
+         * placeholders are returned. */
         snprintf(details->name, SCE_NP_TROPHY_NAME_MAX_SIZE,
                  "Trophy %d", trophyId);
         snprintf(details->description, SCE_NP_TROPHY_DESC_MAX_SIZE,
@@ -870,7 +826,7 @@ s32 sceNpTrophyGetTrophyInfo(SceNpTrophyContext context,
 
 /* True when every trophy gating the platinum is unlocked. A trophy gates
  * the platinum when it is a member of the platinum group: its pid matches
- * the platinum id, or -- when the config carried no pid attribute -- it is
+ * the platinum id, or (when the config carried no pid attribute) it is
  * simply any non-platinum trophy. */
 static int trophy_platinum_requirements_met(const TrophyContext* ctx)
 {
@@ -907,19 +863,18 @@ s32 sceNpTrophyUnlockTrophy(SceNpTrophyContext context,
 
     TrophyContext* ctx = &s_contexts[context];
 
-    /* A READ_ONLY context exists "to reference trophies without unlocking
-     * them" (NP_Trophy-Reference p.35). The exact reject code for trying is
-     * not documented; NOT_SUPPORTED is the closest defined one (INFERRED). */
+    /* A READ_ONLY context exists to reference trophies without unlocking
+     * them. The exact reject code for trying is not documented;
+     * NOT_SUPPORTED is the closest defined one. */
     if (ctx->read_only)
         return SCE_NP_TROPHY_ERROR_NOT_SUPPORTED;
 
-    /* Out-of-range id: "The trophy ID may exceed the maximum allowable
-     * number of trophies" -> INVALID_TROPHY_ID (Reference p.48). */
+    /* Out-of-range id -> INVALID_TROPHY_ID. */
     if (trophyId < 0 || (u32)trophyId >= ctx->total_trophies)
         return SCE_NP_TROPHY_ERROR_INVALID_TROPHY_ID;
 
-    /* "The platinum trophy is unlocked by the system and cannot be unlocked
-     * by this function" (Reference p.48). */
+    /* The platinum trophy is unlocked by the system and cannot be unlocked
+     * by this function. */
     if (ctx->have_config && ctx->platinum_id >= 0 &&
         trophyId == ctx->platinum_id)
         return SCE_NP_TROPHY_ERROR_PLATINUM_CANNOT_UNLOCK;
@@ -931,25 +886,16 @@ s32 sceNpTrophyUnlockTrophy(SceNpTrophyContext context,
     ctx->unlocked[trophyId] = 1;
     ctx->unlock_time[trophyId] = trophy_now_tick();
 
-    printf("************************************************************\n");
-    printf("*  TROPHY UNLOCKED!  Trophy #%d                            \n",
-           trophyId);
-    printf("*  Context: %d  CommId: %s                                 \n",
-           context, ctx->commId.data);
-    printf("************************************************************\n");
-
-    /* Platinum award (Reference p.48: when the requirements are met as a
-     * result of this unlock, the platinum id is returned in *platinumId;
-     * otherwise INVALID_TROPHY_ID). The system performs the actual platinum
-     * unlock, so record it here too. */
+    /* Platinum award: when the requirements are met as a result of this
+     * unlock, the platinum id is returned in *platinumId; otherwise
+     * INVALID_TROPHY_ID. The system performs the actual platinum unlock,
+     * so record it here too. */
     s32 awarded_platinum = SCE_NP_TROPHY_INVALID_TROPHY_ID;
     if (ctx->platinum_id >= 0 && !ctx->unlocked[ctx->platinum_id] &&
         trophy_platinum_requirements_met(ctx)) {
         ctx->unlocked[ctx->platinum_id] = 1;
         ctx->unlock_time[ctx->platinum_id] = ctx->unlock_time[trophyId];
         awarded_platinum = ctx->platinum_id;
-        printf("*  PLATINUM UNLOCKED!  Trophy #%d                          \n",
-               ctx->platinum_id);
     }
 
     /* Save immediately */
@@ -977,9 +923,8 @@ s32 sceNpTrophyGetTrophyUnlockState(SceNpTrophyContext context,
 
     TrophyContext* ctx = &s_contexts[context];
 
-    /* NP_Trophy-Reference p.35: a READ_ONLY context "can use
-     * sceNpTrophyGetTrophyUnlockState(). When doing so, there is no need to
-     * call sceNpTrophyRegisterContext()." Load config + persisted state on
+    /* A READ_ONLY context can use sceNpTrophyGetTrophyUnlockState() without
+     * calling sceNpTrophyRegisterContext(). Load config + persisted state on
      * demand for that path; every other context must be registered. */
     if (!ctx->registered) {
         if (!ctx->read_only)
@@ -998,9 +943,9 @@ s32 sceNpTrophyGetTrophyUnlockState(SceNpTrophyContext context,
     for (u32 i = 0; i < SCE_NP_TROPHY_MAX_NUM_TROPHIES / 32; i++)
         trophy_store_be32(&flags->flag[i], words[i]);
 
-    /* "count will return the number of valid bits in flags" (Reference
-     * p.56) -- the real trophy count when the pack config is present, not
-     * the 128-bit array capacity. */
+    /* count returns the number of valid bits in flags: the real trophy
+     * count when the pack config is present, not the 128-bit array
+     * capacity. */
     trophy_store_be32(count, ctx->total_trophies);
     return CELL_OK;
 }
@@ -1029,8 +974,5 @@ s32 sceNpTrophyGetGameProgress(SceNpTrophyContext context,
 
     const s32 result = total > 0 ? (s32)((unlocked * 100) / total) : 0;
     trophy_store_be32(percentage, (u32)result);
-
-    printf("[sceNpTrophy] GetGameProgress(ctx=%d) -> %d%%\n",
-           context, result);
     return CELL_OK;
 }

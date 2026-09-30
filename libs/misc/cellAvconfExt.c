@@ -6,7 +6,6 @@
  */
 
 #include "cellAvconfExt.h"
-#include <stdio.h>
 #include <string.h>
 
 /* ---------------------------------------------------------------------------
@@ -22,13 +21,10 @@ static float s_gamma = 1.0f;
 s32 cellAudioOutGetSoundAvailability(u32 audioOut, u32 type, u32 fs, u32 option)
 {
     (void)audioOut;
+    (void)fs;
     (void)option;
 
-    /* Report 2-channel LPCM at 48kHz as always available */
-    if (type == CELL_AUDIO_OUT_CODING_TYPE_LPCM && (fs & CELL_AUDIO_OUT_FS_48KHZ))
-        return CELL_AUDIO_OUT_CHNUM_2;
-
-    /* 6-channel (5.1) LPCM also available */
+    /* Only 2-channel LPCM is reported as available, at any sampling rate. */
     if (type == CELL_AUDIO_OUT_CODING_TYPE_LPCM)
         return CELL_AUDIO_OUT_CHNUM_2;
 
@@ -54,9 +50,6 @@ s32 cellAudioOutGetDeviceInfo(u32 audioOut, u32 deviceIndex,
     (void)audioOut;
     (void)deviceIndex;
 
-    printf("[cellAvconfExt] AudioOutGetDeviceInfo(out=%u, dev=%u)\n",
-           audioOut, deviceIndex);
-
     if (!info)
         return CELL_EINVAL;
 
@@ -81,8 +74,6 @@ s32 cellAudioOutGetConfiguration(u32 audioOut,
     (void)option;
     (void)optionSize;
 
-    printf("[cellAvconfExt] AudioOutGetConfiguration()\n");
-
     if (!config)
         return CELL_EINVAL;
 
@@ -96,7 +87,7 @@ s32 cellAudioOutGetConfiguration(u32 audioOut,
 s32 cellAudioOutSetCopyControl(u32 audioOut, u32 control)
 {
     (void)audioOut;
-    printf("[cellAvconfExt] AudioOutSetCopyControl(control=%u)\n", control);
+    (void)control;
     return CELL_OK;
 }
 
@@ -117,7 +108,6 @@ s32 cellVideoOutGetGamma(u32 videoOut, float* gamma)
 s32 cellVideoOutSetGamma(u32 videoOut, float gamma)
 {
     (void)videoOut;
-    printf("[cellAvconfExt] VideoOutSetGamma(%.2f)\n", gamma);
     s_gamma = gamma;
     return CELL_OK;
 }

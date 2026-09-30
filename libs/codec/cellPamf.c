@@ -1,13 +1,10 @@
 /*
  * ps3recomp - cellPamf HLE implementation
  *
- * Parses PAMF container headers to extract stream information.
- * The actual PAMF header format is parsed to provide correct stream
- * counts and codec parameters to cellDmux/cellVdec/cellAdec.
+ * Parses PAMF container headers to report stream counts and codec parameters.
  */
 
 #include "cellPamf.h"
-#include <stdio.h>
 #include <string.h>
 
 /* ---------------------------------------------------------------------------
@@ -48,7 +45,7 @@
 /* Stream descriptor size (fixed 24 bytes per descriptor) */
 #define PAMF_STREAM_DESC_SIZE     24
 
-/* Raw stream type values in the PAMF file (different from SDK constants!) */
+/* Raw stream type values in the PAMF file (different from the SDK constants) */
 #define PAMF_RAW_TYPE_AVC         1
 #define PAMF_RAW_TYPE_M2V         2
 #define PAMF_RAW_TYPE_ATRAC3PLUS  3
@@ -102,8 +99,6 @@ s32 cellPamfReaderInitialize(CellPamfReader* reader, void* pamfAddr,
 {
     (void)attribute;
 
-    printf("[cellPamf] ReaderInitialize(addr=%p, size=%u)\n", pamfAddr, pamfSize);
-
     if (!reader || !pamfAddr || pamfSize < PAMF_MIN_HEADER_SIZE)
         return (s32)CELL_PAMF_ERROR_INVALID_ARG;
 
@@ -111,10 +106,8 @@ s32 cellPamfReaderInitialize(CellPamfReader* reader, void* pamfAddr,
 
     /* Verify magic */
     u32 magic = be32(base + PAMF_OFF_MAGIC);
-    if (magic != CELL_PAMF_MAGIC) {
-        printf("[cellPamf] Invalid PAMF magic: 0x%08X\n", magic);
+    if (magic != CELL_PAMF_MAGIC)
         return (s32)CELL_PAMF_ERROR_INVALID_HEADER;
-    }
 
     reader->pamfAddr = pamfAddr;
     reader->pamfSize = pamfSize;
@@ -124,24 +117,6 @@ s32 cellPamfReaderInitialize(CellPamfReader* reader, void* pamfAddr,
     reader->numStreams = (u8)be16(base + PAMF_OFF_NUM_STREAMS);
     reader->currentStream = 0;
     reader->currentEP = 0;
-
-    u32 muxRate = be32(base + PAMF_OFF_MUX_RATE);
-
-    printf("[cellPamf] PAMF v%08X: %u streams, dataOffset=0x%X, dataSize=%u, "
-           "streamTableOff=0x%X, muxRate=%u\n",
-           be32(base + PAMF_OFF_VERSION),
-           reader->numStreams, reader->dataOffset, reader->dataSize,
-           reader->streamTableOffset, muxRate);
-
-    /* Log each stream descriptor */
-    for (u32 i = 0; i < reader->numStreams; i++) {
-        const u8* desc = base + reader->streamTableOffset + i * PAMF_STREAM_DESC_SIZE;
-        u8 rawType = desc[0];
-        u8 channel = desc[1];
-        s32 sdkType = raw_type_to_sdk(rawType);
-        printf("[cellPamf]   stream[%u]: rawType=%u (sdk=%d) channel=%u\n",
-               i, rawType, sdkType, channel);
-    }
 
     return CELL_OK;
 }
@@ -260,7 +235,6 @@ static u32 audio_sample_rate(u8 code)
 {
     switch (code) {
     case 1: return 44100;
-    case 2: return 48000;
     default: return 48000;
     }
 }
@@ -269,7 +243,6 @@ static u8 audio_channels(u8 code)
 {
     switch (code) {
     case 1: return 1;
-    case 2: return 2;
     case 6: return 6;
     case 8: return 8;
     default: return 2;
@@ -279,14 +252,13 @@ static u8 audio_channels(u8 code)
 static u8 lpcm_bits(u8 code)
 {
     switch (code) {
-    case 1: return 16;
     case 2: return 24;
     default: return 16;
     }
 }
 
 /* ---------------------------------------------------------------------------
- * Stream info extraction — reads real codec parameters from descriptors
+ * Stream info extraction: reads real codec parameters from descriptors
  *
  * Stream descriptor layout (24 bytes, big-endian):
  *   Byte  0:    stream type (raw: 1=AVC, 2=M2V, 3=ATRAC3+, 4=AC3, 5=LPCM)
@@ -341,12 +313,6 @@ s32 cellPamfReaderGetStreamInfo(CellPamfReader* reader, void* info, u32 infoSize
             avc->frameCropRightOffset  = desc[19];
             avc->frameCropTopOffset    = desc[20];
             avc->frameCropBottomOffset = desc[21];
-
-            printf("[cellPamf] AVC info: profile=%u level=%u %ux%u "
-                   "frameRate=%u aspect=%u\n",
-                   avc->profileIdc, avc->levelIdc,
-                   avc->horizontalSize, avc->verticalSize,
-                   avc->frameRateCode, avc->aspectRatioIdc);
         }
         break;
 
@@ -356,9 +322,6 @@ s32 cellPamfReaderGetStreamInfo(CellPamfReader* reader, void* info, u32 infoSize
             memset(at3, 0, sizeof(*at3));
             at3->numberOfChannels  = audio_channels(desc[10]);
             at3->samplingFrequency = audio_sample_rate(desc[12]);
-
-            printf("[cellPamf] ATRAC3+ info: %u ch, %u Hz\n",
-                   at3->numberOfChannels, at3->samplingFrequency);
         }
         break;
 
@@ -369,10 +332,6 @@ s32 cellPamfReaderGetStreamInfo(CellPamfReader* reader, void* info, u32 infoSize
             lpcm->numberOfChannels  = audio_channels(desc[10]);
             lpcm->bitsPerSample     = lpcm_bits(desc[11]);
             lpcm->samplingFrequency = audio_sample_rate(desc[12]);
-
-            printf("[cellPamf] LPCM info: %u ch, %u Hz, %u bits\n",
-                   lpcm->numberOfChannels, lpcm->samplingFrequency,
-                   lpcm->bitsPerSample);
         }
         break;
 
@@ -382,9 +341,6 @@ s32 cellPamfReaderGetStreamInfo(CellPamfReader* reader, void* info, u32 infoSize
             memset(ac3, 0, sizeof(*ac3));
             ac3->numberOfChannels  = audio_channels(desc[10]);
             ac3->samplingFrequency = audio_sample_rate(desc[12]);
-
-            printf("[cellPamf] AC3 info: %u ch, %u Hz\n",
-                   ac3->numberOfChannels, ac3->samplingFrequency);
         }
         break;
 
@@ -406,7 +362,6 @@ s32 cellPamfReaderGetStreamIndex(CellPamfReader* reader)
 s32 cellPamfStreamTypeToEsFilterId(u8 streamType, u8 streamIndex,
                                      void* esFilterId)
 {
-    (void)streamType; (void)streamIndex;
     if (!esFilterId)
         return (s32)CELL_PAMF_ERROR_INVALID_ARG;
 

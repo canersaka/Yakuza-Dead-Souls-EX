@@ -5,19 +5,14 @@
  * from each active port's buffer in guest memory, mixes them, and outputs
  * to the host audio device.
  *
- * Backend selection:
- *   - Windows default: WASAPI (via mmdeviceapi)
- *   - Everywhere else / if PS3RECOMP_AUDIO_USE_SDL2 defined: SDL2 audio
- *
- * Define PS3RECOMP_AUDIO_USE_SDL2 to force SDL2 backend on Windows.
+ * Output: WASAPI shared mode.
  */
 
 #include "cellAudio.h"
 #include <stdio.h>
 #include <string.h>
-#include <stdlib.h>
-#include <math.h>
-#include "../../runtime/memory/vm.h"   /* vm_commit, vm_to_host, vm_base */
+#include "ps3emu/endian.h"
+#include "../../runtime/memory/vm.h"   /* vm_commit, vm_to_host */
 
 /* sys_event helpers (C-linkage; defined in runtime/syscalls/sys_event.c).
  * Declared directly to avoid pulling sys_event.h's C++ guards into this C file. */
@@ -27,98 +22,49 @@ extern int          sys_event_queue_push_by_id(unsigned int qid, unsigned long l
 extern unsigned int sys_event_find_queue_by_key(unsigned long long key);
 
 /* ---------------------------------------------------------------------------
- * Backend selection
+ * WASAPI / threading setup
  * -----------------------------------------------------------------------*/
 
-#if defined(PS3RECOMP_AUDIO_USE_SDL2)
-  #define AUDIO_BACKEND_SDL2    1
-  #define AUDIO_BACKEND_WASAPI  0
-#elif defined(_WIN32)
-  #define AUDIO_BACKEND_SDL2    0
-  #define AUDIO_BACKEND_WASAPI  1
-#else
-  #define AUDIO_BACKEND_SDL2    1
-  #define AUDIO_BACKEND_WASAPI  0
+#ifndef WIN32_LEAN_AND_MEAN
+  #define WIN32_LEAN_AND_MEAN
 #endif
+#include <windows.h>
+#include <mmdeviceapi.h>
+#include <audioclient.h>
+#include <process.h>
 
-#if AUDIO_BACKEND_WASAPI
-  #ifndef WIN32_LEAN_AND_MEAN
-    #define WIN32_LEAN_AND_MEAN
-  #endif
-  #include <windows.h>
-  #include <mmdeviceapi.h>
-  #include <audioclient.h>
-  #include <process.h>
+/* Define WASAPI COM GUIDs (avoids needing uuid.lib linkage for these) */
+#define DEFINE_AUDIO_GUID(name, l, w1, w2, b1, b2, b3, b4, b5, b6, b7, b8) \
+        const GUID name = { l, w1, w2, { b1, b2, b3, b4, b5, b6, b7, b8 } }
+DEFINE_AUDIO_GUID(ps3r_CLSID_MMDeviceEnumerator, 0xBCDE0395,0xE52F,0x467C,0x8E,0x3D,0xC4,0x57,0x92,0x91,0x69,0x2E);
+DEFINE_AUDIO_GUID(ps3r_IID_IMMDeviceEnumerator,  0xA95664D2,0x9614,0x4F35,0xA7,0x46,0xDE,0x8D,0xB6,0x36,0x17,0xE6);
+DEFINE_AUDIO_GUID(ps3r_IID_IAudioClient,         0x1CB9AD4C,0xDBFA,0x4c32,0xB1,0x78,0xC2,0xF5,0x68,0xA7,0x03,0xB2);
+DEFINE_AUDIO_GUID(ps3r_IID_IAudioRenderClient,   0xF294ACFC,0x3146,0x4483,0xA7,0xBF,0xAD,0xDC,0xA7,0xC2,0x60,0xE2);
 
-  /* Define WASAPI COM GUIDs (avoids needing uuid.lib linkage for these) */
-  #ifdef __cplusplus
-    #define GUID_SECT
-  #else
-    #define GUID_SECT
-  #endif
-  #ifndef DEFINE_AUDIO_GUID
-    #ifdef INITGUID
-      #define DEFINE_AUDIO_GUID(name, l, w1, w2, b1, b2, b3, b4, b5, b6, b7, b8) \
-              const GUID name = { l, w1, w2, { b1, b2, b3, b4, b5, b6, b7, b8 } }
-    #else
-      #define DEFINE_AUDIO_GUID(name, l, w1, w2, b1, b2, b3, b4, b5, b6, b7, b8) \
-              const GUID name = { l, w1, w2, { b1, b2, b3, b4, b5, b6, b7, b8 } }
-    #endif
-  #endif
-  DEFINE_AUDIO_GUID(ps3r_CLSID_MMDeviceEnumerator, 0xBCDE0395,0xE52F,0x467C,0x8E,0x3D,0xC4,0x57,0x92,0x91,0x69,0x2E);
-  DEFINE_AUDIO_GUID(ps3r_IID_IMMDeviceEnumerator,  0xA95664D2,0x9614,0x4F35,0xA7,0x46,0xDE,0x8D,0xB6,0x36,0x17,0xE6);
-  DEFINE_AUDIO_GUID(ps3r_IID_IAudioClient,         0x1CB9AD4C,0xDBFA,0x4c32,0xB1,0x78,0xC2,0xF5,0x68,0xA7,0x03,0xB2);
-  DEFINE_AUDIO_GUID(ps3r_IID_IAudioRenderClient,   0xF294ACFC,0x3146,0x4483,0xA7,0xBF,0xAD,0xDC,0xA7,0xC2,0x60,0xE2);
+/* Map to the names used in the code */
+#define IID_IMMDeviceEnumerator  ps3r_IID_IMMDeviceEnumerator
+#define CLSID_MMDeviceEnumerator ps3r_CLSID_MMDeviceEnumerator
+#define IID_IAudioClient         ps3r_IID_IAudioClient
+#define IID_IAudioRenderClient   ps3r_IID_IAudioRenderClient
 
-  /* Map to the names used in the code */
-  #define IID_IMMDeviceEnumerator  ps3r_IID_IMMDeviceEnumerator
-  #define CLSID_MMDeviceEnumerator ps3r_CLSID_MMDeviceEnumerator
-  #define IID_IAudioClient         ps3r_IID_IAudioClient
-  #define IID_IAudioRenderClient   ps3r_IID_IAudioRenderClient
-#endif
-
-#if AUDIO_BACKEND_SDL2
-  #include <SDL2/SDL.h>
-#endif
-
-/* Portable threading */
-#ifdef _WIN32
-  #include <windows.h>
-  typedef HANDLE thread_t;
-  typedef CRITICAL_SECTION mutex_t;
-  #define mutex_init(m)    InitializeCriticalSection(m)
-  #define mutex_destroy(m) DeleteCriticalSection(m)
-  #define mutex_lock(m)    EnterCriticalSection(m)
-  #define mutex_unlock(m)  LeaveCriticalSection(m)
-#else
-  #include <pthread.h>
-  #include <unistd.h>
-  #include <time.h>
-  typedef pthread_t thread_t;
-  typedef pthread_mutex_t mutex_t;
-  #define mutex_init(m)    pthread_mutex_init(m, NULL)
-  #define mutex_destroy(m) pthread_mutex_destroy(m)
-  #define mutex_lock(m)    pthread_mutex_lock(m)
-  #define mutex_unlock(m)  pthread_mutex_unlock(m)
-#endif
+typedef HANDLE thread_t;
+typedef CRITICAL_SECTION mutex_t;
+#define mutex_init(m)    InitializeCriticalSection(m)
+#define mutex_destroy(m) DeleteCriticalSection(m)
+#define mutex_lock(m)    EnterCriticalSection(m)
+#define mutex_unlock(m)  LeaveCriticalSection(m)
 
 /* ---------------------------------------------------------------------------
  * Internal state
  * -----------------------------------------------------------------------*/
 
-/* Per-port audio buffer allocated on the host side.
- * In a full emulator these would be in guest VM memory; here we allocate
- * host buffers and expose their addresses through portAddr/readIndexAddr. */
-#define AUDIO_PORT_BUF_MAX  (CELL_AUDIO_BLOCK_32 * CELL_AUDIO_BLOCK_SAMPLES * CELL_AUDIO_PORT_8CH)
-
 typedef struct {
     int                  in_use;
     int                  running;
     CellAudioPortParam   param;
-    float*               buffer;        /* host audio buffer (float samples) */
+    float*               buffer;        /* host view of the guest-VM ring (big-endian float samples) */
     u32                  buf_size;       /* buffer size in bytes */
     u64                  read_index;     /* current read position (block index) */
-    u64                  write_index;    /* where the game is writing */
     /* For address reporting to guest */
     u64                  port_addr;      /* guest-visible buffer address */
     u64                  read_idx_addr;  /* guest-visible read index address */
@@ -126,18 +72,16 @@ typedef struct {
 
 static int            s_audio_initialized = 0;
 static u64            s_audio_start_us = 0;      /* us anchor for GetPortTimestamp */
-/* 2026-08-04 doc-conformance audit: block tags must come from ONE global
- * counter shared by all ports (RPCS3 cellAudio.cpp:1329 seeds each port from
- * the global m_counter), not from the per-port read_index that restarts at 0
- * on every PortOpen -- otherwise a port opened T us after init reports every
- * block T us in the past and two ports contradict each other. Ticks once per
- * mixed block (5.33 ms). */
+/* Block tags come from one global counter shared by all ports, not from the
+ * per-port read_index that restarts at 0 on every PortOpen; otherwise a port
+ * opened T us after init would report every block T us in the past and two
+ * ports would contradict each other. Ticks once per mixed block (5.33 ms). */
 static u64            s_audio_block_counter = 0;
 /* Guest "system time" clock hook (runtime/syscalls/sys_timer.h); registered
  * by the runner before main(). GetPortTimestamp must answer in the same
- * domain the guest reads via sys_time_get_system_time -- the old raw-QPC
- * anchor was on the HOST-uptime epoch, putting every stamp-vs-now delta the
- * surmixer computes off by hours to days. */
+ * domain the guest reads via sys_time_get_system_time; a raw host-uptime
+ * anchor would put every stamp-vs-now delta a guest mixer computes off by
+ * hours to days. */
 extern u64 (*g_lv2_system_time_us)(void);
 static AudioPortSlot  s_ports[CELL_AUDIO_PORT_MAX];
 
@@ -154,28 +98,27 @@ static thread_t      s_mix_thread;
 static mutex_t       s_audio_mutex;
 
 /* ---------------------------------------------------------------------------
- * Guest-VM audio buffers + big-endian I/O (2026-06-21)
+ * Guest-VM audio buffers + big-endian I/O
  *
- * The audio port ring buffer and read-index must live in GUEST VM so the game
- * gets real guest EAs it can read/write (the old code handed out host calloc
- * pointers -> the game couldn't use them). Dedicated region at 0x50000000,
+ * The audio port ring buffer and read-index must live in guest VM so the game
+ * gets real guest EAs it can read/write (host pointers are unusable to the
+ * guest). Dedicated region at 0x50000000,
  * outside the sys_memory window (0x40000000-0x50000000) and the stack
- * (0xD0000000+). Committed on first use; bump-allocated (audio buffers are
- * never individually freed during a session).
+ * (0xD0000000+). Committed on first use; bump-allocated, with closed
+ * ports' blocks recycled through the free list below.
  * -----------------------------------------------------------------------*/
 #define AUDIO_VM_BASE  0x50000000u
 #define AUDIO_VM_SIZE  0x00400000u   /* 4 MB */
 static u32 s_audio_vm_bump = AUDIO_VM_BASE;
 static int s_audio_vm_ready = 0;
 
-/* 2026-08-05 item-K fix 8d (2026-08-04 audit): PortClose never returned the
- * port's ring/read-index blocks to this region, so ~15 open/close cycles
- * exhausted the 4 MB window and every later PortOpen failed forever (a title
- * cycling ports per-movie dies). Freed blocks are recorded here and reused
- * EXACT-SIZE-first by audio_vm_alloc (ports come in a handful of fixed sizes
- * -- 2ch/8ch x 2/4/8/16/32 blocks + the 128-byte read-index -- so exact-fit
- * reclaims the recycled shapes without fragmentation bookkeeping). Callers
- * hold s_audio_mutex on the open/close paths, which serializes access. */
+/* PortClose returns the port's ring/read-index blocks to this region, so a
+ * title that cycles ports (for example per movie) does not exhaust the 4 MB
+ * window. Freed blocks are recorded here and reused exact-size-first by
+ * audio_vm_alloc (ports come in a handful of fixed sizes: 2ch/8ch x
+ * 2/4/8/16/32 blocks + the 128-byte read-index, so exact-fit reclaims the
+ * recycled shapes without fragmentation bookkeeping). Callers hold
+ * s_audio_mutex on the open/close paths, which serializes access. */
 #define AUDIO_VM_FREE_MAX 32
 typedef struct { u32 addr; u32 size; } AudioVmFreeBlock;
 static AudioVmFreeBlock s_audio_vm_free[AUDIO_VM_FREE_MAX];
@@ -215,8 +158,7 @@ static void audio_vm_free(u32 addr, u32 size)
             return;
         }
     }
-    /* Free table full: drop the block (bounded leak, strictly better than
-     * the old always-leak). */
+    /* Free table full: drop the block (bounded leak). */
 }
 
 /* Write host->guest in big-endian (the guest is PPC BE). */
@@ -232,33 +174,15 @@ static void audio_be_w64(u32 ea, u64 v)
     audio_be_w32(ea + 4, (u32)v);
 }
 
-/* Big-endian scalar helpers (guest is PPC BE). Also used by cellAudioPortOpen
- * to byteswap the guest CellAudioPortParam into host-native order. */
-static inline u64 ca_be64(u64 v) {
-#if defined(_MSC_VER)
-    return _byteswap_uint64(v);
-#else
-    return __builtin_bswap64(v);
-#endif
-}
-static inline u32 ca_be32(u32 v) {
-#if defined(_MSC_VER)
-    return _byteswap_ulong(v);
-#else
-    return __builtin_bswap32(v);
-#endif
-}
-
 /* Read a big-endian 32-bit float sample from the guest port buffer.
  * The guest (PPC, big-endian) writes float PCM into port->buffer; the host
- * mixer must byteswap each sample to native order before use (RPCS3 does the
- * same: its port buffer is typed be_t<f32>*, auto-swapped on read). Reinterpret
+ * mixer must byteswap each sample to native order before use. Reinterpret
  * via memcpy to avoid strict-aliasing UB. */
 static inline float rd_be_f32(const float* p)
 {
     u32 w;
     memcpy(&w, p, sizeof(w));
-    w = ca_be32(w);
+    w = ps3_bswap32(w);
     float f;
     memcpy(&f, &w, sizeof(f));
     return f;
@@ -267,13 +191,6 @@ static inline float rd_be_f32(const float* p)
 /* Output mix buffer (stereo, one block worth) */
 static float s_mix_buffer[CELL_AUDIO_BLOCK_SAMPLES * 2];
 
-static int audio_trace_enabled(void)
-{
-    static int cached = -1;
-    if (cached < 0)
-        cached = getenv("YZ_AUDIO_TRACE") ? 1 : 0;
-    return cached;
-}
 
 /* Optional host-native movie stream. It is mixed by the same fixed 48 kHz
  * audio heartbeat as guest ports, making the consumed sample count the movie
@@ -291,65 +208,6 @@ static HostAudioStream s_host_audio;
 /* ---------------------------------------------------------------------------
  * Host audio output backend
  * -----------------------------------------------------------------------*/
-
-#if AUDIO_BACKEND_SDL2
-
-static SDL_AudioDeviceID s_sdl_audio_dev = 0;
-
-static int audio_backend_init(void)
-{
-    if (SDL_WasInit(SDL_INIT_AUDIO) == 0) {
-        if (SDL_InitSubSystem(SDL_INIT_AUDIO) < 0) {
-            printf("[cellAudio] SDL audio init failed: %s\n", SDL_GetError());
-            return -1;
-        }
-    }
-
-    SDL_AudioSpec want, have;
-    memset(&want, 0, sizeof(want));
-    want.freq     = CELL_AUDIO_SAMPLE_RATE;
-    want.format   = AUDIO_F32SYS;
-    want.channels = 2;
-    want.samples  = CELL_AUDIO_BLOCK_SAMPLES;
-    want.callback = NULL; /* We'll use SDL_QueueAudio */
-
-    s_sdl_audio_dev = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
-    if (s_sdl_audio_dev == 0) {
-        printf("[cellAudio] SDL_OpenAudioDevice failed: %s\n", SDL_GetError());
-        return -1;
-    }
-
-    SDL_PauseAudioDevice(s_sdl_audio_dev, 0); /* Start playback */
-    return 0;
-}
-
-static void audio_backend_shutdown(void)
-{
-    if (s_sdl_audio_dev) {
-        SDL_CloseAudioDevice(s_sdl_audio_dev);
-        s_sdl_audio_dev = 0;
-    }
-}
-
-static void audio_backend_submit(const float* stereo_samples, u32 num_samples)
-{
-    if (s_sdl_audio_dev) {
-        SDL_QueueAudio(s_sdl_audio_dev, stereo_samples,
-                       num_samples * 2 * sizeof(float));
-    }
-}
-
-static u32 audio_backend_queued_samples(void)
-{
-    if (s_sdl_audio_dev) {
-        return SDL_GetQueuedAudioSize(s_sdl_audio_dev) / (2 * sizeof(float));
-    }
-    return 0;
-}
-
-#endif /* AUDIO_BACKEND_SDL2 */
-
-#if AUDIO_BACKEND_WASAPI
 
 static IAudioClient*        s_wasapi_client = NULL;
 static IAudioRenderClient*  s_wasapi_render = NULL;
@@ -446,12 +304,6 @@ static int audio_backend_init(void)
         printf("[cellAudio] WASAPI Start failed: 0x%08lX\n", hr);
         return -1;
     }
-    if (audio_trace_enabled()) {
-        printf("[cellAudio-trace] WASAPI active: 48000 Hz stereo float, "
-               "buffer=%u frames, mode=%s\n",
-               (unsigned)s_wasapi_buf_frames,
-               s_wasapi_event ? "event" : "poll");
-    }
     return 0;
 }
 
@@ -476,21 +328,13 @@ static void audio_backend_shutdown(void)
 
 static void audio_backend_submit(const float* stereo_samples, u32 num_samples)
 {
-    static int first_submit_logged = 0;
-    static int first_submit_failure_logged = 0;
     if (!s_wasapi_render) return;
 
     UINT32 padding = 0;
     HRESULT hr = s_wasapi_client->lpVtbl->GetCurrentPadding(
         s_wasapi_client, &padding);
-    if (FAILED(hr)) {
-        if (audio_trace_enabled() && !first_submit_failure_logged) {
-            first_submit_failure_logged = 1;
-            printf("[cellAudio-trace] WASAPI GetCurrentPadding failed: "
-                   "0x%08lX\n", hr);
-        }
+    if (FAILED(hr))
         return;
-    }
 
     UINT32 available = s_wasapi_buf_frames - padding;
     if (num_samples > available)
@@ -503,29 +347,10 @@ static void audio_backend_submit(const float* stereo_samples, u32 num_samples)
         s_wasapi_render, num_samples, &buf);
     if (SUCCEEDED(hr) && buf) {
         memcpy(buf, stereo_samples, num_samples * 2 * sizeof(float));
-        hr = s_wasapi_render->lpVtbl->ReleaseBuffer(
+        s_wasapi_render->lpVtbl->ReleaseBuffer(
             s_wasapi_render, num_samples, 0);
-        if (audio_trace_enabled() && !first_submit_logged &&
-            SUCCEEDED(hr)) {
-            first_submit_logged = 1;
-            printf("[cellAudio-trace] first block accepted by WASAPI "
-                   "(%u frames)\n", (unsigned)num_samples);
-        }
-    } else if (audio_trace_enabled() && !first_submit_failure_logged) {
-        first_submit_failure_logged = 1;
-        printf("[cellAudio-trace] WASAPI GetBuffer failed: 0x%08lX\n", hr);
     }
 }
-
-static u32 audio_backend_queued_samples(void)
-{
-    if (!s_wasapi_client) return 0;
-    UINT32 padding = 0;
-    s_wasapi_client->lpVtbl->GetCurrentPadding(s_wasapi_client, &padding);
-    return padding;
-}
-
-#endif /* AUDIO_BACKEND_WASAPI */
 
 /* ---------------------------------------------------------------------------
  * Mixing
@@ -539,8 +364,8 @@ static void audio_mix_one_block(void)
     mutex_lock(&s_audio_mutex);
 
     /* One global block tick per mixed period (all ports advance together;
-     * libaudio Reference p.23: update notifications are issued at the same
-     * time for all ports). Tag/timestamp queries key off this counter. */
+     * update notifications are issued at the same time for all ports).
+     * Tag/timestamp queries key off this counter. */
     s_audio_block_counter++;
 
     const int mix_guest_ports =
@@ -552,11 +377,9 @@ static void audio_mix_one_block(void)
 
         u32 nch    = (u32)port->param.nChannel;
         u32 nblock = (u32)port->param.nBlock;
-        /* U6 fix (2026-07-09): removed the level<=0 -> 1.0 clamp that used
-         * to live here. cellAudioPortOpen now resolves the port's level
-         * once (honoring CELL_AUDIO_PORTATTR_INITLEVEL, RPCS3
-         * cellAudio.cpp:1340-1346) and an intentional level=0 (mute) must
-         * stay muted through the mixer, not get silently un-muted. */
+        /* cellAudioPortOpen resolves the port's level once (honoring
+         * CELL_AUDIO_PORTATTR_INITLEVEL), and an intentional level=0 (mute)
+         * stays muted through the mixer. */
         float level = port->param.level;
         if (level > 1.0f) level = 1.0f;
         if (level < 0.0f) level = 0.0f;
@@ -566,35 +389,10 @@ static void audio_mix_one_block(void)
         u32 block_offset = block_idx * CELL_AUDIO_BLOCK_SAMPLES * nch;
         float* src = port->buffer + block_offset;
 
-        if (audio_trace_enabled()) {
-            static int first_guest_word_logged = 0;
-            if (!first_guest_word_logged) {
-                const u32 words = CELL_AUDIO_BLOCK_SAMPLES * nch;
-                for (u32 i = 0; i < words; i++) {
-                    u32 raw = 0;
-                    memcpy(&raw, &src[i], sizeof(raw));
-                    if (raw != 0u) {
-                        first_guest_word_logged = 1;
-                        printf("[cellAudio-trace] first nonzero guest PCM "
-                               "word: port=%d block=%u sample=%u "
-                               "raw=0x%08X decoded=%.6f\n",
-                               p, block_idx, i, raw,
-                               (double)rd_be_f32(&src[i]));
-                        break;
-                    }
-                }
-            }
-        }
 
         for (u32 s = 0; s < CELL_AUDIO_BLOCK_SAMPLES; s++) {
-            float left, right;
-            if (nch >= 2) {
-                left  = rd_be_f32(&src[s * nch + 0]) * level;
-                right = rd_be_f32(&src[s * nch + 1]) * level;
-            } else {
-                /* Mono: duplicate to both channels */
-                left = right = rd_be_f32(&src[s]) * level;
-            }
+            float left  = rd_be_f32(&src[s * nch + 0]) * level;
+            float right = rd_be_f32(&src[s * nch + 1]) * level;
 
             /* If 7.1, mix center and other channels into stereo */
             if (nch == 8) {
@@ -614,18 +412,15 @@ static void audio_mix_one_block(void)
             }
         }
 
-        /* s23 conformance fix: ZERO the consumed block. Spec: "When the
-         * AudioServer reads audio data from the ring buffer, it clears the
-         * content of the blocks it finished reading" (libaudio overview);
-         * RPCS3 memsets the consumed block before advancing (cellAudio.cpp
-         * reset_ports pattern). Besides fidelity (a stalled producer must go
-         * SILENT, not loop stale PCM), block-clearing is a documented
-         * consumption signal a producer can poll -- frontier-relevant. */
+        /* Zero the consumed block: the audio server clears the blocks it has
+         * finished reading. Besides fidelity (a stalled producer must go
+         * silent, not loop stale PCM), block-clearing is a documented
+         * consumption signal a producer can poll. */
         memset(src, 0, CELL_AUDIO_BLOCK_SAMPLES * nch * sizeof(float));
 
         /* Advance read index + publish the block index to the guest (BE u64 at
-         * read_idx_addr) so the game's audio loop sees blocks being consumed and
-         * keeps feeding the next one (matches RPCS3: *index = cur_pos, 0..nBlock-1). */
+         * read_idx_addr, 0..nBlock-1) so the game's audio loop sees blocks being
+         * consumed and keeps feeding the next one. */
         port->read_index++;
         if (port->read_idx_addr)
             audio_be_w64((u32)port->read_idx_addr, port->read_index % nblock);
@@ -653,26 +448,6 @@ static void audio_mix_one_block(void)
         if (s_mix_buffer[i] < -1.0f) s_mix_buffer[i] = -1.0f;
     }
 
-    if (audio_trace_enabled()) {
-        static int first_nonzero_logged = 0;
-        static int first_audible_logged = 0;
-        float peak = 0.0f;
-        for (u32 i = 0; i < CELL_AUDIO_BLOCK_SAMPLES * 2; i++) {
-            float sample = s_mix_buffer[i];
-            if (sample < 0.0f) sample = -sample;
-            if (sample > peak) peak = sample;
-        }
-        if (!first_nonzero_logged && peak > 0.000001f) {
-            first_nonzero_logged = 1;
-            printf("[cellAudio-trace] first nonzero mixed block "
-                   "(peak=%.6f)\n", (double)peak);
-        }
-        if (!first_audible_logged && peak > 0.001f) {
-            first_audible_logged = 1;
-            printf("[cellAudio-trace] first audible-level mixed block "
-                   "(peak=%.6f)\n", (double)peak);
-        }
-    }
 }
 
 /* ---------------------------------------------------------------------------
@@ -695,42 +470,22 @@ static void audio_notify_event_queues(void)
 }
 
 /* ---------------------------------------------------------------------------
- * Guest block-progression pacing (conformance fix, 2026-07-11)
+ * Guest block-progression pacing
  *
  * The console's audio server runs a fixed hardware heartbeat: one block is
- * exactly 256 samples / 5.3 ms (5 1/3 ms), and BOTH the ring-buffer
+ * exactly 256 samples / 5.3 ms (5 1/3 ms), and both the ring-buffer
  * read-index advance and the per-block notify event fire on that fixed
- * cadence, independent of how the host sink is draining (oracle: RPCS3
- * cellAudio.cpp advances its ring on the emulated clock, never on backend
- * occupancy). Before this fix the loop below paced itself with
- * Sleep(2)/Sleep(5) gated on host WASAPI buffer occupancy, so guest-visible
- * progress rode the backend's drain rate instead of the fixed heartbeat.
- *
- * Kill switch: YZ_AUDIO_LEGACY_PACE reverts to that occupancy-paced
- * Sleep(2)/Sleep(5) branch (prints a banner once, legacy path only).
+ * cadence, independent of how the host sink is draining. Guest-visible
+ * progress therefore never depends on host backend buffer occupancy.
  *
  * Pacing math: the block period (16000/3 us) is not an integer, so rather
  * than accumulate a per-iteration sleep duration (which would accumulate
- * rounding error), every wait target is an ABSOLUTE deadline computed fresh
+ * rounding error), every wait target is an absolute deadline computed fresh
  * from a thread-start anchor and the monotonic block sequence number via
  * 64-bit integer division: deadline = anchor + n * period. Truncation of
  * that division alternates by at most one low-order tick and cancels out
  * exactly every 3 blocks (== 16 ms, an exact integer), so there is no
- * running remainder to leak drift into over an arbitrarily long session. */
-static int audio_legacy_pace(void)
-{
-    static int cached = -1;
-    if (cached < 0) {
-        cached = getenv("YZ_AUDIO_LEGACY_PACE") ? 1 : 0;
-        if (cached)
-            printf("[cellAudio] YZ_AUDIO_LEGACY_PACE: reverting to WASAPI-occupancy "
-                   "pacing (non-conformant; guest block progress rides the host "
-                   "backend's drain rate instead of the fixed 5.3ms heartbeat)\n");
-    }
-    return cached;
-}
-
-#ifdef _WIN32
+ * running remainder to leak drift into over an arbitrarily long run. */
 
 static HANDLE          s_pace_timer;
 static ULARGE_INTEGER  s_pace_anchor;      /* FILETIME 100ns units, thread-start */
@@ -780,132 +535,40 @@ static void audio_pace_wait_block(void)
 static unsigned __stdcall audio_mix_thread_func(void* arg)
 {
     (void)arg;
-    printf("[cellAudio] Mixing thread started\n");
-
-    int legacy = audio_legacy_pace();
-    if (!legacy) audio_pace_reset();
+    audio_pace_reset();
 
     while (s_mix_thread_running) {
         /* Mix and submit one block. audio_backend_submit() still clips to
          * whatever the host WASAPI ring can currently accept (occupancy
-         * governs the HOST sink only, not guest block progression below). */
+         * governs the host sink only, not guest block progression below). */
         audio_mix_one_block();
         audio_backend_submit(s_mix_buffer, CELL_AUDIO_BLOCK_SAMPLES);
 
         /* Notify event queues */
         audio_notify_event_queues();
 
-        if (legacy) {
-            u32 queued = audio_backend_queued_samples();
-            if (queued > CELL_AUDIO_BLOCK_SAMPLES * 4) {
-                Sleep(5);
-            } else {
-                Sleep(2);
-            }
-        } else {
-            audio_pace_wait_block();
-        }
+        audio_pace_wait_block();
     }
 
-    printf("[cellAudio] Mixing thread stopped\n");
     return 0;
 }
-#else
-
-static struct timespec s_pace_anchor_ts;
-static u64             s_pace_block_seq;
-
-static void audio_pace_reset(void)
-{
-    clock_gettime(CLOCK_MONOTONIC, &s_pace_anchor_ts);
-    s_pace_block_seq = 1;   /* block 0 already ran (right at the anchor) */
-}
-
-static void audio_pace_wait_block(void)
-{
-    /* period, in ns: 16000000/3 (== 5.3333... ms). Integer division against
-     * the running sequence number, not an accumulator. */
-    u64 offset_ns = (s_pace_block_seq * 16000000ULL) / 3ULL;
-    s_pace_block_seq++;
-
-    struct timespec target = s_pace_anchor_ts;
-    target.tv_sec  += (time_t)(offset_ns / 1000000000ULL);
-    target.tv_nsec += (long)(offset_ns % 1000000000ULL);
-    if (target.tv_nsec >= 1000000000L) {
-        target.tv_nsec -= 1000000000L;
-        target.tv_sec  += 1;
-    }
-
-#if defined(__linux__)
-    clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &target, NULL);
-#else
-    /* Portable fallback: poll the same monotonic clock. Still zero-drift
-     * (the deadline itself doesn't move), just coarser wake granularity. */
-    for (;;) {
-        struct timespec now;
-        clock_gettime(CLOCK_MONOTONIC, &now);
-        if (now.tv_sec > target.tv_sec ||
-            (now.tv_sec == target.tv_sec && now.tv_nsec >= target.tv_nsec))
-            break;
-        usleep(200);
-    }
-#endif
-}
-
-static void* audio_mix_thread_func(void* arg)
-{
-    (void)arg;
-    printf("[cellAudio] Mixing thread started\n");
-
-    int legacy = audio_legacy_pace();
-    if (!legacy) audio_pace_reset();
-
-    while (s_mix_thread_running) {
-        audio_mix_one_block();
-        audio_backend_submit(s_mix_buffer, CELL_AUDIO_BLOCK_SAMPLES);
-        audio_notify_event_queues();
-
-        if (legacy) {
-            u32 queued = audio_backend_queued_samples();
-            if (queued > CELL_AUDIO_BLOCK_SAMPLES * 4) {
-                usleep(5000);
-            } else {
-                usleep(2000);
-            }
-        } else {
-            audio_pace_wait_block();
-        }
-    }
-
-    printf("[cellAudio] Mixing thread stopped\n");
-    return NULL;
-}
-#endif
 
 static int audio_start_mix_thread(void)
 {
     s_mix_thread_running = 1;
 
-#ifdef _WIN32
     s_mix_thread = (HANDLE)_beginthreadex(NULL, 0, audio_mix_thread_func,
                                            NULL, 0, NULL);
     if (!s_mix_thread) {
         s_mix_thread_running = 0;
         return -1;
     }
-#else
-    if (pthread_create(&s_mix_thread, NULL, audio_mix_thread_func, NULL) != 0) {
-        s_mix_thread_running = 0;
-        return -1;
-    }
-#endif
     return 0;
 }
 
 static void audio_stop_mix_thread(void)
 {
     s_mix_thread_running = 0;
-#ifdef _WIN32
     if (s_mix_thread) {
         WaitForSingleObject(s_mix_thread, 2000);
         CloseHandle(s_mix_thread);
@@ -915,9 +578,6 @@ static void audio_stop_mix_thread(void)
         CloseHandle(s_pace_timer);
         s_pace_timer = NULL;
     }
-#else
-    pthread_join(s_mix_thread, NULL);
-#endif
 }
 
 /* ---------------------------------------------------------------------------
@@ -926,8 +586,6 @@ static void audio_stop_mix_thread(void)
 
 s32 cellAudioInit(void)
 {
-    printf("[cellAudio] Init()\n");
-
     if (s_audio_initialized)
         return CELL_AUDIO_ERROR_ALREADY_INIT;
 
@@ -948,11 +606,9 @@ s32 cellAudioInit(void)
         /* Guest boot-anchored domain (see the hook comment above). */
         s_audio_start_us = g_lv2_system_time_us();
     } else {
-#ifdef _WIN32
         LARGE_INTEGER f, c;
         QueryPerformanceFrequency(&f); QueryPerformanceCounter(&c);
         s_audio_start_us = (u64)((c.QuadPart * 1000000LL) / f.QuadPart);
-#endif
     }
     s_audio_block_counter = 0;
     s_audio_initialized = 1;
@@ -961,8 +617,6 @@ s32 cellAudioInit(void)
 
 s32 cellAudioQuit(void)
 {
-    printf("[cellAudio] Quit()\n");
-
     if (!s_audio_initialized)
         return CELL_AUDIO_ERROR_NOT_INIT;
 
@@ -995,9 +649,6 @@ int cellAudioHostStreamStart(const int16_t* pcm, uint64_t frames,
     s_host_audio.finished = 0;
     s_host_audio.mute_guest_ports = mute_guest_ports ? 1 : 0;
     mutex_unlock(&s_audio_mutex);
-    printf("[cellAudio] Host movie stream start: %llu frames, guest ports %s\n",
-           (unsigned long long)frames,
-           mute_guest_ports ? "muted" : "mixed");
     return 0;
 }
 
@@ -1006,13 +657,8 @@ void cellAudioHostStreamStop(void)
     if (!s_audio_initialized)
         return;
     mutex_lock(&s_audio_mutex);
-    u64 played = s_host_audio.cursor;
-    int was_present = s_host_audio.present;
     memset(&s_host_audio, 0, sizeof(s_host_audio));
     mutex_unlock(&s_audio_mutex);
-    if (was_present)
-        printf("[cellAudio] Host movie stream stop: %llu frames played\n",
-               (unsigned long long)played);
 }
 
 uint64_t cellAudioHostStreamPositionFrames(void)
@@ -1035,12 +681,9 @@ int cellAudioHostStreamFinished(void)
     return finished;
 }
 
-/* Guest structs are big-endian (PPC); the import bridge hands us a HOST pointer
+/* Guest structs are big-endian (PPC); the import bridge hands us a host pointer
  * into guest VM, so multi-byte fields must be byteswapped to host order before
- * use. (Bug found 2026-06-20: nChannel was read raw -> 0x0800000000000000 instead
- * of 8 -> CELL_AUDIO_ERROR_PARAM -> the game aborted audio init -> the surround
- * mixer + the CRI movie pipeline collapsed. RPCS3 reads 8 and proceeds.)
- * The ca_be64/ca_be32 helpers are defined above (near the mixer). */
+ * use (a raw nChannel of 8 reads as 0x0800000000000000 and fails validation). */
 
 s32 cellAudioPortOpen(const CellAudioPortParam* param, u32* portNum)
 {
@@ -1052,41 +695,29 @@ s32 cellAudioPortOpen(const CellAudioPortParam* param, u32* portNum)
 
     /* Byteswap the big-endian guest param into a host-native copy. */
     CellAudioPortParam hp;
-    hp.nChannel = ca_be64(param->nChannel);
-    hp.nBlock   = ca_be64(param->nBlock);
-    hp.attr     = ca_be64(param->attr);
-    { union { u32 u; float f; } lv; lv.u = ca_be32(*(const u32*)&param->level); hp.level = lv.f; }
-
-    printf("[cellAudio] PortOpen(nChannel=%llu, nBlock=%llu, attr=0x%llX, level=%f)\n",
-           (unsigned long long)hp.nChannel, (unsigned long long)hp.nBlock,
-           (unsigned long long)hp.attr, (double)hp.level);
+    hp.nChannel = ps3_bswap64(param->nChannel);
+    hp.nBlock   = ps3_bswap64(param->nBlock);
+    hp.attr     = ps3_bswap64(param->attr);
+    { union { u32 u; float f; } lv; lv.u = ps3_bswap32(*(const u32*)&param->level); hp.level = lv.f; }
 
     /* Validate parameters */
     u64 nch = hp.nChannel;
     u64 nblk = hp.nBlock;
     if (nch != CELL_AUDIO_PORT_2CH && nch != CELL_AUDIO_PORT_8CH)
         return CELL_AUDIO_ERROR_PARAM;
-    /* 2026-08-05 item-K fix 8b: firmware also accepts nBlock 2 and 4 (used
-     * by CRI/libmixer ports; rejecting them killed audio at init --
-     * 2026-08-04 audit). The libaudio Reference (p.4) documents only
-     * BLOCK_8/16, but ORACLE(SDK cell/audio.h:40-42) defines BLOCK_8/16/32
-     * and ORACLE(RPCS3 cellAudio.cpp:1267-1271) accepts exactly
-     * {2,4,8,16,32}; anything else is CELL_AUDIO_ERROR_PARAM. */
+    /* Firmware accepts nBlock of exactly {2,4,8,16,32}; 2 and 4 are used by
+     * CRI/libmixer ports, so rejecting them would kill audio at init.
+     * Anything else is CELL_AUDIO_ERROR_PARAM. */
     if (nblk != 2 && nblk != 4 &&
         nblk != CELL_AUDIO_BLOCK_8 && nblk != CELL_AUDIO_BLOCK_16 &&
         nblk != CELL_AUDIO_BLOCK_32)
         return CELL_AUDIO_ERROR_PARAM;
 
-    /* U6 fix (2026-07-09): only honor the game's requested level when
-     * CELL_AUDIO_PORTATTR_INITLEVEL is set (RPCS3 cellAudio.cpp:1340-1346);
-     * otherwise default to 1.0f, same as before this fix.
-     * 2026-08-05 item-K fix 8c -- ORACLE(libaudio Reference p.18, level
-     * semantics): "When a negative value is specified to level, a positive
-     * inverse of the specified value will be applied as the scaling factor"
-     * -- i.e. the ABSOLUTE value, not silence (the old floor-at-0 turned a
-     * negative INITLEVEL into a muted port where hardware plays at |level|).
-     * The >1.0 clamp stays as our own safety margin (spec allows >1.0 but
-     * warns it deteriorates quality; RPCS3 only rejects level <= -1.0f). */
+    /* Only honor the game's requested level when
+     * CELL_AUDIO_PORTATTR_INITLEVEL is set; otherwise default to 1.0f.
+     * A negative level is applied as its absolute value, not as silence
+     * (hardware plays at |level|). The >1.0 clamp is our own safety margin:
+     * levels above 1.0 are allowed but degrade quality. */
     {
         float resolved_level = 1.0f;
         if (hp.attr & CELL_AUDIO_PORTATTR_INITLEVEL) {
@@ -1118,7 +749,6 @@ s32 cellAudioPortOpen(const CellAudioPortParam* param, u32* portNum)
     port->running = 0;
     port->param   = hp;          /* host-native (byteswapped) copy */
     port->read_index  = 0;
-    port->write_index = 0;
 
     /* Allocate the audio ring buffer + read-index in GUEST VM, so the game can
      * read/write them via guest EAs (cellAudioGetPortConfig hands these back). */
@@ -1138,34 +768,17 @@ s32 cellAudioPortOpen(const CellAudioPortParam* param, u32* portNum)
     port->read_idx_addr = (u64)g_ridx;                /* guest EA: read index     */
     audio_be_w64(g_ridx, 0);                          /* read index starts at 0   */
 
-    /* portNum is a host pointer aliasing guest BE memory -- write big-endian
-     * (was host-endian: the game read a byte-swapped port index). */
+    /* portNum is a host pointer aliasing guest BE memory, so write big-endian. */
     { unsigned char* pn = (unsigned char*)portNum;
       pn[0]=(unsigned char)(found>>24); pn[1]=(unsigned char)(found>>16);
       pn[2]=(unsigned char)(found>>8);  pn[3]=(unsigned char)found; }
 
-    /* CRI-gate TEST (pt30, env YZ_AUDIO_FORCE): the game never calls cellAudioPortStart
-     * (libmixer init never completes). HYPOTHESIS: the criMana player won't decode the
-     * voice until the audio OUTPUT is running (somewhere to drain PCM). Simulate the
-     * missing PortStart (port->running=1) + SetNotifyEventQueue (register the surround
-     * mixer's queue key so our mixing thread feeds it period events). If the player then
-     * decodes + the boot progresses, the audio-output-ready handshake IS the gate. */
-    if (getenv("YZ_AUDIO_FORCE")) {
-        s_ports[found].running = 1;
-        printf("[cellAudio] YZ_AUDIO_FORCE: port %d forced running\n", found);
-    }
-
     mutex_unlock(&s_audio_mutex);
-
-    if (getenv("YZ_AUDIO_FORCE"))
-        cellAudioSetNotifyEventQueue(0x8000CAFE02460300ULL);  /* register mixer queue */
     return CELL_OK;
 }
 
 s32 cellAudioPortClose(u32 portNum)
 {
-    printf("[cellAudio] PortClose(port=%u)\n", portNum);
-
     if (!s_audio_initialized)
         return CELL_AUDIO_ERROR_NOT_INIT;
 
@@ -1179,10 +792,10 @@ s32 cellAudioPortClose(u32 portNum)
         return CELL_AUDIO_ERROR_PORT_NOT_OPEN;
     }
 
-    /* item-K fix 8d: return the port's guest-VM blocks (ring buffer +
-     * read-index) to the audio VM free list so reopened ports reuse them
-     * instead of exhausting the 4 MB window (see audio_vm_free above).
-     * Matches real firmware, which releases port memory on close. */
+    /* Return the port's guest-VM blocks (ring buffer + read-index) to the
+     * audio VM free list so reopened ports reuse them instead of exhausting
+     * the 4 MB window (see audio_vm_free above). Real firmware releases port
+     * memory on close. */
     audio_vm_free((u32)s_ports[portNum].port_addr, s_ports[portNum].buf_size);
     audio_vm_free((u32)s_ports[portNum].read_idx_addr, 16);
     s_ports[portNum].port_addr     = 0;
@@ -1197,8 +810,6 @@ s32 cellAudioPortClose(u32 portNum)
 
 s32 cellAudioPortStart(u32 portNum)
 {
-    printf("[cellAudio] PortStart(port=%u)\n", portNum);
-
     if (!s_audio_initialized)
         return CELL_AUDIO_ERROR_NOT_INIT;
 
@@ -1217,8 +828,6 @@ s32 cellAudioPortStart(u32 portNum)
 
 s32 cellAudioPortStop(u32 portNum)
 {
-    printf("[cellAudio] PortStop(port=%u)\n", portNum);
-
     if (!s_audio_initialized)
         return CELL_AUDIO_ERROR_NOT_INIT;
 
@@ -1235,50 +844,17 @@ s32 cellAudioPortStop(u32 portNum)
     return CELL_OK;
 }
 
-/* Surmixer synchronization (mirrors RPCS3 AudioSetNotifyEventQueue,
- * cellAudio.cpp:1671-1719 + the merged #18857 fix). The CRI surmixer's notify
- * queue (key c_mxr000) is CREATED by the _cellsurMixerMain thread; RPCS3 BLOCKS
- * the registration until that queue exists so the surmixer init cannot race
- * ahead of its own thread (RPCS3 issue #18852). Gated by YZ_SURMIXER_SYNC. */
-extern void yz_for_each_thread(void (*cb)(unsigned int tid, const char* name, void* handle));
-static volatile int s_surmixer_thread_seen;
-static void surmixer_name_cb(unsigned int tid, const char* name, void* handle)
-{ (void)tid; (void)handle; if (name && strcmp(name, "_cellsurMixerMain") == 0) s_surmixer_thread_seen = 1; }
-static int has_sur_mixer_thread(void)
-{ s_surmixer_thread_seen = 0; yz_for_each_thread(surmixer_name_cb); return s_surmixer_thread_seen; }
-
 s32 cellAudioSetNotifyEventQueue(u64 key)
 {
-    printf("[cellAudio] SetNotifyEventQueue(key=0x%llX)\n",
-           (unsigned long long)key);
-
     if (!s_audio_initialized)
         return CELL_AUDIO_ERROR_NOT_INIT;
 
-    { static int surmix_sync = -1;
-      if (surmix_sync < 0) surmix_sync = getenv("YZ_SURMIXER_SYNC") ? 1 : 0;
-      const unsigned long long c_mxr000 = 0x8000CAFE02460300ULL;
-      if (surmix_sync && (key == c_mxr000 || key == 0) && has_sur_mixer_thread()) {
-          int found = 0;
-          for (int count = 0; count < 100; count++) {
-              if (sys_event_find_queue_by_key(c_mxr000)) { found = 1; break; }
-#ifdef _WIN32
-              Sleep(50);
-#else
-              usleep(50000);
-#endif
-          }
-          if (key == 0 && found) key = c_mxr000;   /* correct key (#18857) */
-          printf("[cellAudio] surmixer-sync: c_mxr000 queue %s after wait\n",
-                 found ? "found" : "TIMEOUT");
-      } }
-
-    /* 2026-08-04 doc-conformance audit (RPCS3 cellAudio.cpp:1722-1742):
-     * the key must resolve to an EXISTING event queue and must not already
+    /* The key must resolve to an existing event queue and must not already
      * be registered; both cases are CELL_AUDIO_ERROR_TRANS_EVENT. Titles
-     * poll SetNotifyEventQueue until the surmixer queue appears -- answering
-     * CELL_OK for a nonexistent queue broke that retry loop, and a duplicate
-     * registration doubled the 5.3 ms event rate into one queue (overrun). */
+     * poll SetNotifyEventQueue until the surmixer queue appears, so answering
+     * CELL_OK for a nonexistent queue would break that retry loop, and a
+     * duplicate registration would double the 5.3 ms event rate into one
+     * queue (overrun). */
     if (!sys_event_find_queue_by_key(key))
         return CELL_AUDIO_ERROR_TRANS_EVENT;
 
@@ -1301,14 +877,11 @@ s32 cellAudioSetNotifyEventQueue(u64 key)
     }
 
     mutex_unlock(&s_audio_mutex);
-    return CELL_AUDIO_ERROR_TRANS_EVENT; /* table full (oracle convention) */
+    return CELL_AUDIO_ERROR_TRANS_EVENT; /* table full */
 }
 
 s32 cellAudioRemoveNotifyEventQueue(u64 key)
 {
-    printf("[cellAudio] RemoveNotifyEventQueue(key=0x%llX)\n",
-           (unsigned long long)key);
-
     if (!s_audio_initialized)
         return CELL_AUDIO_ERROR_NOT_INIT;
 
@@ -1323,8 +896,7 @@ s32 cellAudioRemoveNotifyEventQueue(u64 key)
     }
 
     mutex_unlock(&s_audio_mutex);
-    /* Unknown key: TRANS_EVENT per the oracle (RPCS3 cellAudio.cpp:1811),
-     * not PARAM (2026-08-04 audit). */
+    /* Unknown key: TRANS_EVENT, not PARAM. */
     return CELL_AUDIO_ERROR_TRANS_EVENT;
 }
 
@@ -1333,15 +905,11 @@ s32 cellAudioGetPortConfig(u32 portNum, CellAudioPortConfig* config)
     if (!s_audio_initialized)
         return CELL_AUDIO_ERROR_NOT_INIT;
 
-    /* 2026-08-05 item-K fix 8a -- validation order + closed-port contract.
-     * ORACLE(RPCS3 cellAudio.cpp cellAudioGetPortConfig): NULL config or
-     * out-of-range portNum -> CELL_AUDIO_ERROR_PARAM (checked FIRST); a
-     * valid but never-opened/closed port is NOT an error -- it reports
-     * CELL_OK with status = CELL_AUDIO_STATUS_CLOSE
-     * (ORACLE(SDK cell/audio.h:33) = 0x1010; libaudio Reference p.6:
-     * "CELL_AUDIO_STATUS_CLOSE: Closed (cannot start reading)"). The old
-     * code returned PORT_NOT_OPEN, so a spec-following status poll could
-     * never observe the documented CLOSE state (2026-08-04 audit). */
+    /* Validation order: a NULL config or out-of-range portNum is
+     * CELL_AUDIO_ERROR_PARAM (checked first). A valid but never-opened or
+     * closed port is not an error; it reports CELL_OK with
+     * status = CELL_AUDIO_STATUS_CLOSE (0x1010), so a status poll can observe
+     * the CLOSE state. */
     if (!config || portNum >= CELL_AUDIO_PORT_MAX)
         return CELL_AUDIO_ERROR_PARAM;
 
@@ -1358,8 +926,8 @@ s32 cellAudioGetPortConfig(u32 portNum, CellAudioPortConfig* config)
 
     AudioPortSlot* port = &s_ports[portNum];
 
-    /* Write the guest CellAudioPortConfig (32 bytes, BIG-ENDIAN) at its real PS3
-     * offsets (RPCS3 cellAudio.h): readIndexAddr@0(u32) status@4(u32)
+    /* Write the guest CellAudioPortConfig (32 bytes, big-endian) at its real PS3
+     * offsets: readIndexAddr@0(u32) status@4(u32)
      * nChannel@8(u64) nBlock@16(u64) portSize@24(u32) portAddr@28(u32).
      * (The host struct layout differs; write the guest bytes explicitly.) */
     unsigned char* c = (unsigned char*)config;
@@ -1390,7 +958,7 @@ s32 cellAudioPortGetStatus(u32 portNum, u32* status)
     if (portNum >= CELL_AUDIO_PORT_MAX || !status)
         return CELL_AUDIO_ERROR_PARAM;
 
-    {   /* out-param is a raw guest pointer: write guest-BE (audit 2026-07-01) */
+    {   /* out-param is a raw guest pointer: write guest-BE */
         u32 v = !s_ports[portNum].in_use ? (u32)CELL_AUDIO_STATUS_CLOSE
               : s_ports[portNum].running ? (u32)CELL_AUDIO_STATUS_RUN
                                          : (u32)CELL_AUDIO_STATUS_READY;
@@ -1402,12 +970,9 @@ s32 cellAudioPortGetStatus(u32 portNum, u32* status)
     return CELL_OK;
 }
 
-/* Block tag of slot blockNo (RPCS3 cellAudio.cpp cellAudioGetPortBlockTag:
- * tag = global_counter + blockNo - cur_pos). Our read_index is the monotonic
- * global counter and read_index % nBlock the current slot, so the tag of slot
- * blockNo in the current lap is read_index - cur_pos + blockNo. libmixer's
- * sur-mixer pump paces itself with this + GetPortTimestamp; the ENOSYS stub
- * starved the mixer (2026-07-02). Out-param written guest-BE (guest is
+/* Block tag of slot blockNo: tag = global_counter + blockNo - cur_pos, where
+ * read_index % nBlock is the current slot. libmixer's sur-mixer pump paces
+ * itself with this + GetPortTimestamp. Out-param written guest-BE (guest is
  * big-endian; every HLE write of a multi-byte out-param must match). */
 s32 cellAudioGetPortBlockTag(u32 portNum, u64 blockNo, u64* tag)
 {
@@ -1430,8 +995,7 @@ s32 cellAudioGetPortBlockTag(u32 portNum, u64 blockNo, u64* tag)
         mutex_unlock(&s_audio_mutex);
         return CELL_AUDIO_ERROR_PARAM;
     }
-    /* Global-counter form (RPCS3 cellAudio.cpp:1557: tag = global_counter +
-     * blockNo - cur_pos); while running, read_index and the global counter
+    /* Global-counter form: while running, read_index and the global counter
      * advance in lockstep, so this stays consistent per-port while giving
      * all ports one shared tag timeline. */
     u64 t = s_audio_block_counter + blockNo - (port->read_index % nblk);
@@ -1443,8 +1007,8 @@ s32 cellAudioGetPortBlockTag(u32 portNum, u64 blockNo, u64* tag)
     return CELL_OK;
 }
 
-/* Microsecond timestamp at which block `tag` was mixed (RPCS3: start_time +
- * tag * 256 * 1000000 / 48000). Anchored to the mixer's own block clock:
+/* Microsecond timestamp at which block `tag` was mixed: start_time +
+ * tag * 256 * 1000000 / 48000. Anchored to the mixer's own block clock:
  * one block = 256 samples @48kHz = 16000/3 us. */
 s32 cellAudioGetPortTimestamp(u32 portNum, u64 tag, u64* stamp)
 {
@@ -1460,12 +1024,10 @@ s32 cellAudioGetPortTimestamp(u32 portNum, u64 tag, u64* stamp)
     if (!stamp)
         return CELL_AUDIO_ERROR_PARAM;
 
-    /* U6c fix (2026-07-09): RPCS3 cellAudio.cpp:1519-1521 --
-     * `if (port.global_counter < tag) return CELL_AUDIO_ERROR_TAG_NOT_FOUND;`
-     * before this fix we always answered with a timestamp, even for a tag
-     * the port hasn't advanced to yet. 2026-08-04: tags now come from the
-     * shared s_audio_block_counter (see GetPortBlockTag), so compare against
-     * that, and the stamp below is anchored on the guest system-time clock. */
+    /* A tag the mixer has not reached yet is CELL_AUDIO_ERROR_TAG_NOT_FOUND.
+     * Tags come from the shared s_audio_block_counter (see GetPortBlockTag),
+     * so compare against that; the stamp below is anchored on the guest
+     * system-time clock. */
     mutex_lock(&s_audio_mutex);
     u64 global_counter = s_audio_block_counter;
     mutex_unlock(&s_audio_mutex);
@@ -1483,14 +1045,11 @@ s32 cellAudioSetPersonalDevice(s32 iPersonalStream, s32 iDevice)
 {
     (void)iPersonalStream;
     (void)iDevice;
-    printf("[cellAudio] SetPersonalDevice(stream=%d, device=%d) - stub\n",
-           iPersonalStream, iDevice);
     return CELL_OK;
 }
 
 s32 cellAudioUnsetPersonalDevice(s32 iPersonalStream)
 {
     (void)iPersonalStream;
-    printf("[cellAudio] UnsetPersonalDevice(stream=%d) - stub\n", iPersonalStream);
     return CELL_OK;
 }

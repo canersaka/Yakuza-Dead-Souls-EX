@@ -6,64 +6,7 @@
 #include "sys_timer.h"   /* lv2_usec_deadline: sub-ms timed waits */
 #include "../memory/vm.h"
 #include <string.h>
-#include <stdio.h>
 #include <stdlib.h>
-
-/* t1-unblock diagnostic (env YZ_T1_UNBLOCK, 2026-07-04, DIAGNOSTIC ONLY --
- * see docs/FLAGS.md; NOT a shipping fix, must stay env-gated and default-off
- * with a kill-switch per the project's band-aid hygiene rule). Purpose: t1 is stuck
- * in a CHAIN of SPURS waits, each blocked on a producer signal that never
- * arrives. This scopes how deep the chain goes by making t1's blocking waits
- * in this phase return immediately instead of parking, so t1 can barrel
- * forward through the whole chain. Heavy hammer, may break correctness --
- * env-gated OFF, diagnosis only. REMOVE with the t1-wedge frontier. */
-static int t1_unblock_on(void)
-{
-    static int on = -1;
-    if (on < 0) { const char* e = getenv("YZ_T1_UNBLOCK"); on = (e && *e) ? 1 : 0; }
-    return on;
-}
-extern uint32_t yz_thread_current_id(void);
-
-/* s30 sem trace (env YZ_SEM_TRACE, diag, ledger #67 successor-staging hunt):
- * the stage handoff's last unobserved link is the async-FS request semaphore
- * (t2 parks in wait(sem=1) at every death — s30_fresheyes_fable.md). Bounded
- * stderr trace of wait/post on low sem ids answers, at the death window:
- * did a post ever happen (requester alive, wake lost) or not (requester's
- * decision gate is upstream). Cap 4000 lines, armed banner. */
-static int sem_trace_on(void)
-{
-    static int on = -1;
-    if (on < 0) {
-        const char* e = getenv("YZ_SEM_TRACE");
-        on = (e && *e) ? 1 : 0;
-        if (on) { fprintf(stderr, "[sem-trace] ARMED (YZ_SEM_TRACE): wait/post on sem ids <= 8\n"); fflush(stderr); }
-    }
-    return on;
-}
-static long s_sem_trace_n = 0;
-#define SEM_TRACE_CAP 4000
-
-/* Low-volume performance attribution used by the fixed orphanage sample.
- * Unlike YZ_SEM_TRACE this records only the main-thread wait on semaphore 4
- * and the threads that satisfy it, so logging does not become the workload. */
-static int sem_profile_on(void)
-{
-    static int on = -1;
-    if (on < 0) on = getenv("YZ_SEM_PROFILE") ? 1 : 0;
-    return on;
-}
-#ifdef _WIN32
-static volatile LONG s_sem_profile_armed;
-static volatile LONG s_sem_profile_wait_logs;
-static volatile LONG s_sem_profile_post_logs;
-static volatile LONG s_sem_profile_wait_active;
-static volatile LONG s_sem_profile_wait_seq;
-static volatile LONG64 s_sem_profile_wait_started_ms;
-static volatile LONG s_sem_profile_last_post_seq;
-static volatile LONG s_sem_profile_last_post_after_ms;
-static volatile LONG s_sem_profile_last_post_tid;
-#endif
 
 /* ---------------------------------------------------------------------------
  * Globals
@@ -141,14 +84,13 @@ static void write_be32(uint32_t addr, uint32_t val)
  * sys_semaphore_create
  *
  * r3 = pointer to receive semaphore ID (u32*)
- * r4 = pointer to attribute struct
+ * r4 = pointer to attribute struct (not read)
  * r5 = initial value
  * r6 = max value
  * -----------------------------------------------------------------------*/
 int64_t sys_semaphore_create(ppu_context* ctx)
 {
     uint32_t id_out_addr  = LV2_ARG_PTR(ctx, 0);
-    uint32_t attr_addr    = LV2_ARG_PTR(ctx, 1);
     int32_t  initial      = LV2_ARG_S32(ctx, 2);
     int32_t  max_val      = LV2_ARG_S32(ctx, 3);
 
@@ -172,23 +114,10 @@ int64_t sys_semaphore_create(ppu_context* ctx)
     s->value     = initial;
     s->max_value = max_val;
 
-    if (attr_addr != 0) {
-        uint8_t* attr_raw = (uint8_t*)vm_to_host(attr_addr);
-        uint32_t proto_be;
-        memcpy(&proto_be, attr_raw, 4);
-#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__ || defined(_WIN32)
-        proto_be = ((proto_be >> 24) & 0xFF) | ((proto_be >> 8) & 0xFF00) |
-                   ((proto_be << 8) & 0xFF0000) | ((proto_be << 24) & 0xFF000000u);
-#endif
-        s->protocol = proto_be;
-        /* name at offset 8 */
-        memcpy(s->name, attr_raw + 8, 8);
-    }
-
 #ifdef _WIN32
-    /* s47 lost-wake fix: the kernel semaphore is a PURE WAKE CHANNEL, not a
-     * count mirror — it starts at 0 regardless of `initial` (the count lives
-     * only in s->value; a waiter checks value before ever sleeping). Cap the
+    /* The kernel semaphore is a pure wake channel, not a count mirror: it
+     * starts at 0 regardless of `initial` (the count lives only in
+     * s->value; a waiter checks value before ever sleeping). Cap the
      * handle at LONG_MAX-ish: tokens are bounded by waiters and spurious
      * leftovers are benign (a woken waiter re-checks value and re-sleeps). */
     s->sem_handle = CreateSemaphoreA(NULL, 0, 0x7FFFFFFF, NULL);
@@ -206,13 +135,6 @@ int64_t sys_semaphore_create(ppu_context* ctx)
     uint32_t sem_id = (uint32_t)(slot + 1);
     if (id_out_addr != 0) {
         write_be32(id_out_addr, sem_id);
-    }
-    if (sem_profile_on()) {
-        fprintf(stderr,
-                "[sem-profile-create] id=%u name='%.*s' initial=%d max=%d "
-                "protocol=0x%08X\n",
-                sem_id, 8, s->name, initial, max_val, s->protocol);
-        fflush(stderr);
     }
 
     sem_table_unlock();
@@ -273,135 +195,35 @@ int64_t sys_semaphore_wait(ppu_context* ctx)
 {
     uint32_t sem_id     = LV2_ARG_U32(ctx, 0);
     uint64_t timeout_us = LV2_ARG_U64(ctx, 1);
-#ifdef _WIN32
-    ULONGLONG profile_start = 0;
-#endif
 
-    /* Batch fixes item 8: clamp the guest timeout to 48 bits so the QPC
-     * deadline multiply / ms-DWORD conversion below can't overflow. */
+    /* Clamp the guest timeout to 48 bits so the QPC deadline multiply /
+     * ms-DWORD conversion below can't overflow. */
     if (timeout_us > ((1ull << 48) - 1)) timeout_us = (1ull << 48) - 1;
 
     sys_semaphore_info* s = sem_ref_acquire(sem_id);
     if (!s)
         return (int64_t)(int32_t)CELL_ESRCH;
 
-#ifdef _WIN32
-    if (sem_profile_on() && sem_id == 4 && yz_thread_current_id() == 1) {
-        profile_start = GetTickCount64();
-        InterlockedExchange64(&s_sem_profile_wait_started_ms,
-                              (LONG64)profile_start);
-        InterlockedIncrement(&s_sem_profile_wait_seq);
-        InterlockedExchange(&s_sem_profile_last_post_seq, -1);
-        InterlockedExchange(&s_sem_profile_last_post_after_ms, -1);
-        InterlockedExchange(&s_sem_profile_last_post_tid, -1);
-        InterlockedExchange(&s_sem_profile_wait_active, 1);
-        if (InterlockedCompareExchange(&s_sem_profile_armed, 1, 0) == 0) {
-            fprintf(stderr,
-                    "[sem-profile-arm] t1 waiting id=4 name='%.*s' "
-                    "timeout_us=%llu value=%d max=%d\n",
-                    8, s->name, (unsigned long long)timeout_us,
-                    s->value, s->max_value);
-            fflush(stderr);
-        }
-    }
-#endif
 
-    if (sem_trace_on() && sem_id <= 8 && s_sem_trace_n < SEM_TRACE_CAP) {
-        s_sem_trace_n++;
-        fprintf(stderr, "[sem] t%u WAIT-enter id=%u val=%d tmo=%llu lr=0x%08llX\n",
-                yz_thread_current_id(), sem_id, s->value,
-                (unsigned long long)timeout_us, (unsigned long long)ctx->lr);
-        fflush(stderr);
-    }
-
-    /* YZ_T1_UNBLOCK: if t1 would block here (value <= 0), return CELL_OK
-     * immediately instead of parking. Cap logging at ~100 lines but let the
-     * forcing continue unbounded (per the diagnostic's request). */
-    if (t1_unblock_on() && yz_thread_current_id() == 1) {
-        int would_block;
-#ifdef _WIN32
-        EnterCriticalSection(&s->value_lock);
-        would_block = (s->value <= 0);
-        LeaveCriticalSection(&s->value_lock);
-#else
-        pthread_mutex_lock(&s->mtx);
-        would_block = (s->value <= 0);
-        pthread_mutex_unlock(&s->mtx);
-#endif
-        if (would_block) {
-            static long n = 0; long c = ++n;
-            if (c <= 100) {
-                fprintf(stderr, "[t1-unblock] sem_wait id=%u forced\n", sem_id);
-                fflush(stderr);
-            }
-            sem_ref_release(s);
-            return CELL_OK;
-        }
-    }
 
 #ifdef _WIN32
-    /* s47 LOST-WAKE FIX (the s36-s38 completion-race family, finally named —
-     * ledger/STATUS s47; 1-minute repro in wt/exp-menu). The old scheme kept
-     * the count TWICE (kernel handle + shadow s->value) and post() made its
-     * EBUSY decision off the shadow, which LAGS between a waiter's kernel
-     * grant and its value-- — the s30-era comment in post() documented the
-     * spurious-refusal window but the refusal also SKIPPED ReleaseSemaphore:
-     * a dropped wake the guest never recovers from (the CRI device-server
-     * lane treats posts as fire-and-forget). Single-truth rewrite, mirroring
-     * the (already-correct) POSIX branch: s->value is the ONLY count, checked
-     * and decremented under value_lock BEFORE any sleep; the kernel sem is a
-     * pure wake channel (post releases min(count, waiters) tokens; spurious
-     * or orphaned tokens just cause a benign re-check loop). */
+    /* Single source of truth, mirroring the POSIX branch: s->value is the
+     * only count, checked and decremented under value_lock before any
+     * sleep; the kernel sem is a pure wake channel (post releases
+     * min(count, waiters) tokens; spurious or orphaned tokens just cause
+     * a benign re-check loop). */
     int64_t deadline = (timeout_us > 0) ? lv2_usec_deadline(timeout_us) : 0;
     for (;;) {
-        /* Take a token if available (the ONLY count, under the lock). */
+        /* Take a token if available (the only count, under the lock). */
         EnterCriticalSection(&s->value_lock);
         if (s->value > 0) {
             s->value--;
             LeaveCriticalSection(&s->value_lock);
-            const ULONGLONG profile_elapsed = profile_start
-                ? GetTickCount64() - profile_start : 0;
-            if (profile_start)
-                InterlockedExchange(&s_sem_profile_wait_active, 0);
-            if (profile_start && profile_elapsed >= 5 &&
-                InterlockedIncrement(&s_sem_profile_wait_logs) <= 256) {
-                const LONG wait_seq = InterlockedCompareExchange(
-                    &s_sem_profile_wait_seq, 0, 0);
-                const LONG post_seq = InterlockedCompareExchange(
-                    &s_sem_profile_last_post_seq, 0, 0);
-                const LONG post_after = InterlockedCompareExchange(
-                    &s_sem_profile_last_post_after_ms, 0, 0);
-                const LONG post_tid = InterlockedCompareExchange(
-                    &s_sem_profile_last_post_tid, 0, 0);
-                fprintf(stderr,
-                        "[sem-profile-wait] seq=%ld t1 id=4 "
-                        "elapsed_ms=%llu post_after_ms=%ld post_tid=%ld "
-                        "value=%d waiters=%d\n",
-                        wait_seq,
-                        (unsigned long long)profile_elapsed,
-                        post_seq == wait_seq ? post_after : -1,
-                        post_seq == wait_seq ? post_tid : -1,
-                        s->value, s->waiters);
-                fflush(stderr);
-            }
-            if (sem_trace_on() && sem_id <= 8 && s_sem_trace_n < SEM_TRACE_CAP) {
-                s_sem_trace_n++;
-                fprintf(stderr, "[sem] t%u WAIT-exit id=%u val=%d\n",
-                        yz_thread_current_id(), sem_id, s->value);
-                fflush(stderr);
-            }
             sem_ref_release(s);
             return CELL_OK;
         }
         if (timeout_us > 0 && lv2_deadline_passed(deadline)) {
             LeaveCriticalSection(&s->value_lock);
-            if (profile_start)
-                InterlockedExchange(&s_sem_profile_wait_active, 0);
-            if (sem_trace_on() && sem_id <= 8 && s_sem_trace_n < SEM_TRACE_CAP) {
-                s_sem_trace_n++;
-                fprintf(stderr, "[sem] t%u WAIT-timeout id=%u\n", yz_thread_current_id(), sem_id);
-                fflush(stderr);
-            }
             sem_ref_release(s);
             return (int64_t)(int32_t)CELL_ETIMEDOUT;
         }
@@ -409,8 +231,9 @@ int64_t sys_semaphore_wait(ppu_context* ctx)
         LeaveCriticalSection(&s->value_lock);
 
         /* Sleep on the wake channel. Bounded 1ms slices when timed so the QPC
-         * deadline (not the OS timer tick) governs; INFINITE when untimed —
-         * a post always releases a token so a real wake is never missed. */
+         * deadline (not the OS timer tick) governs; INFINITE when untimed,
+         * since a post always releases a token and a real wake is never
+         * missed. */
         DWORD ms = (timeout_us == 0) ? INFINITE : 1;
         WaitForSingleObject(s->sem_handle, ms);
 
@@ -471,28 +294,16 @@ int64_t sys_semaphore_trywait(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_ESRCH;
 
 #ifdef _WIN32
-    /* s47 single-truth: decide purely on s->value (the handle is a wake
-     * channel, not a count mirror). */
+    /* Decide purely on s->value (the handle is a wake channel, not a count
+     * mirror). */
     EnterCriticalSection(&s->value_lock);
     if (s->value <= 0) {
         LeaveCriticalSection(&s->value_lock);
-        if (sem_trace_on() && sem_id <= 8 && s_sem_trace_n < SEM_TRACE_CAP) {
-            s_sem_trace_n++;
-            fprintf(stderr, "[sem] t%u TRYWAIT-busy id=%u val=0\n",
-                    yz_thread_current_id(), sem_id);
-            fflush(stderr);
-        }
         sem_ref_release(s);
         return (int64_t)(int32_t)CELL_EBUSY;
     }
     s->value--;
     LeaveCriticalSection(&s->value_lock);
-    if (sem_trace_on() && sem_id <= 8 && s_sem_trace_n < SEM_TRACE_CAP) {
-        s_sem_trace_n++;
-        fprintf(stderr, "[sem] t%u TRYWAIT-ok id=%u val=%d\n",
-                yz_thread_current_id(), sem_id, s->value);
-        fflush(stderr);
-    }
 #else
     pthread_mutex_lock(&s->mtx);
     if (s->value <= 0) {
@@ -514,31 +325,6 @@ int64_t sys_semaphore_trywait(ppu_context* ctx)
  * r3 = sem_id
  * r4 = count (number to post)
  * -----------------------------------------------------------------------*/
-/* s36 force-wake diagnostic (YZ_FORCE_WAKE): post a semaphore from a WATCHDOG
- * thread (not a guest syscall) to un-park a starved CRI consumer. Used only to
- * TEST whether the completion-dispatch stall (consumers parked forever) is the
- * preload blocker; capped at max_value so it can't over-count. */
-void yz_force_sem_post(uint32_t sem_id)
-{
-    sys_semaphore_info* s = sem_ref_acquire(sem_id);
-    if (!s) return;
-#ifdef _WIN32
-    EnterCriticalSection(&s->value_lock);
-    int ok = (s->value < s->max_value);
-    if (ok) s->value++;
-    int wake = (ok && s->waiters > 0) ? 1 : 0;
-    LeaveCriticalSection(&s->value_lock);
-    if (wake) ReleaseSemaphore(s->sem_handle, 1, NULL);
-#else
-    pthread_mutex_lock(&s->mtx);
-    if (s->value < s->max_value) {
-        s->value++;
-        if (s->waiters > 0) pthread_cond_signal(&s->cv);
-    }
-    pthread_mutex_unlock(&s->mtx);
-#endif
-    sem_ref_release(s);
-}
 
 int64_t sys_semaphore_post(ppu_context* ctx)
 {
@@ -552,53 +338,18 @@ int64_t sys_semaphore_post(ppu_context* ctx)
     if (!s)
         return (int64_t)(int32_t)CELL_ESRCH;
 
-#ifdef _WIN32
-    if (sem_profile_on() && sem_id == 4 && s_sem_profile_armed &&
-        s_sem_profile_wait_active) {
-        const LONG64 wait_started = InterlockedCompareExchange64(
-            &s_sem_profile_wait_started_ms, 0, 0);
-        const ULONGLONG elapsed = wait_started > 0
-            ? GetTickCount64() - (ULONGLONG)wait_started : 0;
-        const LONG wait_seq = InterlockedCompareExchange(
-            &s_sem_profile_wait_seq, 0, 0);
-        InterlockedExchange(&s_sem_profile_last_post_after_ms,
-                            (LONG)elapsed);
-        InterlockedExchange(&s_sem_profile_last_post_tid,
-                            (LONG)yz_thread_current_id());
-        InterlockedExchange(&s_sem_profile_last_post_seq, wait_seq);
-        if (InterlockedIncrement(&s_sem_profile_post_logs) <= 256) {
-            fprintf(stderr,
-                    "[sem-profile-post] seq=%ld after_ms=%llu tid=%u id=4 "
-                    "count=%d value=%d waiters=%d lr=0x%08llX\n",
-                    wait_seq, (unsigned long long)elapsed,
-                    yz_thread_current_id(), count, s->value, s->waiters,
-                    (unsigned long long)ctx->lr);
-            fflush(stderr);
-        }
-    }
-#endif
-
-    /* 2026-08-05 item-K fix 5 -- ORACLE(Lv2 Reference p.220): waiters absorb
-     * the post FIRST. "If the value specified ... is equal to or larger than
-     * the number of threads that is waiting, all the waiting threads are
-     * woken up, and the semaphore value is incremented by the number of
-     * difference. At this point, if the semaphore value after the
-     * incrementation is larger than the maximum number, the threads are not
-     * woken up, and an error [EBUSY] is returned." The old check compared
-     * value+count against max WITHOUT crediting waiters, refusing legal
-     * posts (and dropping every owed wake) whenever count > max while
-     * waiters were parked (2026-08-04 audit). Error value stays CELL_EBUSY
-     * (Reference p.220 "The semaphore value is above the upper limit"). */
+    /* Waiters absorb the post first: when count is at least the number of
+     * waiting threads, all of them are woken and the semaphore value is
+     * incremented by the difference. Only if that resulting value exceeds
+     * the maximum are the threads not woken and CELL_EBUSY returned.
+     * Comparing value+count against max without crediting waiters would
+     * refuse legal posts (and drop every owed wake) whenever count > max
+     * while waiters were parked. */
 #ifdef _WIN32
     EnterCriticalSection(&s->value_lock);
     int wake = (count < s->waiters) ? count : s->waiters;
     if ((int64_t)s->value + count - wake > (int64_t)s->max_value) {
         LeaveCriticalSection(&s->value_lock);
-        static long ebusy_n = 0;
-        if (ebusy_n < 64) { ebusy_n++;
-            fprintf(stderr, "[sem-post] t%u EBUSY refused id=%u count=%d val=%d waiters=%d max=%d (n=%ld)\n",
-                    yz_thread_current_id(), sem_id, count, s->value, s->waiters, s->max_value, ebusy_n);
-            fflush(stderr); }
         sem_ref_release(s);
         return (int64_t)(int32_t)CELL_EBUSY;
     }
@@ -606,28 +357,15 @@ int64_t sys_semaphore_post(ppu_context* ctx)
     /* Wake channel: release exactly enough tokens to cover the parked waiters
      * this post can satisfy (min(count, waiters)). Woken waiters re-check
      * value under the lock; an orphaned token (waiter already left) is benign.
-     * This is the lost-wake fix — a post can NEVER skip the release now. */
+     * A post never skips the release. */
     LeaveCriticalSection(&s->value_lock);
 
-    if (wake > 0 && !ReleaseSemaphore(s->sem_handle, wake, NULL)) {
-        static long relfail_n = 0;
-        if (relfail_n < 64) { relfail_n++;
-            fprintf(stderr, "[sem-post] t%u RELEASE-FAILED id=%u wake=%d val=%d max=%d gle=%lu\n",
-                    yz_thread_current_id(), sem_id, wake, s->value, s->max_value,
-                    (unsigned long)GetLastError());
-            fflush(stderr); }
-    }
-    if (sem_trace_on() && sem_id <= 8 && s_sem_trace_n < SEM_TRACE_CAP) {
-        s_sem_trace_n++;
-        fprintf(stderr, "[sem] t%u POST id=%u count=%d val=%d lr=0x%08llX\n",
-                yz_thread_current_id(), sem_id, count, s->value,
-                (unsigned long long)ctx->lr);
-        fflush(stderr);
-    }
+    if (wake > 0)
+        ReleaseSemaphore(s->sem_handle, wake, NULL);
 #else
     pthread_mutex_lock(&s->mtx);
-    /* item-K fix 5 (see Win32 branch): waiters absorb the post before the
-     * max_value ceiling applies (Lv2 Reference p.220). */
+    /* As in the Win32 branch: waiters absorb the post before the max_value
+     * ceiling applies. */
     { int wake = (count < s->waiters) ? count : s->waiters;
       if ((int64_t)s->value + count - wake > (int64_t)s->max_value) {
           pthread_mutex_unlock(&s->mtx);
@@ -635,8 +373,9 @@ int64_t sys_semaphore_post(ppu_context* ctx)
           return (int64_t)(int32_t)CELL_EBUSY;
       }
       s->value += count;
-      /* Wake the waiters this post can satisfy (broadcast is also correct — they
-       * re-check value — but min(count,waiters) signals is precise). */
+      /* Wake the waiters this post can satisfy (broadcast is also correct,
+       * since they re-check value, but min(count,waiters) signals is
+       * precise). */
       for (int i = 0; i < wake; i++) pthread_cond_signal(&s->cv); }
     pthread_mutex_unlock(&s->mtx);
 #endif

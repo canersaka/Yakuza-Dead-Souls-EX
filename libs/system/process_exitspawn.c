@@ -1,12 +1,10 @@
-/* Independent host state for the process runtime's exit-spawn callbacks. */
+/* Stores the guest callbacks registered through the exit-spawn imports. */
 
 #include "sysPrxForUser.h"
 #include <stdatomic.h>
 
-/* These values are guest OPD addresses, not host function pointers.  The
- * current runner does not replace its process image, but retaining the exact
- * registrations keeps startup state truthful and gives a future exit-spawn
- * implementation the callbacks it must dispatch through g_ps3_guest_caller. */
+/* These values are guest OPD addresses, not host function pointers. The
+ * runner does not replace its process image, so they are only recorded. */
 static atomic_uint_least32_t s_process_atexitspawn_callback;
 static atomic_uint_least32_t s_process_at_Exitspawn_callback;
 

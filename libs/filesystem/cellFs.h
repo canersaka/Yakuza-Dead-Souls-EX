@@ -18,9 +18,6 @@ extern "C" {
 /* ---------------------------------------------------------------------------
  * FS-specific error codes
  * -----------------------------------------------------------------------*/
-/* s23 conformance fix: EBADF was 0x80010009 (= CELL_EPERM) and EMFILE was
- * 0x80010018 (= CELL_ENOTMSELF) -- both wrong numerics; a guest comparing
- * against the real constants never matched (RPCS3 ErrorCodes.h:145/147). */
 #define CELL_FS_ERROR_EBADF         (s32)0x8001002A
 #define CELL_FS_ERROR_EMFILE        (s32)0x8001002C
 
@@ -70,9 +67,9 @@ extern "C" {
 
 /* The PS3 ABI packs CellFsStat to 4-byte alignment: the 64-bit fields sit at
  * 4-byte (not 8-byte) offsets, so st_size is at +0x24 and the struct is 52
- * bytes (RPCS3 sys_fs.h: be_t<s64,4>, CHECK_SIZE_ALIGN(CellFsStat,52,4)).
- * Without #pragma pack the host would 8-align the s64s, putting st_size at +0x28
- * (56-byte struct) and the guest would read its size from the wrong offset. */
+ * bytes. Without #pragma pack the host would 8-align the s64s, putting
+ * st_size at +0x28 (56-byte struct) and the guest would read its size from
+ * the wrong offset. */
 #pragma pack(push, 4)
 typedef struct CellFsStat {
     s32  st_mode;
@@ -85,12 +82,8 @@ typedef struct CellFsStat {
     u64  st_blksize;
 } CellFsStat;
 
-/* s23 conformance fix: the real cellFsReaddir ABI takes THIS 258-byte struct
- * (RPCS3 sys_fs.h CellFsDirent: u8 d_type; u8 d_namlen; char d_name[256]),
- * NOT CellFsDirectoryEntry -- the old signature memset 308 bytes over the
- * guest's 258-byte buffer (50-byte OOB guest write) and put the name 50
- * bytes past where the guest reads d_name. CellFsDirectoryEntry belongs to
- * cellFsGetDirectoryEntries (not imported by this game). */
+/* cellFsReaddir fills this 258-byte struct (u8 d_type; u8 d_namlen;
+ * char d_name[256]). */
 #pragma pack(push, 1)
 typedef struct CellFsDirent {
     u8   d_type;                                    /* CELL_FS_TYPE_* */
@@ -104,39 +97,21 @@ typedef struct CellFsDirent {
 #define CELL_FS_TYPE_REGULAR   2
 #define CELL_FS_TYPE_SYMLINK   3
 
-typedef struct CellFsDirectoryEntry {
-    CellFsStat attribute;
-    char       entry_name[CELL_FS_MAX_FS_FILE_NAME_LENGTH];
-} CellFsDirectoryEntry;
 #pragma pack(pop)
 
 /* Opaque file/directory descriptors */
 typedef s32 CellFsFd;
 
 /* Optional host observer for successful opens. The filesystem still owns the
- * file and all guest-visible state; observers may use the translated path for
- * side-band services such as media presentation. */
+ * file and all guest-visible state. */
 typedef void (*CellFsOpenHook)(CellFsFd fd, const char* guest_path,
                                const char* host_path);
 void cellfs_set_open_hook(CellFsOpenHook hook);
-typedef void (*CellFsCloseHook)(CellFsFd fd, const char* guest_path);
-void cellfs_set_close_hook(CellFsCloseHook hook);
-/* Optional override for streams presented by a host-side media service.
- * Returning nonzero completes the guest read successfully with zero bytes. */
-typedef int (*CellFsReadEofHook)(CellFsFd fd, const char* guest_path,
-                                u64 offset, u64 nbytes);
-void cellfs_set_read_eof_hook(CellFsReadEofHook hook);
 typedef s32 CellFsDir;
 
 /* ---------------------------------------------------------------------------
  * Path configuration
  * -----------------------------------------------------------------------*/
-
-/* Set the root directory for all path translations (default: ".") */
-void cellfs_set_root_path(const char* root);
-
-/* Add or override a PS3 prefix -> host path mapping */
-void cellfs_add_path_mapping(const char* ps3_prefix, const char* host_path);
 
 /* Translate a PS3 virtual path (e.g. "/dev_hdd0/game/...") to a host path.
  * Returns 0 on success, -1 if no mapping found. */

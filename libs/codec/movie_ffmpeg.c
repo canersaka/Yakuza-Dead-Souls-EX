@@ -24,8 +24,6 @@ uint64_t       movie_audio_frames(MoviePlayer* m) { (void)m; return 0; }
 int            movie_audio_sample_rate(MoviePlayer* m) { (void)m; return 0; }
 int            movie_audio_channels(MoviePlayer* m) { (void)m; return 0; }
 const uint8_t* movie_next_rgba(MoviePlayer* m, double* p) { (void)m; (void)p; return 0; }
-const uint8_t* movie_next_argb(MoviePlayer* m, double* p) { (void)m; (void)p; return 0; }
-int            movie_next_yuv(MoviePlayer* m, MovieYuvFrame* o) { (void)m; (void)o; return 0; }
 void           movie_close(MoviePlayer* m) { (void)m; }
 
 #else /* HAVE_FFMPEG */
@@ -45,13 +43,12 @@ struct MoviePlayer {
     AVFormatContext*   fmt;
     AVCodecContext*    dec;
     struct SwsContext* sws;
-    struct SwsContext* sws_argb;
     AVFrame*           frame;
     AVPacket*          pkt;
     int                vstream;
     int                w, h;
     double             fps;
-    uint8_t*           rgba;      /* w*h*4 output buffer (RGBA or ARGB) */
+    uint8_t*           rgba;      /* w*h*4 RGBA output buffer */
     int16_t*           audio_pcm; /* interleaved stereo S16 @ 48 kHz */
     uint64_t           audio_frames;
     uint64_t           audio_capacity;
@@ -506,8 +503,8 @@ MoviePlayer* movie_open(const char* path)
     if (m->vstream < 0) { movie_close(m); return 0; }
 
     AVCodecParameters* par = m->fmt->streams[m->vstream]->codecpar;
-    /* Sofdec video is MPEG-1; RPCS3's minimal FFmpeg build ships mpeg2video
-     * (which decodes MPEG-1) but not mpeg1video -- fall back to it. */
+    /* Sofdec video is MPEG-1; a minimal FFmpeg build may ship mpeg2video
+     * (which decodes MPEG-1) but not mpeg1video, so fall back to it. */
     const AVCodec* codec = avcodec_find_decoder(par->codec_id);
     if (!codec) codec = avcodec_find_decoder(AV_CODEC_ID_MPEG1VIDEO);
     if (!codec) codec = avcodec_find_decoder(AV_CODEC_ID_MPEG2VIDEO);
@@ -601,98 +598,10 @@ const uint8_t* movie_next_rgba(MoviePlayer* m, double* pts_out)
     }
 }
 
-/* Decode the next frame and convert to big-endian A8R8G8B8 byte order
- * (A,R,G,B per pixel) — the GCM linear ARGB layout the game's movie plane
- * samples (fmt 0xA5, measured from the RSX oracle). Same buffer/lifetime
- * rules as movie_next_rgba. */
-const uint8_t* movie_next_argb(MoviePlayer* m, double* pts_out)
-{
-    if (!m) return 0;
-    for (;;) {
-        int rr = avcodec_receive_frame(m->dec, m->frame);
-        if (rr != 0) {
-            int got = 0;
-            while (av_read_frame(m->fmt, m->pkt) >= 0) {
-                if (m->pkt->stream_index == m->vstream) {
-                    avcodec_send_packet(m->dec, m->pkt);
-                    av_packet_unref(m->pkt);
-                    got = 1;
-                    break;
-                }
-                av_packet_unref(m->pkt);
-            }
-            if (!got) {
-                avcodec_send_packet(m->dec, NULL);
-                if (avcodec_receive_frame(m->dec, m->frame) != 0) return 0;
-            } else {
-                continue;
-            }
-        }
-        if (!m->sws_argb)
-            m->sws_argb = sws_getContext(m->w, m->h, m->dec->pix_fmt, m->w, m->h,
-                                         AV_PIX_FMT_ARGB, SWS_BILINEAR, 0, 0, 0);
-        uint8_t* dst[1] = { m->rgba };
-        int stride[1] = { m->w * 4 };
-        sws_scale(m->sws_argb, (const uint8_t* const*)m->frame->data,
-                  m->frame->linesize, 0, m->h, dst, stride);
-        if (pts_out) {
-            AVRational tb = m->fmt->streams[m->vstream]->time_base;
-            int64_t pts = m->frame->best_effort_timestamp;
-            *pts_out = (pts == AV_NOPTS_VALUE) ? 0.0 : pts * av_q2d(tb);
-        }
-        return m->rgba;
-    }
-}
-
-int movie_next_yuv(MoviePlayer* m, MovieYuvFrame* out)
-{
-    if (!m || !out) return 0;
-    for (;;) {
-        int rr = avcodec_receive_frame(m->dec, m->frame);
-        if (rr == 0) {
-            out->y = m->frame->data[0];
-            out->u = m->frame->data[1];
-            out->v = m->frame->data[2];
-            out->ystride = m->frame->linesize[0];
-            out->cstride = m->frame->linesize[1];
-            out->w = m->w;
-            out->h = m->h;
-            AVRational tb = m->fmt->streams[m->vstream]->time_base;
-            int64_t pts = m->frame->best_effort_timestamp;
-            out->pts = (pts == AV_NOPTS_VALUE) ? 0.0 : pts * av_q2d(tb);
-            return 1;
-        }
-        int got = 0;
-        while (av_read_frame(m->fmt, m->pkt) >= 0) {
-            if (m->pkt->stream_index == m->vstream) {
-                avcodec_send_packet(m->dec, m->pkt);
-                av_packet_unref(m->pkt);
-                got = 1;
-                break;
-            }
-            av_packet_unref(m->pkt);
-        }
-        if (!got) {
-            avcodec_send_packet(m->dec, NULL);
-            if (avcodec_receive_frame(m->dec, m->frame) != 0) return 0;
-            out->y = m->frame->data[0];
-            out->u = m->frame->data[1];
-            out->v = m->frame->data[2];
-            out->ystride = m->frame->linesize[0];
-            out->cstride = m->frame->linesize[1];
-            out->w = m->w;
-            out->h = m->h;
-            out->pts = 0.0;
-            return 1;
-        }
-    }
-}
-
 void movie_close(MoviePlayer* m)
 {
     if (!m) return;
     if (m->sws)      sws_freeContext(m->sws);
-    if (m->sws_argb) sws_freeContext(m->sws_argb);
     if (m->frame) av_frame_free(&m->frame);
     if (m->pkt)   av_packet_free(&m->pkt);
     if (m->dec)   avcodec_free_context(&m->dec);

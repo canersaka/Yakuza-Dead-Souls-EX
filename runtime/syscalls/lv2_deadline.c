@@ -1,9 +1,8 @@
 /*
  * ps3recomp - high-resolution deadlines for short LV2 waits
  *
- * Kept separate from sys_timer.c so synchronization primitives and their
- * standalone stress suite can share the real deadline implementation without
- * pulling in the complete timer/event subsystem.
+ * Kept separate from sys_timer.c so synchronization primitives can use the
+ * deadline helpers without the full timer subsystem.
  */
 
 #include "sys_timer.h"

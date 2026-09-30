@@ -1,10 +1,8 @@
 /*
- * Sparse post-publication guest-write notification shared by generated PPU
- * stores and host HLE bulk writers.
- *
- * The 4 GiB guest address space is represented by one bit per 4 KiB page.
- * When no native SPURS/graphics waiter has registered a page, the common path
- * is only relaxed atomic loads and returns without entering the exact router.
+ * Post-store notification shared by generated PPU stores and HLE bulk
+ * writers. One bit per 4 KiB guest page marks pages watched by native
+ * SPURS; when no watched page is written, the common path is only relaxed
+ * atomic loads.
  */
 #ifndef PS3RECOMP_PPU_GUEST_WRITE_H
 #define PS3RECOMP_PPU_GUEST_WRITE_H

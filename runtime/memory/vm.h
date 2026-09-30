@@ -4,11 +4,9 @@
  * Manages the host-side mapping of the PS3's 32-bit address space.
  * On Windows uses VirtualAlloc; on POSIX uses mmap.
  *
- * PS3 memory map (simplified):
- *   0x00010000 - 0x0FFFFFFF : User-space (main memory, 256 MB)
- *   0x10000000 - 0x1FFFFFFF : RSX mapped memory
- *   0x30000000 - 0x3FFFFFFF : SPU local store windows (raw SPU mapping)
- *   0xD0000000 - 0xDFFFFFFF : Stack area
+ * vm_init commits main memory (0x00010000 - 0x0FFFFFFF) and the thread stack
+ * area (0xD0000000 - 0xDFFFFFFF). The rest of the 4 GiB range stays reserved
+ * and is committed on demand with vm_commit.
  */
 
 #ifndef VM_H
@@ -26,8 +24,6 @@
   #include <windows.h>
 #else
   #include <sys/mman.h>
-  #include <signal.h>
-  #include <unistd.h>
 #endif
 
 #ifdef __cplusplus
@@ -41,9 +37,6 @@ extern "C" {
 #define VM_MAIN_MEM_BASE    0x00010000u
 #define VM_MAIN_MEM_SIZE    0x10000000u      /* 256 MB main memory */
 #define VM_RSX_BASE         0x10000000u
-#define VM_RSX_SIZE         0x10000000u      /* 256 MB RSX */
-#define VM_SPU_BASE         0x30000000u
-#define VM_SPU_WINDOW_SIZE  0x00040000u      /* 256 KB per SPU LS */
 #define VM_STACK_BASE       0xD0000000u
 #define VM_STACK_REGION     0x10000000u      /* 256 MB stack region */
 
@@ -235,31 +228,6 @@ static inline uint32_t vm_stack_allocate(vm_stack_alloc* sa, uint32_t stack_size
 }
 
 /* ---------------------------------------------------------------------------
- * SPU local store allocation
- *
- * Each SPU gets a 256 KB window in the VM_SPU_BASE range, used for
- * raw SPU memory-mapped access from the PPU.
- * -----------------------------------------------------------------------*/
-
-static inline int32_t vm_spu_ls_map(uint32_t spu_index)
-{
-    if (spu_index >= 8) return CELL_EINVAL; /* max 8 SPUs */
-
-    uint32_t addr = VM_SPU_BASE + spu_index * VM_SPU_WINDOW_SIZE;
-    return vm_commit(addr, VM_SPU_WINDOW_SIZE);
-}
-
-static inline uint32_t vm_spu_ls_addr(uint32_t spu_index)
-{
-    return VM_SPU_BASE + spu_index * VM_SPU_WINDOW_SIZE;
-}
-
-static inline uint8_t* vm_spu_ls_host_ptr(uint32_t spu_index)
-{
-    return vm_base + VM_SPU_BASE + spu_index * VM_SPU_WINDOW_SIZE;
-}
-
-/* ---------------------------------------------------------------------------
  * Address translation helpers
  * -----------------------------------------------------------------------*/
 
@@ -271,20 +239,6 @@ static inline void* vm_to_host(uint32_t addr)
 static inline uint32_t vm_to_guest(const void* host_ptr)
 {
     return (uint32_t)((const uint8_t*)host_ptr - vm_base);
-}
-
-static inline int vm_is_valid_addr(uint32_t addr)
-{
-    /* Check if address falls within a committed region */
-    if (addr >= VM_MAIN_MEM_BASE && addr < VM_MAIN_MEM_BASE + VM_MAIN_MEM_SIZE)
-        return 1;
-    if (addr >= VM_STACK_BASE && addr < VM_STACK_BASE + VM_STACK_REGION)
-        return 1;
-    if (addr >= VM_SPU_BASE && addr < VM_SPU_BASE + 8 * VM_SPU_WINDOW_SIZE)
-        return 1;
-    if (addr >= VM_RSX_BASE && addr < VM_RSX_BASE + VM_RSX_SIZE)
-        return 1;
-    return 0;
 }
 
 #ifdef __cplusplus

@@ -15,24 +15,18 @@
  * Internal state
  * -----------------------------------------------------------------------*/
 
-/* The callback / userdata args are GUEST addresses, not host pointers: the
- * callback is an OPD that must be dispatched through g_ps3_guest_caller (see
- * ps3emu/guest_call.h), never called as a host function pointer. Store them as
+/* The callback / userdata args are guest addresses, not host pointers: the
+ * callback is an OPD that is dispatched through g_ps3_guest_caller (see
+ * ps3emu/guest_call.h), not called as a host function pointer. Store them as
  * guest EAs. */
 static int                   s_dialog_open = 0;
 static uint32_t              s_callback_opd = 0;
 static uint32_t              s_userdata_ea  = 0;
-static CellMsgDialogType     s_type        = 0;
 
-/* Progress bar state */
+/* Progress bar values (percent) */
 #define MAX_PROGRESS_BARS 2
 
-typedef struct {
-    u32  value;
-    char message[256];
-} ProgressBarState;
-
-static ProgressBarState s_progress[MAX_PROGRESS_BARS];
+static u32 s_progress[MAX_PROGRESS_BARS];
 
 /* ---------------------------------------------------------------------------
  * API implementations
@@ -44,14 +38,6 @@ s32 cellMsgDialogOpen2(CellMsgDialogType type, const char* msgString,
 {
     printf("[cellMsgDialog] Open2(type=0x%08X, msg='%s')\n",
            type, msgString ? msgString : "<null>");
-    /* Also on STDERR (2026-08-05): a modal dialog can silently park the whole
-     * title -- boot 9 sat on the title screen for 11k frames behind an
-     * invisible "Sign in to PlayStation(R)Network?" prompt while every soak
-     * log line looked healthy, because this banner was stdout-only. Any
-     * dialog is load-bearing state; it belongs in the diagnostic stream. */
-    fprintf(stderr, "[msgdialog] OPEN type=0x%08X msg='%s'\n",
-            type, msgString ? msgString : "<null>");
-    fflush(stderr);
 
     if (s_dialog_open) {
         printf("[cellMsgDialog] WARNING: dialog already open, closing previous\n");
@@ -60,21 +46,19 @@ s32 cellMsgDialogOpen2(CellMsgDialogType type, const char* msgString,
     s_dialog_open  = 1;
     s_callback_opd = (uint32_t)(uintptr_t)callback;
     s_userdata_ea  = (uint32_t)(uintptr_t)userdata;
-    s_type         = type;
     memset(s_progress, 0, sizeof(s_progress));
 
-    /* Print the message so developers can see it */
+    /* Print the dialog text (no UI is rendered). */
     if (msgString) {
         printf("========================================\n");
         printf("[DIALOG] %s\n", msgString);
         printf("========================================\n");
     }
 
-    /* Determine button type and auto-respond. 2026-08-04 doc-conformance
-     * audit: the button-type field is bits 6-4 (mask 0x70; Reference p.5,
-     * sysutil_msgdialog.h:54-57) -- bit 7 is Disable-Cancel, and folding it
-     * in (the old 0xF0 mask) misclassified the canonical
-     * YESNO|DISABLE_CANCEL_ON dialog (0x90) as "no buttons". */
+    /* Determine button type and auto-respond. The button-type field is
+     * bits 6-4 (mask 0x70); bit 7 is Disable-Cancel, and folding it in
+     * would misclassify the canonical YESNO|DISABLE_CANCEL_ON dialog (0x90)
+     * as "no buttons". */
     u32 button_type = type & 0x00000070;
     int has_progress = (type & 0x0000F000) != 0;
 
@@ -96,9 +80,6 @@ s32 cellMsgDialogOpen2(CellMsgDialogType type, const char* msgString,
         /* Close and dispatch the guest callback (OPD) via the guest caller.
          * Guest signature: void cb(s32 buttonType, void* userdata) -> r3/r4. */
         s_dialog_open = 0;
-        fprintf(stderr, "[msgdialog] AUTO-ANSWER %d (cb=%s)\n", (int)result,
-                s_callback_opd ? "yes" : "none");
-        fflush(stderr);
         if (s_callback_opd) {
             ps3_invoke_guest(s_callback_opd, (uint64_t)(uint32_t)result,
                              (uint64_t)s_userdata_ea, 0, 0, 0, 0, 0, 0);
@@ -140,10 +121,9 @@ s32 cellMsgDialogAbort(void)
 
     s_dialog_open = 0;
 
-    /* Reference p.14/p.18: when Abort closes the dialog the callback
-     * registered at open time is unregistered WITHOUT being called -- the
-     * old ESCAPE invocation double-advanced any caller state machine that
-     * aborts its own dialog (2026-08-04 doc-conformance audit). */
+    /* When Abort closes the dialog, the callback registered at open time is
+     * unregistered without being called; invoking it would double-advance
+     * any caller state machine that aborts its own dialog. */
     s_callback_opd = 0;
 
     return CELL_OK;
@@ -157,12 +137,8 @@ s32 cellMsgDialogProgressBarSetMsg(u32 progressBarIndex, const char* msgString)
     if (!s_dialog_open)
         return CELL_MSGDIALOG_ERROR_DIALOG_NOT_OPENED;
 
-    if (msgString) {
-        strncpy(s_progress[progressBarIndex].message, msgString,
-                sizeof(s_progress[progressBarIndex].message) - 1);
-        s_progress[progressBarIndex].message[sizeof(s_progress[progressBarIndex].message) - 1] = '\0';
+    if (msgString)
         printf("[cellMsgDialog] ProgressBar[%u] msg='%s'\n", progressBarIndex, msgString);
-    }
 
     return CELL_OK;
 }
@@ -175,7 +151,7 @@ s32 cellMsgDialogProgressBarReset(u32 progressBarIndex)
     if (!s_dialog_open)
         return CELL_MSGDIALOG_ERROR_DIALOG_NOT_OPENED;
 
-    s_progress[progressBarIndex].value = 0;
+    s_progress[progressBarIndex] = 0;
     printf("[cellMsgDialog] ProgressBar[%u] reset to 0%%\n", progressBarIndex);
 
     return CELL_OK;
@@ -189,12 +165,12 @@ s32 cellMsgDialogProgressBarInc(u32 progressBarIndex, u32 delta)
     if (!s_dialog_open)
         return CELL_MSGDIALOG_ERROR_DIALOG_NOT_OPENED;
 
-    s_progress[progressBarIndex].value += delta;
-    if (s_progress[progressBarIndex].value > 100)
-        s_progress[progressBarIndex].value = 100;
+    s_progress[progressBarIndex] += delta;
+    if (s_progress[progressBarIndex] > 100)
+        s_progress[progressBarIndex] = 100;
 
     printf("[cellMsgDialog] ProgressBar[%u] = %u%%\n",
-           progressBarIndex, s_progress[progressBarIndex].value);
+           progressBarIndex, s_progress[progressBarIndex]);
 
     return CELL_OK;
 }

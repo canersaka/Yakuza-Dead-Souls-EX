@@ -2,7 +2,7 @@
  * ps3recomp - cellSync HLE
  *
  * SPU-safe synchronization primitives: mutex, barrier, reader-writer,
- * bounded queue, and lock-free queue.  Implemented with C11 atomics.
+ * bounded queue and lock-free queue.
  */
 
 #ifndef PS3RECOMP_CELL_SYNC_H
@@ -35,7 +35,7 @@ extern "C" {
 #define CELL_SYNC_ERROR_EMPTY                   (CELL_ERROR_BASE_SYNC | 0x13)
 
 /* ---------------------------------------------------------------------------
- * CellSyncMutex -- 32-bit spinlock
+ * CellSyncMutex -- 32-bit big-endian ticket lock
  * -----------------------------------------------------------------------*/
 typedef struct CellSyncMutex {
     /* One guest-owned big-endian ticket word: current in the high half,
@@ -105,7 +105,7 @@ s32 cellSyncQueueSize(CellSyncQueue* queue, u32* size);
 s32 cellSyncQueueClear(CellSyncQueue* queue);
 
 /* ---------------------------------------------------------------------------
- * CellSyncLFQueue -- lock-free queue
+ * CellSyncLFQueue -- lock-free queue API (spinlock implementation)
  * -----------------------------------------------------------------------*/
 #define CELL_SYNC_LFQUEUE_DIR_PUSH  0
 #define CELL_SYNC_LFQUEUE_DIR_POP   1

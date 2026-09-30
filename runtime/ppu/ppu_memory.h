@@ -4,30 +4,16 @@
  * All PS3 memory is big-endian.  These functions translate a 32-bit PS3
  * virtual address to a host pointer via vm_base, then perform a load or
  * store with the appropriate byte swap.
- *
- * Atomic operations (lwarx/stwcx) are emulated with C11 atomics.
  */
 
 #ifndef PPU_MEMORY_H
 #define PPU_MEMORY_H
 
 #include "../../include/ps3emu/endian.h"
-#include "ppu_context.h"
 #include "ppu_guest_write.h"
 
 #include <stdint.h>
-#include "ppu_guest_read.h"
 #include <string.h>
-#include <stdatomic.h>
-#include <stdio.h>
-#ifdef __cplusplus
-#  include <atomic>
-#endif
-#if defined(_MSC_VER)
-#  include <intrin.h>          /* _ReturnAddress -- the YZ_SLOTSTORE diag */
-#else
-#  define _ReturnAddress() __builtin_return_address(0)
-#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -50,22 +36,15 @@ static inline void* vm_translate(uint32_t addr)
 }
 
 static inline uint8_t* vm_ptr8(uint32_t addr)  { return (uint8_t*)vm_translate(addr); }
-static inline uint16_t* vm_ptr16(uint32_t addr) { return (uint16_t*)vm_translate(addr); }
-static inline uint32_t* vm_ptr32(uint32_t addr) { return (uint32_t*)vm_translate(addr); }
-static inline uint64_t* vm_ptr64(uint32_t addr) { return (uint64_t*)vm_translate(addr); }
 
-/* PPU->SPU lock-line coherence for the runtime-side inline stores (2026-08-04
- * doc-conformance audit): mirror yakuza/shims.cpp's VM_WRITE_COH. An HLE
- * store to a 128-byte line an SPU holds under GETLLAR must serialize through
- * the SPU lock-line and raise SPU_EVENT_LR, else the SPU's PUTLLC clobbers
- * the store or a parked idle-service never wakes. Previously only lifted
- * code (via the exported shims accessors) had this; cellFs/cellSaveData/
- * lv2_register/sys_cond stores bypassed it. Fast path: spu_coh_is_reserved()
- * is a range check + O(1) bitmap probe (spu_channels.c), so ordinary writes
- * skip the lock entirely. Bulk forms check the first line only, matching the
- * shims macro. */
+/* PPU->SPU lock-line coherence for the inline stores below. A store to a
+ * 128-byte line an SPU holds under GETLLAR must serialize through the SPU
+ * lock-line and raise SPU_EVENT_LR, otherwise the SPU's PUTLLC clobbers the
+ * store or a parked idle-service never wakes. spu_coh_is_reserved() is a
+ * range check plus an O(1) bitmap probe, so ordinary writes skip the lock.
+ * Bulk forms check only the first line. */
 #ifdef PS3RECOMP_NO_SPU_COH
-/* Standalone unit-test builds that compile an HLE module WITHOUT the SPU
+/* Standalone unit-test builds that compile an HLE module without the SPU
  * runtime (e.g. libs/system/tests) define this to get no-op coherence. */
 static inline int  spu_coh_is_reserved(uint32_t addr) { (void)addr; return 0; }
 static inline void spu_lockline_lock(void) {}
@@ -79,10 +58,6 @@ void spu_coh_notify_write(uint32_t ea);
 #endif
 static inline void vm_store_coh(uint32_t addr, const void* src, size_t n)
 {
-    if (n <= UINT32_MAX)
-        vm_native_residency_notify(
-            addr, (uint32_t)n, 0u, VM_NATIVE_RESIDENCY_WRITE_BEGIN,
-            0u, 0u, 0u, 0u);
     if (spu_coh_is_reserved(addr)) {
         spu_lockline_lock();
         memcpy(vm_ptr8(addr), src, n);
@@ -91,10 +66,6 @@ static inline void vm_store_coh(uint32_t addr, const void* src, size_t n)
     } else {
         memcpy(vm_ptr8(addr), src, n);
     }
-    if (n <= UINT32_MAX)
-        vm_native_residency_notify(
-            addr, (uint32_t)n, 0u, VM_NATIVE_RESIDENCY_WRITE_END,
-            0u, 0u, 0u, 0u);
 }
 
 /* ---------------------------------------------------------------------------
@@ -102,15 +73,11 @@ static inline void vm_store_coh(uint32_t addr, const void* src, size_t n)
  * -----------------------------------------------------------------------*/
 static inline uint8_t vm_read8(uint32_t addr)
 {
-    vm_native_residency_notify(addr, 1u, 0u, 0u, 0u, 0u, 0u, 0u);
-    vm_native_report_notify_read(addr, 1u, 0u);
     return *vm_ptr8(addr);
 }
 
 static inline uint16_t vm_read16(uint32_t addr)
 {
-    vm_native_residency_notify(addr, 2u, 0u, 0u, 0u, 0u, 0u, 0u);
-    vm_native_report_notify_read(addr, 2u, 0u);
     uint16_t raw;
     memcpy(&raw, vm_ptr8(addr), sizeof(raw));
     return ps3_bswap16(raw);
@@ -118,8 +85,6 @@ static inline uint16_t vm_read16(uint32_t addr)
 
 static inline uint32_t vm_read32(uint32_t addr)
 {
-    vm_native_residency_notify(addr, 4u, 0u, 0u, 0u, 0u, 0u, 0u);
-    vm_native_report_notify_read(addr, 4u, 0u);
     uint32_t raw;
     memcpy(&raw, vm_ptr8(addr), sizeof(raw));
     return ps3_bswap32(raw);
@@ -127,8 +92,6 @@ static inline uint32_t vm_read32(uint32_t addr)
 
 static inline uint64_t vm_read64(uint32_t addr)
 {
-    vm_native_residency_notify(addr, 8u, 0u, 0u, 0u, 0u, 0u, 0u);
-    vm_native_report_notify_read(addr, 8u, 0u);
     uint64_t raw;
     memcpy(&raw, vm_ptr8(addr), sizeof(raw));
     return ps3_bswap64(raw);
@@ -136,8 +99,6 @@ static inline uint64_t vm_read64(uint32_t addr)
 
 static inline float vm_read_f32(uint32_t addr)
 {
-    vm_native_residency_notify(addr, 4u, 0u, 0u, 0u, 0u, 0u, 0u);
-    vm_native_report_notify_read(addr, 4u, 0u);
     uint32_t raw;
     memcpy(&raw, vm_ptr8(addr), sizeof(raw));
     raw = ps3_bswap32(raw);
@@ -148,8 +109,6 @@ static inline float vm_read_f32(uint32_t addr)
 
 static inline double vm_read_f64(uint32_t addr)
 {
-    vm_native_residency_notify(addr, 8u, 0u, 0u, 0u, 0u, 0u, 0u);
-    vm_native_report_notify_read(addr, 8u, 0u);
     uint64_t raw;
     memcpy(&raw, vm_ptr8(addr), sizeof(raw));
     raw = ps3_bswap64(raw);
@@ -163,29 +122,12 @@ static inline double vm_read_f64(uint32_t addr)
  * -----------------------------------------------------------------------*/
 static inline void vm_write8(uint32_t addr, uint8_t val)
 {
-    /* s26 stager hunt (final unwatched widths — see vm_write32) */
-    if (addr >= 0x42452880u && addr < 0x424529E0u) {
-        extern int g_yz_slotstore;
-        if (g_yz_slotstore) {
-            extern void yz_slotstore_log(uint32_t addr, unsigned long long val,
-                                         int width, void* ra);
-            yz_slotstore_log(addr, val, 8, _ReturnAddress());
-        }
-    }
     vm_store_coh(addr, &val, 1);
     vm_native_spurs_notify_write(addr, 1);
 }
 
 static inline void vm_write16(uint32_t addr, uint16_t val)
 {
-    if (addr >= 0x42452880u && addr < 0x424529E0u) {
-        extern int g_yz_slotstore;
-        if (g_yz_slotstore) {
-            extern void yz_slotstore_log(uint32_t addr, unsigned long long val,
-                                         int width, void* ra);
-            yz_slotstore_log(addr, val, 16, _ReturnAddress());
-        }
-    }
     uint16_t raw = ps3_bswap16(val);
     vm_store_coh(addr, &raw, sizeof(raw));
     vm_native_spurs_notify_write(addr, 2);
@@ -193,106 +135,6 @@ static inline void vm_write16(uint32_t addr, uint16_t val)
 
 static inline void vm_write32(uint32_t addr, uint32_t val)
 {
-    /*
-     * Focused a010 stopper lifecycle watch.  Runtime-side PPU helpers use this
-     * inline accessor rather than yakuza/shims.cpp's exported vm_write32, so
-     * cover it as well.  The callee is a single env/root/arena gate unless a
-     * real gs_task release has armed this exact word.
-     */
-    extern volatile long g_yz_a010_release_scene_active;
-    if (g_yz_a010_release_scene_active &&
-        addr >= 0x40400000u && addr < 0x40C00000u) {
-        extern void yz_a010_reltrace_ppu_store(
-            uint32_t addr, uint32_t val, uint32_t guest_pc);
-        yz_a010_reltrace_ppu_store(addr, val, 0u);
-    }
-    /* Effect-pool slot watch (env YZ_EFFSLOT_WATCH; Akiyama/Hana null-slot
-     * hunt). The manager at [0x14EC864] = 0x604EBF80 is deterministic for
-     * the autostart boot; its object-slot array lives at +0x230. Log every
-     * scalar store into it with the host return address so the creation
-     * (or deliberate null store) site can be named. */
-#ifdef PS3RECOMP_NATIVE_SPURS_PPU_WATCH
-    {
-        extern int g_yz_effslot_watch;
-        if (g_yz_effslot_watch && (addr - 0x604EC1B0u) < 0x30u) {
-            extern void yz_effslot_log(uint32_t addr, unsigned long long val,
-                                       void* ra, int width);
-            yz_effslot_log(addr, val, _ReturnAddress(), 32);
-        }
-    }
-#endif
-    /* a010 object-batch source probe. Restrict it to mapped RSX command
-     * arenas and headers whose method span contains a draw command. */
-    if (addr >= 0x40400000u && addr < 0x43000000u &&
-        (val & 0xA0030003u) == 0u) {
-        const uint32_t first = val & 0x3FFFCu;
-        const uint32_t canonical_first = first & 0x1FFCu;
-        const uint32_t count = (val >> 18) & 0x7FFu;
-        const uint32_t canonical_last =
-            canonical_first + (count ? (count - 1u) * 4u : 0u);
-        const int noninc = (val & 0x40000000u) != 0;
-        const int draw_header =
-            count && count <= 64u && ((noninc &&
-                       (canonical_first == 0x1808u ||
-                        canonical_first == 0x1814u ||
-                        canonical_first == 0x1820u)) ||
-                      (!noninc &&
-                       ((canonical_first <= 0x1808u &&
-                         canonical_last >= 0x1808u) ||
-                        (canonical_first <= 0x1814u &&
-                         canonical_last >= 0x1814u) ||
-                        (canonical_first <= 0x1820u &&
-                         canonical_last >= 0x1820u))));
-        if (draw_header) {
-            extern int g_yz_a010_ppucmd;
-            extern volatile long g_yz_a010_root_active;
-            if (g_yz_a010_ppucmd && g_yz_a010_root_active) {
-                extern void yz_a010_ppucmd_log(uint32_t addr, uint32_t val,
-                                                void* ra, int width);
-                yz_a010_ppucmd_log(addr, val, _ReturnAddress(), 32);
-            }
-        }
-    }
-    /* DIAG (env YZ_WATCH_DLIST): watch PPU writes to the io 0x1104D00 display
-     * list (EA 0x41504D00). Tells whether the PPU producer (t1) ever writes the
-     * REAL contents over the 0xA2000500 placeholder -> it's the producer and the
-     * deadlock is a fixable consumer circular wait; vs never -> producer missing
-     * (gs_task). One branch, predicted not-taken; harmless when env unset. */
-    if (addr >= 0x41504C00u && addr < 0x41504E00u) {   /* io 0x1104D00 display list */
-        extern int g_yz_watch_dlist;
-        if (g_yz_watch_dlist) {
-            extern unsigned long g_yz_dlist_w;
-            if (g_yz_dlist_w < 120) { g_yz_dlist_w++;
-                fprintf(stderr, "[dlist-w] EA=0x%08X = 0x%08X\n", addr, val);
-                fflush(stderr);
-            }
-        }
-    }
-    /* DIAG (env YZ_SLOTSTORE, s26 — DONT_RECHASE #57 mode B): name the PPU
-     * writer of the wid4 work-record slots (the round value a signaled task
-     * consumes half-staged). The page-guard watch was defeated by the vm's
-     * aliased mappings; every LIFTED store flows through here instead. One
-     * predicted-not-taken branch when off. */
-    if (addr >= 0x42452880u && addr < 0x424529E0u) {
-        extern int g_yz_slotstore;
-        if (g_yz_slotstore) {
-            extern void yz_slotstore_log(uint32_t addr, unsigned long long val,
-                                         int width, void* ra);
-            yz_slotstore_log(addr, val, 32, _ReturnAddress());
-        }
-    }
-    /* s26 ride15 pivot (STATUS ⚡): PPU writes to the decode label 0x10200FE0
-     * (the per-round RE-ARM zeroes) — order vs the SPU publishes ([fe0]) is
-     * the wedge discriminator (acquire parks on an already-published value).
-     * Same env gate as the slot watch. */
-    if (addr == 0x10200FE0u) {
-        extern int g_yz_slotstore;
-        if (g_yz_slotstore) {
-            extern void yz_slotstore_log(uint32_t addr, unsigned long long val,
-                                         int width, void* ra);
-            yz_slotstore_log(addr, val, 33, _ReturnAddress());  /* width 33 = label tag */
-        }
-    }
     uint32_t raw = ps3_bswap32(val);
     vm_store_coh(addr, &raw, sizeof(raw));
     vm_native_spurs_notify_write(addr, 4);
@@ -300,38 +142,6 @@ static inline void vm_write32(uint32_t addr, uint32_t val)
 
 static inline void vm_write64(uint32_t addr, uint64_t val)
 {
-    extern volatile long g_yz_a010_release_scene_active;
-    if (g_yz_a010_release_scene_active &&
-        addr < 0x40C00000u &&
-        (uint64_t)addr + 8u > 0x40400000ull) {
-        extern void yz_a010_reltrace_ppu_store(
-            uint32_t addr, uint32_t val, uint32_t guest_pc);
-        if (addr >= 0x40400000u)
-            yz_a010_reltrace_ppu_store(
-                addr, (uint32_t)(val >> 32), 0u);
-        if (addr + 4u >= 0x40400000u &&
-            addr + 4u < 0x40C00000u)
-            yz_a010_reltrace_ppu_store(
-                addr + 4u, (uint32_t)val, 0u);
-    }
-    if (addr >= 0x42452880u && addr < 0x424529E0u) {   /* see vm_write32 */
-        extern int g_yz_slotstore;
-        if (g_yz_slotstore) {
-            extern void yz_slotstore_log(uint32_t addr, unsigned long long val,
-                                         int width, void* ra);
-            yz_slotstore_log(addr, val, 64, _ReturnAddress());
-        }
-    }
-#ifdef PS3RECOMP_NATIVE_SPURS_PPU_WATCH
-    {
-        extern int g_yz_effslot_watch;
-        if (g_yz_effslot_watch && addr < 0x604EC1E0u && addr + 8u > 0x604EC1B0u) {
-            extern void yz_effslot_log(uint32_t addr, unsigned long long val,
-                                       void* ra, int width);
-            yz_effslot_log(addr, val, _ReturnAddress(), 64);
-        }
-    }
-#endif
     uint64_t raw = ps3_bswap64(val);
     vm_store_coh(addr, &raw, sizeof(raw));
     vm_native_spurs_notify_write(addr, 8);
@@ -354,254 +164,11 @@ static inline void vm_write_f64(uint32_t addr, double val)
 /* ---------------------------------------------------------------------------
  * Block copies (for string / bulk data movement)
  * -----------------------------------------------------------------------*/
-static inline void vm_memcpy_from(void* host_dst, uint32_t guest_src, size_t len)
-{
-    if (len <= UINT32_MAX) {
-        vm_native_residency_notify(
-            guest_src, (uint32_t)len, 0u, 0u, 0u, 0u, 0u, 0u);
-        vm_native_report_notify_read(
-            guest_src, (uint32_t)len, 0u);
-    }
-    memcpy(host_dst, vm_ptr8(guest_src), len);
-}
-
 static inline void vm_memcpy_to(uint32_t guest_dst, const void* host_src, size_t len)
 {
-    extern volatile long g_yz_a010_release_scene_active;
-    if (g_yz_a010_release_scene_active && len <= UINT32_MAX) {
-        extern void yz_a010_reltrace_ppu_bulk(
-            uint32_t dst, const uint8_t* src, uint32_t size,
-            uint32_t guest_pc, uint32_t op, uint8_t fill);
-        yz_a010_reltrace_ppu_bulk(
-            guest_dst, (const uint8_t*)host_src, (uint32_t)len,
-            0u, 1u, 0u);
-    }
-    /* Graphics helpers can assemble an entire command block in host memory
-     * and publish it with one bulk copy, bypassing vm_write32. Scan only bulk
-     * copies that land in the RSX command arenas and only report structurally
-     * valid headers whose normalized method span reaches a draw method. */
-    if (guest_dst < 0x43000000u && len &&
-        (uint64_t)guest_dst + (uint64_t)len > 0x40400000ull) {
-        extern int g_yz_a010_ppucmd;
-        extern volatile long g_yz_a010_root_active;
-        if (g_yz_a010_ppucmd && g_yz_a010_root_active) {
-            const uint8_t* src = (const uint8_t*)host_src;
-            for (size_t off = 0; off + 4u <= len; off += 4u) {
-                const uint32_t word =
-                    ((uint32_t)src[off + 0] << 24) |
-                    ((uint32_t)src[off + 1] << 16) |
-                    ((uint32_t)src[off + 2] << 8) |
-                    (uint32_t)src[off + 3];
-                if ((word & 0xA0030003u) != 0u)
-                    continue;
-                const uint32_t first = word & 0x3FFFCu;
-                const uint32_t canonical_first = first & 0x1FFCu;
-                const uint32_t count = (word >> 18) & 0x7FFu;
-                const uint32_t canonical_last =
-                    canonical_first + (count ? (count - 1u) * 4u : 0u);
-                const int noninc = (word & 0x40000000u) != 0;
-                const int draw_header =
-                    count && count <= 64u && ((noninc &&
-                               (canonical_first == 0x1808u ||
-                                canonical_first == 0x1814u ||
-                                canonical_first == 0x1820u)) ||
-                              (!noninc &&
-                               ((canonical_first <= 0x1808u &&
-                                 canonical_last >= 0x1808u) ||
-                                (canonical_first <= 0x1814u &&
-                                 canonical_last >= 0x1814u) ||
-                                (canonical_first <= 0x1820u &&
-                                 canonical_last >= 0x1820u))));
-                if (draw_header) {
-                    extern void yz_a010_ppucmd_log(uint32_t addr, uint32_t val,
-                                                   void* ra, int width);
-                    yz_a010_ppucmd_log(guest_dst + (uint32_t)off, word,
-                                       _ReturnAddress(), 99);
-                }
-            }
-        }
-    }
-    /* s26 stager hunt (STATUS ⚡ ~03:25): the wid4 work-record slots are
-     * written by NEITHER lifted PPU stores (YZ_SLOTSTORE zero) NOR SPU DMA
-     * ([w4stage] zero) ⇒ this bulk path is the remaining candidate. Same env
-     * gate; width tag 99 = memcpy_to. */
-    if (guest_dst < 0x424529E0u && guest_dst + len > 0x42452880u) {
-        extern int g_yz_slotstore;
-        if (g_yz_slotstore) {
-            extern void yz_slotstore_log(uint32_t addr, unsigned long long val,
-                                         int width, void* ra);
-            unsigned long long head = 0;
-            memcpy(&head, host_src, len < 8 ? len : 8);
-            yz_slotstore_log(guest_dst, head, 99, _ReturnAddress());
-        }
-    }
-    /* frontier writer attribution (YZ_EA_TRAP, shims.cpp): bulk HLE copies are
-     * a write path lifted-code traps do not see. */
-    {
-        extern void yz_ea_trap_c(uint32_t, unsigned, unsigned long long, void*);
-        if (len && len <= UINT32_MAX)
-            yz_ea_trap_c(guest_dst, (unsigned)len,
-                         len >= 4 ? *(const uint32_t*)host_src : 0,
-                         _ReturnAddress());
-    }
     vm_store_coh(guest_dst, host_src, len);
     if (len <= UINT32_MAX)
         vm_native_spurs_notify_write(guest_dst, (uint32_t)len);
-}
-
-static inline void vm_memset(uint32_t guest_dst, int val, size_t len)
-{
-    extern volatile long g_yz_a010_release_scene_active;
-    if (g_yz_a010_release_scene_active && len <= UINT32_MAX) {
-        extern void yz_a010_reltrace_ppu_bulk(
-            uint32_t dst, const uint8_t* src, uint32_t size,
-            uint32_t guest_pc, uint32_t op, uint8_t fill);
-        yz_a010_reltrace_ppu_bulk(
-            guest_dst, (const uint8_t*)0, (uint32_t)len,
-            0u, 2u, (uint8_t)val);
-    }
-    if (guest_dst < 0x424529E0u && guest_dst + len > 0x42452880u) {
-        extern int g_yz_slotstore;
-        if (g_yz_slotstore) {
-            extern void yz_slotstore_log(uint32_t addr, unsigned long long val,
-                                         int width, void* ra);
-            yz_slotstore_log(guest_dst, (unsigned long long)(unsigned)val, 98, _ReturnAddress());
-        }
-    }
-    if (len <= UINT32_MAX)
-        vm_native_residency_notify(
-            guest_dst, (uint32_t)len, 0u,
-            VM_NATIVE_RESIDENCY_WRITE_BEGIN, 0u, 0u, 0u, 0u);
-    if (spu_coh_is_reserved(guest_dst)) {
-        spu_lockline_lock();
-        memset(vm_ptr8(guest_dst), val, len);
-        spu_coh_notify_write(guest_dst);
-        spu_lockline_unlock();
-    } else {
-        memset(vm_ptr8(guest_dst), val, len);
-    }
-    if (len <= UINT32_MAX)
-        vm_native_residency_notify(
-            guest_dst, (uint32_t)len, 0u,
-            VM_NATIVE_RESIDENCY_WRITE_END, 0u, 0u, 0u, 0u);
-    if (len <= UINT32_MAX)
-        vm_native_spurs_notify_write(guest_dst, (uint32_t)len);
-}
-
-/* ---------------------------------------------------------------------------
- * Atomic operations -- lwarx / stwcx emulation
- *
- * !! DEAD CODE ON THE LIFTED PATH -- DO NOT AUDIT OR FIX THESE AS IF LIVE !!
- * The recompiler emits ppu_res_lwarx/ppu_res_stwcx/ppu_res_ldarx/ppu_res_stdcx
- * (yakuza/shims.cpp), which carry the REAL semantics incl. the SPU lock-line
- * coherence discipline (spu_coh_is_reserved -> lockline lock + notify; the
- * 2026-07-03 lost-update fix). These inline helpers have ZERO callers today
- * and lack that discipline; they mislead audits (three separate reviews have
- * flagged them as a live divergence -- see scratch/audit_spurs_ordering_
- * 20260805.md, refuted). Kept only as a reference of the naive model.
- *
- * PowerPC reservation-based atomics:
- *   lwarx  rD, rA, rB   -- Load word and reserve (sets reservation)
- *   stwcx. rS, rA, rB   -- Store word conditional (clears reservation)
- *                           Sets CR0 EQ bit on success.
- *
- * We emulate this using C11 compare-and-swap on the host.
- * -----------------------------------------------------------------------*/
-
-static inline uint32_t ppu_lwarx(ppu_context* ctx, uint32_t addr)
-{
-    /* Read the current value from memory (big-endian, so swap). */
-    vm_native_residency_notify(addr, 4u, 0u, 0u, 0u, 0u, 0u, 0u);
-    uint32_t raw;
-    _Atomic(uint32_t)* atom = (_Atomic(uint32_t)*)vm_ptr32(addr);
-    raw = atomic_load_explicit(atom, memory_order_acquire);
-
-    ctx->reserve_addr  = addr;
-    ctx->reserve_value = raw;
-    ctx->reserve_valid = 1;
-
-    return ps3_bswap32(raw);
-}
-
-static inline int ppu_stwcx(ppu_context* ctx, uint32_t addr, uint32_t val)
-{
-    if (!ctx->reserve_valid || ctx->reserve_addr != addr) {
-        /* No reservation or address mismatch -- fail */
-        ppu_cr_set(ctx, 0, PPU_CR_SO * ppu_xer_get_so(ctx));
-        ctx->reserve_valid = 0;
-        return 0;
-    }
-
-    vm_native_residency_notify(
-        addr, 4u, 0u, VM_NATIVE_RESIDENCY_WRITE_BEGIN,
-        0u, 0u, 0u, 0u);
-    uint32_t expected = (uint32_t)ctx->reserve_value;
-    uint32_t desired  = ps3_bswap32(val);
-    _Atomic(uint32_t)* atom = (_Atomic(uint32_t)*)vm_ptr32(addr);
-
-    int ok = atomic_compare_exchange_strong_explicit(
-        atom, &expected, desired,
-        memory_order_acq_rel, memory_order_acquire);
-
-    ctx->reserve_valid = 0;
-
-    if (ok) {
-        ppu_cr_set(ctx, 0, PPU_CR_EQ | (PPU_CR_SO * ppu_xer_get_so(ctx)));
-        vm_native_residency_notify(
-            addr, 4u, 0u, VM_NATIVE_RESIDENCY_WRITE_END,
-            0u, 0u, 0u, 0u);
-        vm_native_spurs_notify_write(addr, 4);
-    } else
-        ppu_cr_set(ctx, 0, PPU_CR_SO * ppu_xer_get_so(ctx));
-
-    return ok;
-}
-
-/* 64-bit variants: ldarx / stdcx. */
-static inline uint64_t ppu_ldarx(ppu_context* ctx, uint32_t addr)
-{
-    vm_native_residency_notify(addr, 8u, 0u, 0u, 0u, 0u, 0u, 0u);
-    _Atomic(uint64_t)* atom = (_Atomic(uint64_t)*)vm_ptr64(addr);
-    uint64_t raw = atomic_load_explicit(atom, memory_order_acquire);
-
-    ctx->reserve_addr  = addr;
-    ctx->reserve_value = raw;
-    ctx->reserve_valid = 1;
-
-    return ps3_bswap64(raw);
-}
-
-static inline int ppu_stdcx(ppu_context* ctx, uint32_t addr, uint64_t val)
-{
-    if (!ctx->reserve_valid || ctx->reserve_addr != addr) {
-        ppu_cr_set(ctx, 0, PPU_CR_SO * ppu_xer_get_so(ctx));
-        ctx->reserve_valid = 0;
-        return 0;
-    }
-
-    vm_native_residency_notify(
-        addr, 8u, 0u, VM_NATIVE_RESIDENCY_WRITE_BEGIN,
-        0u, 0u, 0u, 0u);
-    uint64_t expected = ctx->reserve_value;
-    uint64_t desired  = ps3_bswap64(val);
-    _Atomic(uint64_t)* atom = (_Atomic(uint64_t)*)vm_ptr64(addr);
-
-    int ok = atomic_compare_exchange_strong_explicit(
-        atom, &expected, desired,
-        memory_order_acq_rel, memory_order_acquire);
-
-    ctx->reserve_valid = 0;
-
-    if (ok) {
-        ppu_cr_set(ctx, 0, PPU_CR_EQ | (PPU_CR_SO * ppu_xer_get_so(ctx)));
-        vm_native_residency_notify(
-            addr, 8u, 0u, VM_NATIVE_RESIDENCY_WRITE_END,
-            0u, 0u, 0u, 0u);
-        vm_native_spurs_notify_write(addr, 8);
-    } else
-        ppu_cr_set(ctx, 0, PPU_CR_SO * ppu_xer_get_so(ctx));
-
-    return ok;
 }
 
 #ifdef __cplusplus

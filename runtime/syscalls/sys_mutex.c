@@ -43,22 +43,6 @@ static void mtx_table_unlock(void)
 #endif
 }
 
-/* s33 conformance kill switch: YZ_MUTEX_LEGACY reverts BOTH the
- * trylock EDEADLK self-relock check and the destroy EBUSY owner-held check
- * to the pre-s33 (non-conformant) behavior. Checked once, static-cached. */
-static int mutex_legacy_mode(void)
-{
-    static int cached = -1;
-    if (cached < 0) {
-        cached = getenv("YZ_MUTEX_LEGACY") ? 1 : 0;
-        if (cached) {
-            fprintf(stderr, "[mtx] YZ_MUTEX_LEGACY set: trylock EDEADLK and "
-                            "destroy EBUSY guards DISABLED (pre-s33 behavior)\n");
-            fflush(stderr);
-        }
-    }
-    return cached;
-}
 
 static int mtx_find_free(void)
 {
@@ -106,15 +90,6 @@ int64_t sys_mutex_create(ppu_context* ctx)
     /* Read attributes from guest memory */
     if (attr_addr != 0) {
         uint8_t* attr_raw = (uint8_t*)vm_to_host(attr_addr);
-        /* protocol is at offset 0 (u32 BE) */
-        uint32_t proto_be;
-        memcpy(&proto_be, attr_raw + 0, 4);
-#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__ || defined(_WIN32)
-        proto_be = ((proto_be >> 24) & 0xFF) | ((proto_be >> 8) & 0xFF00) |
-                   ((proto_be << 8) & 0xFF0000) | ((proto_be << 24) & 0xFF000000u);
-#endif
-        m->protocol = proto_be;
-
         /* recursive flag at offset 4 (u32 BE) */
         uint32_t rec_be;
         memcpy(&rec_be, attr_raw + 4, 4);
@@ -123,15 +98,11 @@ int64_t sys_mutex_create(ppu_context* ctx)
                  ((rec_be << 8) & 0xFF0000) | ((rec_be << 24) & 0xFF000000u);
 #endif
         m->recursive = (rec_be == SYS_SYNC_RECURSIVE) ? 1 : 0;
-
-        /* name at offset 24 */
-        memcpy(m->name, attr_raw + 24, 8);
     }
 
     /* Initialize host mutex */
 #ifdef _WIN32
     InitializeCriticalSection(&m->cs);
-    m->wait_handle = CreateEventA(NULL, FALSE, TRUE, NULL);
 #else
     {
         pthread_mutexattr_t mattr;
@@ -176,22 +147,20 @@ int64_t sys_mutex_destroy(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_ESRCH;
     }
 
-    /* s33: refuse to destroy a mutex a PPU thread still owns, mirroring the
+    /* Refuse to destroy a mutex a PPU thread still owns, mirroring the
      * lwmutex owner_tid guard in sysPrxForUser.c. Deleting a held
-     * CRITICAL_SECTION out from under a live owner is UB (the same
-     * forever-block class the lwmutex guard was added to avoid), and the
-     * guest sees CELL_OK instead of the EBUSY it may depend on to keep
-     * tearing-down-a-live-heap sequences safe. */
-    if (!mutex_legacy_mode() && m->owner_tid != 0) {
+     * CRITICAL_SECTION out from under a live owner is UB (it can block
+     * forever), and the guest would see CELL_OK instead of the EBUSY it may
+     * depend on to keep tearing-down-a-live-heap sequences safe. */
+    if (m->owner_tid != 0) {
         mtx_table_unlock();
         return (int64_t)(int32_t)CELL_EBUSY;
     }
 
-    /* 2026-08-05 item-K fix 6 -- ORACLE(Lv2 Reference p.173): "Prior to this
-     * system call, all condition variables that are associated with the mutex
-     * must be destroyed. Otherwise, EPERM will be returned." Tearing the
-     * mutex down under a live cond also left that cond's later waits touching
-     * a deleted CRITICAL_SECTION (host UB). cond_count is maintained by
+    /* All condition variables associated with the mutex must be destroyed
+     * first, otherwise the call returns EPERM. Tearing the mutex down under
+     * a live cond would also leave that cond's later waits touching a
+     * deleted CRITICAL_SECTION (host UB). cond_count is maintained by
      * sys_cond_create/sys_cond_destroy. */
     if (m->cond_count > 0) {
         mtx_table_unlock();
@@ -200,7 +169,6 @@ int64_t sys_mutex_destroy(ppu_context* ctx)
 
 #ifdef _WIN32
     DeleteCriticalSection(&m->cs);
-    if (m->wait_handle) CloseHandle(m->wait_handle);
 #else
     pthread_mutex_destroy(&m->mtx);
 #endif
@@ -221,7 +189,7 @@ int64_t sys_mutex_lock(ppu_context* ctx)
     uint32_t mutex_id    = LV2_ARG_U32(ctx, 0);
     uint64_t timeout_us  = LV2_ARG_U64(ctx, 1);
 
-    /* Batch fixes item 8: clamp the guest timeout to 48 bits so the QPC
+    /* Clamp the guest timeout to 48 bits so the QPC
      * deadline multiply (usec * qpc_freq) below can't overflow. */
     if (timeout_us > ((1ull << 48) - 1)) timeout_us = (1ull << 48) - 1;
 
@@ -244,11 +212,11 @@ int64_t sys_mutex_lock(ppu_context* ctx)
         /* Infinite wait */
         EnterCriticalSection(&m->cs);
     } else {
-        /* Timed lock via TryEnterCriticalSection to a QPC deadline. The old
-         * GetTickCount/Sleep(1) loop measured elapsed time in ~15.6 ms ticks
-         * and slept a full tick per retry, overshooting sub-ms timeouts by
-         * orders of magnitude. Yield (not Sleep) for sub-ms timeouts so the
-         * holder can run; Sleep(1) only for waits long enough to absorb it. */
+        /* Timed lock via TryEnterCriticalSection to a QPC deadline (a
+         * GetTickCount/Sleep(1) loop would tick at ~15.6 ms and overshoot
+         * sub-ms timeouts by orders of magnitude). Yield (not Sleep) for
+         * sub-ms timeouts so the holder can run; Sleep(1) only for waits
+         * long enough to absorb it. */
         int64_t deadline = lv2_usec_deadline(timeout_us);
         while (!TryEnterCriticalSection(&m->cs)) {
             if (lv2_deadline_passed(deadline)) {
@@ -300,39 +268,31 @@ int64_t sys_mutex_trylock(ppu_context* ctx)
 
     uint64_t caller_tid = ctx->thread_id;
 
-    /* s33: a NOT_RECURSIVE mutex already owned by the calling thread must
+    /* A NOT_RECURSIVE mutex already owned by the calling thread must
      * fail with EDEADLK, mirroring the check in sys_mutex_lock above.
-     * Without this, TryEnterCriticalSection below re-enters successfully on
+     * Otherwise TryEnterCriticalSection below re-enters successfully on
      * Windows for the owning thread, returning CELL_OK and bumping
-     * lock_count with no corresponding extra guest unlock -- unbalancing the
-     * Enter/Leave pairing and leaking a lock level. */
-    if (!mutex_legacy_mode() && !m->recursive && m->owner_tid == caller_tid && m->lock_count > 0) {
+     * lock_count with no corresponding extra guest unlock, which unbalances
+     * the Enter/Leave pairing and leaks a lock level. */
+    if (!m->recursive && m->owner_tid == caller_tid && m->lock_count > 0) {
         return (int64_t)(int32_t)CELL_EDEADLK;
     }
 
-    /* Recursive re-entry. MUST still acquire the host primitive: unlock
+    /* Recursive re-entry must still acquire the host primitive: unlock
      * calls LeaveCriticalSection unconditionally per guest unlock, so every
      * guest lock (including recursive re-entry) must Enter exactly once or
-     * the Enter/Leave pairing breaks — the old fast path here bumped
-     * lock_count WITHOUT entering, so the paired unlock released the CS
-     * while the guest still held the mutex, and the final unlock called
-     * Leave on a non-held CS (UB, corrupts the CS — random forever-blocks
-     * on later Enters; found 2026-07-02 hunting the ~1/5 CRI boot stall).
+     * the Enter/Leave pairing breaks. Bumping lock_count without entering
+     * would release the CS on the paired unlock while the guest still holds
+     * the mutex, and the final unlock would Leave a non-held CS (UB that
+     * corrupts the CS and causes random forever-blocks on later Enters).
      * EnterCriticalSection by the current owner is recursive and never
      * blocks, so this is safe and cheap. */
     if (m->recursive && m->owner_tid == caller_tid && m->lock_count > 0) {
 #ifdef _WIN32
-        { static int tr = -1; if (tr < 0) tr = getenv("YZ_COND_TRACE") ? 1 : 0;
-          if (tr) { static long n = 0; if (n < 200) { n++;
-              fprintf(stderr, "[mtx] t%u RECURSIVE trylock re-entry mutex=%u count=%d\n",
-                      (uint32_t)caller_tid, mutex_id, m->lock_count);
-              fflush(stderr); } } }
         EnterCriticalSection(&m->cs);
 #else
-        /* pthreads: the default mutex is non-recursive; owner re-lock would
-         * deadlock. The pthread path needs PTHREAD_MUTEX_RECURSIVE mutexes
-         * for guest-recursive locks — pre-existing gap, Windows is the
-         * shipping platform. */
+        /* POSIX build: only lock_count is bumped here; the host mutex is
+         * not locked again. */
 #endif
         m->lock_count++;
         return CELL_OK;
@@ -372,10 +332,8 @@ int64_t sys_mutex_unlock(ppu_context* ctx)
 
     uint64_t caller_tid = ctx->thread_id;
 
-    /* Audit sec.6 error-code fidelity (2026-07-03, user-confirmed): RPCS3
-     * sys_mutex.cpp:123 returns CELL_EPERM for a non-owner unlock, not the
-     * made-up CELL_EMUTEX_NOT_OWNED (0x80010120, error_codes.h:61) -- guest
-     * code that branches on EPERM (the real lv2 contract) mis-branched. */
+    /* A non-owner unlock returns CELL_EPERM (the real lv2 contract), not
+     * a private not-owned code; guest code branches on EPERM. */
     if (m->owner_tid != caller_tid) {
         return (int64_t)(int32_t)CELL_EPERM;
     }

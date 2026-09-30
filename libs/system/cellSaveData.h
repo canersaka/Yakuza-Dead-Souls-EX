@@ -37,7 +37,7 @@ extern "C" {
 #define CELL_SAVEDATA_SYSP_DETAIL_SIZE   1024
 #define CELL_SAVEDATA_SYSP_LPARAM_SIZE   8
 
-/* PARAM.SFO parameter IDs */
+/* Directory attribute values */
 #define CELL_SAVEDATA_ATTR_NORMAL       0
 #define CELL_SAVEDATA_ATTR_NODUPLICATE  1
 
@@ -101,6 +101,9 @@ extern "C" {
  * Structures
  * -----------------------------------------------------------------------*/
 
+/* The guest-side callback structures are read and written by byte offset in
+ * cellSaveData.c; the host-pointer members below do not match the guest
+ * layout and these types are used only to declare the callback signatures. */
 typedef struct CellSaveDataCBResult {
     s32  result;
     u32  progressBarInc;
@@ -225,14 +228,6 @@ typedef struct CellSaveDataFileSet {
     void* fileBuf;
 } CellSaveDataFileSet;
 
-typedef struct CellSaveDataDoneGet {
-    s32  excResult;
-    char dirName[CELL_SAVEDATA_DIRNAME_SIZE];
-    s32  sizeKB;
-    s32  hddFreeSizeKB;
-    char reserved[64];
-} CellSaveDataDoneGet;
-
 /* ---------------------------------------------------------------------------
  * Callback function types
  * -----------------------------------------------------------------------*/
@@ -251,9 +246,6 @@ typedef void (*CellSaveDataStatCallback)(CellSaveDataCBResult* cbResult,
 typedef void (*CellSaveDataFileCallback)(CellSaveDataCBResult* cbResult,
                                           CellSaveDataFileGet* get,
                                           CellSaveDataFileSet* set);
-
-typedef void (*CellSaveDataDoneCallback)(CellSaveDataCBResult* cbResult,
-                                          CellSaveDataDoneGet* get);
 
 /* ---------------------------------------------------------------------------
  * Set parameters
@@ -338,7 +330,7 @@ s32 cellSaveDataListAutoLoad(u32 version, u32 errDialog,
 
 s32 cellSaveDataDelete2(u32 container);
 
-/* Old / non-_2 variants from earlier SDK builds — same semantics. */
+/* Non-_2 variants from earlier SDK builds; same semantics. */
 s32 cellSaveDataAutoSave(u32 version, const char* dirName,
                           u32 errDialog,
                           CellSaveDataSetBuf* setBuf,

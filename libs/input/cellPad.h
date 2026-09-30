@@ -2,7 +2,7 @@
  * ps3recomp - cellPad HLE
  *
  * Gamepad input: initialization, reading button/analog state.
- * Backend: XInput on Windows, SDL2 GameController elsewhere.
+ * Backend: XInput plus a keyboard-backed virtual pad.
  */
 
 #ifndef PS3RECOMP_CELL_PAD_H
@@ -159,8 +159,6 @@ s32 cellPadEnd(void);
 
 /* NID: 0x8B72CBA1 */
 s32 cellPadGetData(u32 port_no, CellPadData* data);
-/* Monotonic guest-visible button transition serial for freeze diagnostics. */
-u32 yz_pad_guest_input_serial(void);
 
 /* NID: 0x8B8013DA */
 s32 cellPadGetInfo2(CellPadInfo2* info);
@@ -177,12 +175,8 @@ s32 cellPadSetActDirect(u32 port_no, CellPadActParam* param);
 /* NID: 0x3733EA3C */
 s32 cellPadClearBuf(u32 port_no);
 
-/* Internal: call once per frame to update pad state from host input */
-void cellPad_poll(void);
-
 /* Win32 renderer hook: mirror window key messages into the pad backend.  This
- * supplements GetAsyncKeyState, keeps input tied to the game window, and also
- * makes PostMessage-based automated acceptance boots deterministic. */
+ * supplements GetAsyncKeyState and keeps input tied to the game window. */
 void cellPad_host_key_event(u32 virtual_key, int down);
 void cellPad_host_key_reset(void);
 

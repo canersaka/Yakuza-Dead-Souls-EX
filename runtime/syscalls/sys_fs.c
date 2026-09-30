@@ -15,7 +15,6 @@
   #include <io.h>
   #define stat _stat64
   #define S_ISDIR(m) (((m) & _S_IFDIR) != 0)
-  #define S_ISREG(m) (((m) & _S_IFREG) != 0)
 #else
   #include <unistd.h>
   #include <dirent.h>
@@ -163,18 +162,12 @@ int64_t sys_fs_open(ppu_context* ctx)
     }
 
     if (!fp) {
-        fprintf(stderr, "[sys_fs] open FAILED: %s\n", host_path);
         return (int64_t)(int32_t)CELL_ENOENT;
     }
-
-    fprintf(stderr, "[sys_fs] open OK: %s\n", host_path);
 
     sys_fs_fd_info* f = &g_sys_fs_fds[slot];
     f->active = 1;
     f->fp     = fp;
-    f->flags  = flags;
-    strncpy(f->path, host_path, sizeof(f->path) - 1);
-    f->path[sizeof(f->path) - 1] = '\0';
 
     /* FD is slot + 3 (reserve 0=stdin, 1=stdout, 2=stderr) */
     int32_t fd = slot + 3;
@@ -233,7 +226,7 @@ int64_t sys_fs_write(ppu_context* ctx)
 
     int slot = fd - 3;
     if (slot < 0 || slot >= SYS_FS_FD_MAX) {
-        /* Invalid fd — pretend write succeeded (CRT stdio uses corrupted fds) */
+        /* Invalid fd: pretend write succeeded (CRT stdio uses corrupted fds) */
         if (nwritten_addr != 0)
             write_be64(nwritten_addr, size);
         return CELL_OK;
@@ -300,7 +293,7 @@ int64_t sys_fs_lseek(ppu_context* ctx)
 
     int slot = fd - 3;
     if (slot < 0 || slot >= SYS_FS_FD_MAX) {
-        /* Invalid fd — return position 0 instead of EBADF.
+        /* Invalid fd: return position 0 instead of EBADF.
          * The CRT may call lseek on uninitialized FILE structures. */
         if (pos_addr)
             write_be64(pos_addr, 0);
@@ -355,11 +348,10 @@ static void fill_cell_stat(uint32_t stat_addr, struct stat* st)
     mode |= CELL_FS_S_IWUSR; /* assume writable on Windows */
 #endif
 
-    /* CellFsStat is 52 bytes, 4-byte-packed (RPCS3 sys_fs.h CHECK_SIZE_ALIGN(52,4)):
-     * mode@0 uid@4 gid@8 atime@12 mtime@20 ctime@28 size@36 blksize@44 -- the s64
-     * times/sizes are 4-byte aligned (NO pad@12). Prior layout 8-aligned them ->
-     * st_size landed at +40 instead of +36 (garbage file sizes for a guest using
-     * the raw sys_fs syscall; the cellFs *lib* path is separately correct). */
+    /* CellFsStat is 52 bytes, 4-byte-packed:
+     * mode@0 uid@4 gid@8 atime@12 mtime@20 ctime@28 size@36 blksize@44. The
+     * s64 times/sizes are 4-byte aligned (no pad at 12), so st_size lands at
+     * +36, not +40. */
     write_be32(stat_addr + 0,  mode);
     write_be32(stat_addr + 4,  0);  /* uid */
     write_be32(stat_addr + 8,  0);  /* gid */
@@ -479,7 +471,6 @@ int64_t sys_fs_opendir(ppu_context* ctx)
 #endif
 
     d->active = 1;
-    strncpy(d->path, host_path, sizeof(d->path) - 1);
 
     int32_t dir_fd = slot + 1;
     write_be32(fd_out, (uint32_t)dir_fd);

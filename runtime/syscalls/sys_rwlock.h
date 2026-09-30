@@ -27,13 +27,9 @@ extern "C" {
 
 typedef struct sys_rwlock_info {
     int      active;
-    uint32_t protocol;
-    char     name[8];
 
 #ifdef _WIN32
     SRWLOCK  srw;
-    /* Track exclusive ownership for proper unlock dispatch */
-    volatile LONG  readers;
     volatile LONG  writer;
     uint64_t       writer_tid;   /* owning thread of the write lock (EDEADLK/EPERM) */
 #else

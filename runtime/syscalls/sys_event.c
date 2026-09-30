@@ -3,29 +3,10 @@
  */
 
 #include "sys_event.h"
-#include "sys_mutex.h"   /* SYS_SYNC_FIFO / SYS_SYNC_PRIORITY (audit sec.5 item 3, queue-create validation) */
+#include "sys_mutex.h"   /* SYS_SYNC_FIFO / SYS_SYNC_PRIORITY (queue-create validation) */
 #include "sys_timer.h"   /* lv2_usec_deadline: sub-ms timed waits */
 #include "../memory/vm.h"
-#include "ps3emu/yz_frontier_trace.h"
 #include <string.h>
-#include <stdio.h>
-#include <stdlib.h>
-
-/* t1-unblock diagnostic (env YZ_T1_UNBLOCK, 2026-07-04, DIAGNOSTIC ONLY --
- * see docs/FLAGS.md; NOT a shipping fix, must stay env-gated and default-off
- * with a kill-switch per the project's band-aid hygiene rule). Companion to the
- * sys_semaphore.c lever of the same name -- see that file for the rationale.
- * Makes t1's sys_event_queue_receive return immediately (CELL_OK, zeroed
- * event regs) instead of parking when the queue is empty, so t1 can barrel
- * through its whole SPURS-wait chain to scope how deep it goes. REMOVE with
- * the t1-wedge frontier. */
-static int t1_unblock_on(void)
-{
-    static int on = -1;
-    if (on < 0) { const char* e = getenv("YZ_T1_UNBLOCK"); on = (e && *e) ? 1 : 0; }
-    return on;
-}
-extern uint32_t yz_thread_current_id(void);
 
 /* ---------------------------------------------------------------------------
  * Globals
@@ -34,63 +15,7 @@ sys_event_queue_info g_sys_event_queues[SYS_EVENT_QUEUE_MAX];
 sys_event_port_info  g_sys_event_ports[SYS_EVENT_PORT_MAX];
 sys_event_flag_info  g_sys_event_flags[SYS_EVENT_FLAG_MAX];
 
-static uint64_t bswap64(uint64_t v);
 
-void yz_frontier_event_snapshot(void)
-{
-    const uint64_t bits = bswap64(
-        *(const uint64_t*)vm_to_host(0x4019C680u));
-    const uint32_t bits_hi = (uint32_t)(bits >> 32);
-    const uint32_t bits_lo = (uint32_t)bits;
-
-    for (uint32_t i = 0; i < SYS_EVENT_QUEUE_MAX; ++i) {
-        const sys_event_queue_info* q = &g_sys_event_queues[i];
-        if (!q->active) continue;
-        yz_frontier_trace_emit(
-            YZ_FT_EVENT_STATE, i + 1u, 2u,
-            (uint32_t)q->active,
-            ((uint32_t)q->count << 16) | ((uint32_t)q->head & 0xFFFFu),
-            ((uint32_t)q->tail << 16) | ((uint32_t)q->waiters & 0xFFFFu),
-            bits_hi, bits_lo, (uint32_t)q->capacity);
-        yz_frontier_trace_emit(
-            YZ_FT_SYNC_STATE, i + 1u, 5u,
-            (uint32_t)q->count, (uint32_t)q->capacity,
-            (uint32_t)q->waiters, (uint32_t)q->head,
-            (uint32_t)q->tail, (uint32_t)q->force_destroyed);
-    }
-
-    for (uint32_t i = 0; i < SYS_EVENT_FLAG_MAX; i++) {
-        const sys_event_flag_info* f = &g_sys_event_flags[i];
-        if (!f->active)
-            continue;
-        yz_frontier_trace_emit(
-            YZ_FT_EVENT_STATE, i + 1u, 0,
-            (uint32_t)(f->pattern >> 32),
-            (uint32_t)f->pattern, (uint32_t)f->waiters,
-            f->protocol, f->type, (uint32_t)f->cancel_gen);
-        yz_frontier_trace_emit(
-            YZ_FT_SYNC_STATE, i + 1u, 6u,
-            (uint32_t)f->pattern, (uint32_t)(f->pattern >> 32),
-            (uint32_t)f->waiters, f->protocol, f->type,
-            (uint32_t)f->cancel_gen);
-    }
-}
-
-static void yz_frontier_queue_record(uint32_t phase, uint32_t queue_id,
-                                     const sys_event_queue_info* q,
-                                     const sys_event_t* evt)
-{
-    if (queue_id != 2 || !yz_frontier_trace_is_armed())
-        return;
-    yz_frontier_trace_emit(
-        YZ_FT_EVENT_QUEUE, yz_thread_current_id(), phase,
-        queue_id,
-        ((uint32_t)q->count << 16) | ((uint32_t)q->head & 0xFFFFu),
-        ((uint32_t)q->tail << 16) | ((uint32_t)q->waiters & 0xFFFFu),
-        evt ? (uint32_t)evt->source : 0u,
-        evt ? (uint32_t)evt->data1 : 0u,
-        evt ? (uint32_t)evt->data2 : 0u);
-}
 
 /* Table lock for allocation */
 #ifdef _WIN32
@@ -167,19 +92,14 @@ int64_t sys_event_queue_create(ppu_context* ctx)
     uint64_t key         = LV2_ARG_U64(ctx, 2);
     int32_t  size        = LV2_ARG_S32(ctx, 3);
 
-    /* Audit sec.5 item 3 (2026-07-03, user-confirmed; RPCS3
-     * sys_event.cpp:229-247): size must be in [1,127] -- EINVAL, not a
-     * silent clamp to the max. Protocol/type are read from the attribute
-     * struct up front (before any slot is allocated, matching RPCS3's
-     * validate-then-create order) and must be one of the documented values,
-     * else EINVAL. */
+    /* size must be in 1..127 (EINVAL otherwise, not a silent clamp). Protocol
+     * and type are read from the attribute struct and must be documented
+     * values, else EINVAL. */
     if (size <= 0 || size > SYS_EVENT_QUEUE_BUF_MAX)
         return (int64_t)(int32_t)CELL_EINVAL;
 
     uint32_t protocol = SYS_SYNC_FIFO;
     uint32_t qtype     = SYS_PPU_QUEUE;
-    uint8_t  name_buf[8];
-    memset(name_buf, 0, sizeof(name_buf));
 
     if (attr_addr != 0) {
         uint8_t* attr_raw = (uint8_t*)vm_to_host(attr_addr);
@@ -198,8 +118,6 @@ int64_t sys_event_queue_create(ppu_context* ctx)
                   ((type_be << 8) & 0xFF0000) | ((type_be << 24) & 0xFF000000u);
 #endif
         qtype = type_be;
-
-        memcpy(name_buf, attr_raw + 8, 8);
     }
 
     if (protocol != SYS_SYNC_FIFO && protocol != SYS_SYNC_PRIORITY)
@@ -209,14 +127,10 @@ int64_t sys_event_queue_create(ppu_context* ctx)
 
     evt_table_lock();
 
-    /* 2026-08-05 item-K fix 3 -- duplicate global key must be refused, not
-     * silently given a second queue (2026-08-04 audit: key-routed producers,
-     * e.g. the cellAudio notify lookup, could then hit either queue).
-     * ORACLE(Lv2 Reference p.237): return-values table lists EEXIST "The
-     * specified key is already in use" (the description prose says EINVAL --
-     * the doc contradicts itself; the table and RPCS3 sys_event.cpp agree on
-     * EEXIST, so EEXIST it is). Key 0 = SYS_EVENT_QUEUE_LOCAL is the
-     * documented process-local key exempt from duplication checks. */
+    /* A duplicate global key is refused with EEXIST rather than silently
+     * given a second queue (key-routed producers, e.g. the cellAudio notify
+     * lookup, could then hit either queue). Key 0 (process-local queue) is
+     * exempt from duplication checks. */
     if (key != 0) {
         for (int i = 0; i < SYS_EVENT_QUEUE_MAX; i++) {
             if (g_sys_event_queues[i].active && g_sys_event_queues[i].key == key) {
@@ -243,9 +157,6 @@ int64_t sys_event_queue_create(ppu_context* ctx)
     q->head     = 0;
     q->tail     = 0;
     q->count    = 0;
-    q->protocol = protocol;
-    q->type     = (int32_t)qtype;
-    memcpy(q->name, name_buf, 8);
 
 #ifdef _WIN32
     InitializeCriticalSection(&q->lock);
@@ -272,8 +183,7 @@ int64_t sys_event_queue_destroy(ppu_context* ctx)
     if (queue_id == 0 || queue_id > SYS_EVENT_QUEUE_MAX)
         return (int64_t)(int32_t)CELL_ESRCH;
 
-    /* Audit sec.5 item 4 (2026-07-03, user-confirmed; RPCS3
-     * sys_event.cpp:273): mode must be 0 or SYS_EVENT_QUEUE_DESTROY_FORCE. */
+    /* mode must be 0 or SYS_EVENT_QUEUE_DESTROY_FORCE. */
     if (mode && mode != SYS_EVENT_QUEUE_DESTROY_FORCE)
         return (int64_t)(int32_t)CELL_EINVAL;
 
@@ -285,23 +195,21 @@ int64_t sys_event_queue_destroy(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_ESRCH;
     }
 
-    /* Mark inactive and WAKE any blocked receivers so they observe !active and
+    /* Mark inactive and wake any blocked receivers so they observe !active and
      * return ESRCH (or ECANCELED under FORCE, see below) instead of hanging
      * forever on `not_empty` (lost-wakeup / teardown deadlock). Do it under
      * the per-queue lock so the wake can't race a receiver entering the wait.
-     * Deliberately do NOT Delete/destroy the CRITICAL_SECTION / condition
+     * Deliberately do not delete/destroy the CRITICAL_SECTION / condition
      * variable here: a receiver may still be unwinding out of
      * SleepConditionVariableCS and needs them valid (destroying them under a
-     * live waiter is UB). The slot's primitives are re-Initialized (after a
+     * live waiter is UB). The slot's primitives are re-initialized (after a
      * memset) when the slot is reused by sys_event_queue_create, so leaking
      * them is benign on this bounded, reused 128-slot table.
      *
-     * Audit sec.5 item 4: without FORCE, a queue with parked waiters must
-     * fail with CELL_EBUSY and NOT be torn down (RPCS3 sys_event.cpp:273
-     * checks `!mode && head` on the internal wait queue -- our `waiters`
-     * counter is the equivalent). With FORCE, waiters are woken and made to
-     * observe force_destroyed so they return CELL_ECANCELED instead of the
-     * generic CELL_ESRCH. */
+     * Without FORCE, a queue with parked waiters fails with CELL_EBUSY and
+     * is not torn down (the `waiters` counter tracks the parked receivers).
+     * With FORCE, waiters are woken and made to observe force_destroyed so
+     * they return CELL_ECANCELED instead of the generic CELL_ESRCH. */
 #ifdef _WIN32
     EnterCriticalSection(&q->lock);
     if (!mode && q->waiters > 0) {
@@ -326,13 +234,11 @@ int64_t sys_event_queue_destroy(ppu_context* ctx)
     pthread_mutex_unlock(&q->lock);
 #endif
 
-    /* 2026-08-05 item-K fix 4 -- ORACLE(Lv2 Reference p.239): "All
-     * connections with event ports are forcibly disconnected." Leaving the
-     * connection standing let a later sys_event_port_send inject into
-     * whatever queue recycled this slot (2026-08-04 audit: stale-port
-     * injection). After this sweep a send on such a port takes the
-     * documented ENOTCONN path (Reference p.248). Done under the table lock
-     * that also guards connect/disconnect. */
+    /* Destroying a queue forcibly disconnects every event port connected to
+     * it. Leaving a connection standing would let a later
+     * sys_event_port_send inject into whatever queue recycled this slot.
+     * After this sweep a send on such a port takes the documented ENOTCONN
+     * path. Done under the table lock that also guards connect/disconnect. */
     for (int i = 0; i < SYS_EVENT_PORT_MAX; i++) {
         sys_event_port_info* p = &g_sys_event_ports[i];
         if (p->active && p->connected_queue == (int32_t)queue_id)
@@ -356,8 +262,8 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
     uint32_t event_addr  = LV2_ARG_PTR(ctx, 1);
     uint64_t timeout_us  = LV2_ARG_U64(ctx, 2);
 
-    /* Batch fixes item 8: clamp the guest timeout to 48 bits so the QPC
-     * deadline multiply / ms-DWORD conversion below can't overflow. */
+    /* Cap very large guest timeouts so the microsecond-to-millisecond and
+     * timespec conversions below stay in range. */
     if (timeout_us > ((1ull << 48) - 1)) timeout_us = (1ull << 48) - 1;
 
     if (queue_id == 0 || queue_id > SYS_EVENT_QUEUE_MAX)
@@ -367,43 +273,10 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
     if (!q->active)
         return (int64_t)(int32_t)CELL_ESRCH;
 
-    /* YZ_T1_UNBLOCK: if t1 would block here (queue empty), return CELL_OK
-     * immediately with a zeroed event instead of parking. Cap logging at
-     * ~100 lines but let the forcing continue unbounded. */
-    if (t1_unblock_on() && yz_thread_current_id() == 1) {
-        int would_block;
-#ifdef _WIN32
-        EnterCriticalSection(&q->lock);
-        would_block = (q->count == 0);
-        LeaveCriticalSection(&q->lock);
-#else
-        pthread_mutex_lock(&q->lock);
-        would_block = (q->count == 0);
-        pthread_mutex_unlock(&q->lock);
-#endif
-        if (would_block) {
-            static long n = 0; long c = ++n;
-            if (c <= 100) {
-                fprintf(stderr, "[t1-unblock] eq_recv q=%u forced\n", queue_id);
-                fflush(stderr);
-            }
-            ctx->gpr[4] = 0;
-            ctx->gpr[5] = 0;
-            ctx->gpr[6] = 0;
-            ctx->gpr[7] = 0;
-            if (event_addr != 0) {
-                uint64_t* out = (uint64_t*)vm_to_host(event_addr);
-                out[0] = 0; out[1] = 0; out[2] = 0; out[3] = 0;
-            }
-            return CELL_OK;
-        }
-    }
 
 #ifdef _WIN32
     EnterCriticalSection(&q->lock);
-    yz_frontier_queue_record(
-        YZ_FT_QUEUE_RECEIVE_ENTER, queue_id, q, NULL);
-    q->waiters++;   /* audit sec.5 item 4: destroy's EBUSY check needs this */
+    q->waiters++;   /* destroy's EBUSY check needs this */
 
     if (timeout_us == 0) {
         while (q->count == 0 && q->active) {
@@ -427,8 +300,8 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
             EnterCriticalSection(&q->lock);
         }
     } else {
-        /* Batch fixes item 8: never let a converted ms value land on
-         * 0xFFFFFFFF (INFINITE) -- cap at 0xFFFFFFFE. */
+        /* Never let a converted ms value land on 0xFFFFFFFF (INFINITE);
+         * cap at 0xFFFFFFFE. */
         uint64_t ms64 = timeout_us / 1000;
         DWORD ms = (ms64 > 0xFFFFFFFEull) ? 0xFFFFFFFEu : (DWORD)ms64;
         while (q->count == 0 && q->active) {
@@ -445,9 +318,9 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
     q->waiters--;
 
     if (!q->active || q->count == 0) {
-        /* Audit sec.5 item 4: a FORCE destroy wakes waiters with
-         * CELL_ECANCELED (RPCS3 sys_event.cpp:377/388); a plain teardown
-         * that raced ahead of this waiter still reports CELL_ESRCH. */
+        /* A FORCE destroy wakes waiters with CELL_ECANCELED; a plain
+         * teardown that raced ahead of this waiter still reports
+         * CELL_ESRCH. */
         int64_t rc = q->force_destroyed ? (int64_t)(int32_t)CELL_ECANCELED
                                          : (int64_t)(int32_t)CELL_ESRCH;
         LeaveCriticalSection(&q->lock);
@@ -457,14 +330,10 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
     sys_event_t evt = q->buffer[q->head];
     q->head = (q->head + 1) % q->capacity;
     q->count--;
-    yz_frontier_queue_record(
-        YZ_FT_QUEUE_RECEIVE_POP, queue_id, q, &evt);
 
     LeaveCriticalSection(&q->lock);
 #else
     pthread_mutex_lock(&q->lock);
-    yz_frontier_queue_record(
-        YZ_FT_QUEUE_RECEIVE_ENTER, queue_id, q, NULL);
     q->waiters++;
 
     if (timeout_us == 0) {
@@ -502,25 +371,18 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
     sys_event_t evt = q->buffer[q->head];
     q->head = (q->head + 1) % q->capacity;
     q->count--;
-    yz_frontier_queue_record(
-        YZ_FT_QUEUE_RECEIVE_POP, queue_id, q, &evt);
 
     pthread_mutex_unlock(&q->lock);
 #endif
 
-    /* The lv2 ABI returns the event in GPRs r4-r7; the pointer arg is IGNORED
-     * (RPCS3 names it `dummy_event` and writes the result to ppu.gpr[4..7],
-     * sys_event.cpp:499). Sony's libgcm interrupt thread reads these registers
-     * to decode the vblank/flip cause -- if they are not set it sees stale
-     * garbage and never dispatches the game's handler (the render loop then
-     * never advances). Set the registers; also keep the legacy buffer write
-     * for any caller that reads the (non-standard) out-pointer. */
+    /* The lv2 ABI returns the event in GPRs r4-r7; the out-pointer is written
+     * as well for callers that read it. */
     ctx->gpr[4] = evt.source;
     ctx->gpr[5] = evt.data1;
     ctx->gpr[6] = evt.data2;
     ctx->gpr[7] = evt.data3;
 
-    /* Legacy: also write event to guest memory in big-endian (harmless). */
+    /* Also write the event to guest memory in big-endian. */
     if (event_addr != 0) {
         uint64_t* out = (uint64_t*)vm_to_host(event_addr);
         out[0] = bswap64(evt.source);
@@ -546,11 +408,9 @@ int64_t sys_event_queue_tryreceive(ppu_context* ctx)
     if (!q->active)
         return (int64_t)(int32_t)CELL_ESRCH;
 
-    /* 2026-08-05 item-K fix 2 -- ORACLE(Lv2 Reference p.241 Notes): "If 0 is
-     * specified to size and other argument values are correct, this function
-     * successfully returns CELL_OK, storing 0 in number." The old
-     * clamp-to-1 dequeued an event and wrote 32 bytes into the caller's
-     * zero-length buffer (2026-08-04 audit). size<=0 now receives nothing:
+    /* A size of 0 with otherwise valid arguments succeeds with CELL_OK and
+     * stores 0 in number; clamping to 1 would dequeue an event and write 32
+     * bytes into the caller's zero-length buffer. size<=0 receives nothing:
      * the drain loop below runs zero iterations and *number gets 0. */
     if (max_count < 0) max_count = 0;
 
@@ -625,8 +485,6 @@ int64_t sys_event_queue_drain(ppu_context* ctx)
 /* Helper to enqueue an event into a queue */
 static int event_queue_push(sys_event_queue_info* q, const sys_event_t* evt)
 {
-    const uint32_t queue_id =
-        (uint32_t)(q - &g_sys_event_queues[0]) + 1u;
 #ifdef _WIN32
     EnterCriticalSection(&q->lock);
 #else
@@ -634,8 +492,6 @@ static int event_queue_push(sys_event_queue_info* q, const sys_event_t* evt)
 #endif
 
     if (q->count >= q->capacity) {
-        yz_frontier_queue_record(
-            YZ_FT_QUEUE_PUSH_FULL, queue_id, q, evt);
 #ifdef _WIN32
         LeaveCriticalSection(&q->lock);
 #else
@@ -647,8 +503,6 @@ static int event_queue_push(sys_event_queue_info* q, const sys_event_t* evt)
     q->buffer[q->tail] = *evt;
     q->tail = (q->tail + 1) % q->capacity;
     q->count++;
-    yz_frontier_queue_record(
-        YZ_FT_QUEUE_PUSH_OK, queue_id, q, evt);
 
 #ifdef _WIN32
     WakeConditionVariable(&q->not_empty);
@@ -664,7 +518,6 @@ static int event_queue_push(sys_event_queue_info* q, const sys_event_t* evt)
 int64_t sys_event_port_create(ppu_context* ctx)
 {
     uint32_t id_out_addr = LV2_ARG_PTR(ctx, 0);
-    int32_t  port_type   = LV2_ARG_S32(ctx, 1);
     uint64_t name        = LV2_ARG_U64(ctx, 2);
 
     evt_table_lock();
@@ -681,7 +534,6 @@ int64_t sys_event_port_create(ppu_context* ctx)
     sys_event_port_info* p = &g_sys_event_ports[slot];
     memset(p, 0, sizeof(*p));
     p->active = 1;
-    p->type   = port_type;
     p->name   = name;
     p->connected_queue = 0;
 
@@ -827,14 +679,13 @@ int64_t sys_event_port_send(ppu_context* ctx)
     if (!q->active)
         return (int64_t)(int32_t)CELL_ESRCH;
 
-    /* Audit sec.5 item 2 (2026-07-03, user-confirmed; RPCS3
-     * sys_event.cpp:789): an unnamed port (name == 0, the common case --
-     * sys_event_port_create's `name` arg is usually 0 and assigned only by
-     * callers wanting a fixed identity) must synthesize its source as
-     * (pid << 32) | port_id, not send a bare 0. Our process always reports
-     * pid 1 (sys_process_getpid, lv2_register.c). Receivers that switch on
-     * `source` (rather than blindly trusting whichever port fired) got 0
-     * from every unnamed port and could not tell them apart. */
+    /* An unnamed port (name == 0, the common case: sys_event_port_create's
+     * `name` arg is usually 0 and assigned only by callers wanting a fixed
+     * identity) synthesizes its source as (pid << 32) | port_id rather than
+     * sending a bare 0. Our process always reports pid 1
+     * (sys_process_getpid, lv2_register.c). Receivers that switch on
+     * `source` (rather than blindly trusting whichever port fired) can then
+     * tell unnamed ports apart. */
     sys_event_t evt;
     evt.source = p->name ? p->name : ((uint64_t)1 << 32) | (uint64_t)port_id;
     evt.data1  = data1;
@@ -871,16 +722,12 @@ int64_t sys_event_flag_create(ppu_context* ctx)
 
     uint32_t protocol = SYS_SYNC_FIFO;
     uint32_t ftype     = SYS_SYNC_WAITER_MULTIPLE;
-    uint8_t  name_buf[8];
-    memset(name_buf, 0, sizeof(name_buf));
 
     if (attr_addr != 0) {
-        /* s23 PARSE FIX (found by the validation regression bisect): the attr
-         * struct is {protocol@0x00, pshared@0x04, ipc_key@0x08(u64),
-         * flags@0x10, type@0x14, name@0x18} (RPCS3 sys_event_flag.h
-         * sys_event_flag_attribute_t). The old parse read pshared as "type"
-         * (measured: 0x200 = SYS_SYNC_NOT_PROCESS_SHARED) and ipc_key bytes
-         * as the name -- harmless while unvalidated, fatal once validated. */
+        /* The attr struct is {protocol@0x00, pshared@0x04, ipc_key@0x08(u64),
+         * flags@0x10, type@0x14, name@0x18}. pshared (typically 0x200 =
+         * SYS_SYNC_NOT_PROCESS_SHARED) and the ipc_key bytes must not be
+         * read as the type and name. */
         uint8_t* attr_raw = (uint8_t*)vm_to_host(attr_addr);
         uint32_t proto_be, type_be;
         memcpy(&proto_be, attr_raw, 4);
@@ -893,17 +740,11 @@ int64_t sys_event_flag_create(ppu_context* ctx)
 #endif
         protocol = proto_be;
         ftype    = type_be;
-        memcpy(name_buf, attr_raw + 0x18, 8);
     }
 
-    /* Batch fixes item 9(a): attribute validation, re-enabled after the parse
-     * fix above (the bisect's would-reject values were OUR mis-parse, not the
-     * game's attrs). Loud on rejection so a future mismatch is visible. */
+    /* Attribute validation: protocol and type must be documented values. */
     if ((protocol != SYS_SYNC_FIFO && protocol != SYS_SYNC_PRIORITY) ||
         (ftype != SYS_SYNC_WAITER_SINGLE && ftype != SYS_SYNC_WAITER_MULTIPLE)) {
-        static int n = 0; if (n < 8) { n++;
-            fprintf(stderr, "[evflag] create REJECT: protocol=0x%X type=0x%X\n",
-                    protocol, ftype); fflush(stderr); }
         evt_table_unlock();
         return (int64_t)(int32_t)CELL_EINVAL;
     }
@@ -912,9 +753,7 @@ int64_t sys_event_flag_create(ppu_context* ctx)
     memset(f, 0, sizeof(*f));
     f->active   = 1;
     f->pattern  = init_pattern;
-    f->protocol = protocol;
     f->type     = ftype;
-    memcpy(f->name, name_buf, 8);
 
 #ifdef _WIN32
     InitializeCriticalSection(&f->lock);
@@ -948,9 +787,8 @@ int64_t sys_event_flag_destroy(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_ESRCH;
     }
 
-    /* Batch fixes item 9(c) (RPCS3 sys_event_flag.cpp:103-108): refuse to
-     * tear down a flag with parked waiters instead of destroying it under
-     * them. */
+    /* Refuse to tear down a flag with parked waiters instead of destroying
+     * it under them. */
     if (f->waiters > 0) {
         evt_table_unlock();
         return (int64_t)(int32_t)CELL_EBUSY;
@@ -996,8 +834,8 @@ int64_t sys_event_flag_wait(ppu_context* ctx)
     uint32_t result_addr = LV2_ARG_PTR(ctx, 3);
     uint64_t timeout_us = LV2_ARG_U64(ctx, 4);
 
-    /* Batch fixes item 8: clamp the guest timeout to 48 bits so the QPC
-     * deadline multiply / ms-DWORD conversion below can't overflow. */
+    /* Cap very large guest timeouts so the microsecond-to-millisecond and
+     * timespec conversions below stay in range. */
     if (timeout_us > ((1ull << 48) - 1)) timeout_us = (1ull << 48) - 1;
 
     if (flag_id == 0 || flag_id > SYS_EVENT_FLAG_MAX)
@@ -1007,34 +845,9 @@ int64_t sys_event_flag_wait(ppu_context* ctx)
     if (!f->active)
         return (int64_t)(int32_t)CELL_ESRCH;
 
-    /* Batch fixes item 9(e) (RPCS3 sys_event_flag.h:61-79): mode packs a
-     * wait selector (AND/OR) in the low nibble and an optional CLEAR/
-     * CLEAR_ALL in the rest; validate both instead of the invented
-     * bitpat==0 check this replaces. */
-    {
-        /* s23 REGRESSION BISECT: enforcement wedged the boot -- LOG-ONLY
-         * until the mode values the game passes are measured. */
-        uint32_t wmode = mode & 0xFu;
-        uint32_t cmode = mode & ~0xFu;
-        if ((wmode != SYS_EVENT_FLAG_WAIT_AND && wmode != SYS_EVENT_FLAG_WAIT_OR) ||
-            (cmode != 0 && cmode != SYS_EVENT_FLAG_WAIT_CLEAR && cmode != SYS_EVENT_FLAG_WAIT_CLEAR_ALL)) {
-            static int n = 0; if (n < 8) { n++;
-                fprintf(stderr, "[evflag] mode would-reject: mode=0x%X (log-only)\n",
-                        (uint32_t)mode); fflush(stderr); }
-        }
-    }
-
 #ifdef _WIN32
     EnterCriticalSection(&f->lock);
 
-    /* Batch fixes item 9(b) (RPCS3 sys_event_flag.cpp:170-173): a
-     * SYS_SYNC_WAITER_SINGLE flag rejects a second concurrent waiter. */
-    if (f->type == SYS_SYNC_WAITER_SINGLE && f->waiters > 0) {
-        /* s23 REGRESSION BISECT: log-only (see create validation note). */
-        static int n1 = 0; if (n1 < 8) { n1++;
-            fprintf(stderr, "[evflag] SINGLE double-wait would-reject (log-only)\n");
-            fflush(stderr); }
-    }
     f->waiters++;
     unsigned cancel_snap = f->cancel_gen;
 
@@ -1062,8 +875,8 @@ int64_t sys_event_flag_wait(ppu_context* ctx)
             EnterCriticalSection(&f->lock);
         }
     } else {
-        /* Batch fixes item 8: never let a converted ms value land on
-         * 0xFFFFFFFF (INFINITE) -- cap at 0xFFFFFFFE. */
+        /* Never let a converted ms value land on 0xFFFFFFFF (INFINITE);
+         * cap at 0xFFFFFFFE. */
         uint64_t ms64 = timeout_us / 1000;
         DWORD ms = (ms64 > 0xFFFFFFFEull) ? 0xFFFFFFFEu : (DWORD)ms64;
         while (!flag_check(f->pattern, bitpat, mode) && f->active && f->cancel_gen == cancel_snap) {
@@ -1084,9 +897,9 @@ int64_t sys_event_flag_wait(ppu_context* ctx)
 
     f->waiters--;
 
-    /* Batch fixes item 9(d), generation-scoped: a cancel issued while THIS
-     * thread was parked forces CELL_ECANCELED without consuming the pattern.
-     * Ref p.228 Notes: result receives the flag value at cancel timing. */
+    /* Generation-scoped: a cancel issued while this thread was parked forces
+     * CELL_ECANCELED without consuming the pattern. The result receives the
+     * flag value at cancel time. */
     if (f->cancel_gen != cancel_snap) {
         if (result_addr != 0) {
             uint64_t* out = (uint64_t*)vm_to_host(result_addr);
@@ -1114,12 +927,6 @@ int64_t sys_event_flag_wait(ppu_context* ctx)
 #else
     pthread_mutex_lock(&f->lock);
 
-    if (f->type == SYS_SYNC_WAITER_SINGLE && f->waiters > 0) {
-        /* s23 REGRESSION BISECT: log-only (see create validation note). */
-        static int n2 = 0; if (n2 < 8) { n2++;
-            fprintf(stderr, "[evflag] SINGLE double-wait would-reject (log-only)\n");
-            fflush(stderr); }
-    }
     f->waiters++;
     unsigned cancel_snap = f->cancel_gen;
 
@@ -1194,20 +1001,6 @@ int64_t sys_event_flag_trywait(ppu_context* ctx)
     if (!f->active)
         return (int64_t)(int32_t)CELL_ESRCH;
 
-    /* Batch fixes item 9(e): same mode validation as sys_event_flag_wait. */
-    {
-        /* s23 REGRESSION BISECT: enforcement wedged the boot -- LOG-ONLY
-         * until the mode values the game passes are measured. */
-        uint32_t wmode = mode & 0xFu;
-        uint32_t cmode = mode & ~0xFu;
-        if ((wmode != SYS_EVENT_FLAG_WAIT_AND && wmode != SYS_EVENT_FLAG_WAIT_OR) ||
-            (cmode != 0 && cmode != SYS_EVENT_FLAG_WAIT_CLEAR && cmode != SYS_EVENT_FLAG_WAIT_CLEAR_ALL)) {
-            static int n = 0; if (n < 8) { n++;
-                fprintf(stderr, "[evflag] mode would-reject: mode=0x%X (log-only)\n",
-                        (uint32_t)mode); fflush(stderr); }
-        }
-    }
-
 #ifdef _WIN32
     EnterCriticalSection(&f->lock);
 #else
@@ -1250,10 +1043,9 @@ int64_t sys_event_flag_trywait(ppu_context* ctx)
 }
 
 /* Internal by-id setter: shared by the PPU syscall and the SPU
- * WrOutIntrMbox set_bit protocol (codes 128/192 -- RPCS3 SPUThread.cpp
- * :6090-6160: an SPU sets an lv2 event-flag bit by writing the flag id to
- * OutMbox and (0x80|0xC0)<<24 | bit to OutIntrMbox; Sony's SPURS taskset
- * exit handler uses the impatient form as its completion doorbell). */
+ * WrOutIntrMbox set_bit protocol (codes 128/192): an SPU sets an lv2
+ * event-flag bit by writing the flag id to OutMbox and
+ * (0x80|0xC0)<<24 | bit to OutIntrMbox. */
 int64_t sys_event_flag_set_by_id(uint32_t flag_id, uint64_t bitpat)
 {
     if (flag_id == 0 || flag_id > SYS_EVENT_FLAG_MAX)
@@ -1343,14 +1135,14 @@ int64_t sys_event_flag_get(ppu_context* ctx)
 }
 
 /* ---------------------------------------------------------------------------
- * sys_event_flag_cancel (batch fixes item 9(d))
+ * sys_event_flag_cancel
  *
  * r3 = flag_id
  * r4 = pointer to receive the number of woken waiters (u32*, optional)
  *
  * Bumps the cancel generation so exactly the waiters parked at call time
- * observe it and return CELL_ECANCELED (Lv2 Reference p.232); later waits
- * are unaffected (the previous sticky flag poisoned them forever).
+ * observe it and return CELL_ECANCELED; later waits are unaffected (a
+ * sticky flag would poison them forever).
  * -----------------------------------------------------------------------*/
 int64_t sys_event_flag_cancel(ppu_context* ctx)
 {

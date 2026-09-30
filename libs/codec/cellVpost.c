@@ -1,13 +1,12 @@
 /*
  * ps3recomp - cellVpost HLE implementation
  *
- * Rewritten 2026-08-05 against the SDK contract (see cellVpost.h header
- * comment). Implements the library's actual job: YUV420-planar input,
- * window cut, nearest-neighbor scale (documented first pass; the SDK's
- * scalerType selects fancier filters we approximate), window paste, and
- * RGBA-interleaved or YUV420-planar output, with BT.601/BT.709 matrices
- * and full/broadcast quantization ranges. PictureInfo is an OUTPUT the
- * library fills (the old stub read it).
+ * Follows the SDK contract (see cellVpost.h header comment). Implements the
+ * library's actual job: YUV420-planar input, window cut, nearest-neighbor
+ * scale (the SDK's scalerType selects fancier filters we approximate),
+ * window paste, and RGBA-interleaved or YUV420-planar output, with
+ * BT.601/BT.709 matrices and full/broadcast quantization ranges.
+ * PictureInfo is an output the library fills.
  *
  * All struct fields are guest big-endian; this file receives host
  * pointers from the bridge and swaps explicitly.
@@ -15,11 +14,9 @@
 
 #include "cellVpost.h"
 #include "ps3emu/endian.h"
-#include <stdio.h>
 #include <string.h>
 
 #define VPOST_BE32(x) ps3_bswap32(x)
-#define VPOST_BE64(x) ps3_bswap64(x)
 
 /* Handle cookies: high bits pattern + slot, so a stale/garbage token never
  * validates by accident and 0 is never a valid handle. */
@@ -75,11 +72,11 @@ s32 cellVpostQueryAttr(const CellVpostCfgParam* cfgParam, CellVpostAttr* attr)
     /* The real library reports its SPU work-area requirement; games hand us
      * back a buffer at least this large in Open's resource. We do the work
      * host-side, so any honest nonzero size works -- scale with the config
-     * so a later real consumer sees plausible numbers. */
+     * so a real consumer sees plausible numbers. */
     u32 mem = cfg.inMaxWidth * cfg.inMaxHeight * 2u + 0x40000u;
     attr->memSize = VPOST_BE32(mem);
     attr->delay = 0;
-    /* Library version: unverifiable from the header; report zeros. */
+    /* Library version fields are reported as zero. */
     attr->vpostVerUpper = 0;
     attr->vpostVerLower = 0;
     return CELL_OK;
@@ -102,10 +99,6 @@ s32 cellVpostOpen(const CellVpostCfgParam* cfgParam,
             s_ctx[i].in_use = 1;
             s_ctx[i].cfg = cfg;
             *handle = VPOST_BE32(VPOST_COOKIE_BASE + i);
-            printf("[cellVpost] Open %ux%u -> %ux%u fmt %u -> handle 0x%08X\n",
-                   cfg.inMaxWidth, cfg.inMaxHeight,
-                   cfg.outMaxWidth, cfg.outMaxHeight, cfg.outPicFmt,
-                   VPOST_COOKIE_BASE + i);
             return CELL_OK;
         }
     }
@@ -240,7 +233,7 @@ s32 cellVpostExec(CellVpostHandle handle, const void* inPicBuff,
         }
     }
 
-    /* PictureInfo is an OUTPUT describing what was performed. */
+    /* PictureInfo is an output describing what was performed. */
     u32* pi = (u32*)picInfo;
     pi[0]  = VPOST_BE32(in_w);
     pi[1]  = VPOST_BE32(in_h);

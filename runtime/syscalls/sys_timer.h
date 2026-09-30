@@ -35,14 +35,14 @@ uint64_t ppu_timebase_now(void);
 #ifdef _WIN32
 /* Sub-millisecond timed-wait support for the lv2 sync primitives.
  * SleepConditionVariableCS / WaitForSingleObject floor a timed wait to 1 ms,
- * and the OS then rounds that up to the timer tick — a 30 us guest timeout
+ * and the OS then rounds that up to the timer tick, so a 30 us guest timeout
  * inflates ~50x even with timeBeginPeriod(1). Waits under 1 ms must instead
  * poll their wake predicate and yield to a QueryPerformanceCounter deadline
  * (same approach sys_timer_usleep already uses). */
 int64_t lv2_usec_deadline(uint64_t usec);      /* QPC value 'usec' from now */
 
 /* Guest "system time" clock: microseconds since boot, the domain of
- * sys_time_get_system_time (Lv2 Reference p.262). Registered by the runner
+ * sys_time_get_system_time. Registered by the runner
  * at startup (yakuza/import_overrides.cpp); NULL in standalone builds (the
  * timer falls back to a local boot anchor). Any HLE producing guest-visible
  * timestamps (sys_timer expiry/data3, cellAudioGetPortTimestamp) must use
@@ -62,10 +62,9 @@ typedef struct sys_timer_info {
     uint64_t data1;            /* event data1 */
     uint64_t data2;            /* event data2 (the connect-time data2
                                  * argument, delivered verbatim in every
-                                 * fired event; RPCS3 sys_timer.cpp:363/90) */
+                                 * fired event) */
 
 #ifdef _WIN32
-    HANDLE   timer_handle;
     HANDLE   stop_event;
     HANDLE   thread_handle;
 #else

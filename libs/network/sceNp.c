@@ -1,12 +1,12 @@
 /*
  * ps3recomp - sceNp HLE implementation
  *
- * Provides fake PSN identity so games can proceed through NP checks.
- * The username defaults to "PS3Player" but is configurable.
+ * Offline NP stub: init/term, the NP Manager status reports OFFLINE, and
+ * identity and ticket requests return OFFLINE. The non-SDK helpers near the
+ * top return a configurable placeholder identity (default "PS3Player").
  */
 
 #include "sceNp.h"
-#include <stdio.h>
 #include <string.h>
 
 /* ---------------------------------------------------------------------------
@@ -46,9 +46,6 @@ s32 sceNpInit(u32 poolSize, void* poolPtr)
     (void)poolSize;
     (void)poolPtr;
 
-    printf("[sceNp] Init(poolSize=%u, username=\"%s\")\n",
-           poolSize, s_fake_username);
-
     if (s_np_initialized)
         return SCE_NP_ERROR_ALREADY_INITIALIZED;
 
@@ -58,8 +55,6 @@ s32 sceNpInit(u32 poolSize, void* poolPtr)
 
 s32 sceNpTerm(void)
 {
-    printf("[sceNp] Term()\n");
-
     if (!s_np_initialized)
         return SCE_NP_ERROR_NOT_INITIALIZED;
 
@@ -70,8 +65,6 @@ s32 sceNpTerm(void)
 
 s32 sceNpScoreInit(void)
 {
-    printf("[sceNp] ScoreInit()\n");
-
     if (s_np_score_initialized)
         return SCE_NP_COMMUNITY_ERROR_ALREADY_INITIALIZED;
 
@@ -84,8 +77,6 @@ s32 sceNpScoreInit(void)
 
 s32 sceNpScoreTerm(void)
 {
-    printf("[sceNp] ScoreTerm()\n");
-
     if (!s_np_score_initialized)
         return SCE_NP_COMMUNITY_ERROR_NOT_INITIALIZED;
 
@@ -107,7 +98,6 @@ s32 sceNpGetNpId(s32 userId, SceNpId* npId)
         return SCE_NP_ERROR_INVALID_ARGUMENT;
 
     np_build_fake_id(npId);
-    printf("[sceNp] GetNpId(user=%d) -> \"%s\"\n", userId, s_fake_username);
     return CELL_OK;
 }
 
@@ -125,7 +115,6 @@ s32 sceNpGetOnlineId(s32 userId, SceNpOnlineId* onlineId)
     strncpy(onlineId->data, s_fake_username, SCE_NP_ONLINEID_MAX_LENGTH);
     onlineId->term = '\0';
 
-    printf("[sceNp] GetOnlineId(user=%d) -> \"%s\"\n", userId, s_fake_username);
     return CELL_OK;
 }
 
@@ -143,8 +132,6 @@ s32 sceNpGetOnlineName(s32 userId, SceNpOnlineName* onlineName)
     strncpy(onlineName->data, s_fake_username,
             SCE_NP_ONLINENAME_MAX_LENGTH - 1);
 
-    printf("[sceNp] GetOnlineName(user=%d) -> \"%s\"\n",
-           userId, s_fake_username);
     return CELL_OK;
 }
 
@@ -164,8 +151,6 @@ s32 sceNpGetUserProfile(s32 userId, SceNpUserInfo* userInfo)
             SCE_NP_ONLINENAME_MAX_LENGTH - 1);
     /* Leave avatar URL empty */
 
-    printf("[sceNp] GetUserProfile(user=%d) -> \"%s\"\n",
-           userId, s_fake_username);
     return CELL_OK;
 }
 
@@ -182,7 +167,6 @@ s32 sceNpGetAccountRegion(s32 userId, u32* region)
     /* Region: US (SCEA) = 0x5553 ('US') */
     *region = 0x5553;
 
-    printf("[sceNp] GetAccountRegion(user=%d) -> US\n", userId);
     return CELL_OK;
 }
 
@@ -197,7 +181,6 @@ s32 sceNpGetAccountAge(s32 userId, s32* age)
         return SCE_NP_ERROR_INVALID_ARGUMENT;
 
     *age = 25; /* default adult age */
-    printf("[sceNp] GetAccountAge(user=%d) -> %d\n", userId, *age);
     return CELL_OK;
 }
 
@@ -213,7 +196,6 @@ s32 sceNpGetMyLanguages(SceNpMyLanguages* langs)
     langs->language2 = 0;
     langs->language3 = 0;
 
-    printf("[sceNp] GetMyLanguages() -> English\n");
     return CELL_OK;
 }
 
@@ -222,12 +204,9 @@ s32 sceNpGetMyLanguages(SceNpMyLanguages* langs)
  *
  * We run permanently offline: GetStatus reports OFFLINE so games gate their
  * online flows on it and skip them cleanly, matching how a real signed-out
- * console behaves. The identity/ticket getters mirror RPCS3's offline
- * early-return exactly (see sceNp.h for the citation).
+ * console behaves. GetNpId, GetContentRatingFlag and RequestTicket2 return
+ * the offline result; GetTicket reports an empty ticket.
  * -----------------------------------------------------------------------*/
-
-static SceNpManagerCallback s_npmgr_cb     = NULL;
-static void*                s_npmgr_cb_arg = NULL;
 
 s32 sceNpManagerGetStatus(s32* status)
 {
@@ -238,7 +217,6 @@ s32 sceNpManagerGetStatus(s32* status)
         return SCE_NP_ERROR_INVALID_ARGUMENT;
 
     *status = SCE_NP_MANAGER_STATUS_OFFLINE;
-    printf("[sceNp] ManagerGetStatus() -> OFFLINE\n");
     return CELL_OK;
 }
 
@@ -250,11 +228,9 @@ s32 sceNpManagerRegisterCallback(SceNpManagerCallback callback, void* arg)
     if (!callback)
         return SCE_NP_ERROR_INVALID_ARGUMENT;
 
-    /* Stored for bookkeeping only; we never transition online so (matching
-     * RPCS3) the callback is never actually invoked. */
-    s_npmgr_cb     = callback;
-    s_npmgr_cb_arg = arg;
-    printf("[sceNp] ManagerRegisterCallback()\n");
+    /* We never transition online, so the callback is never stored or
+     * invoked. */
+    (void)arg;
     return CELL_OK;
 }
 
@@ -266,8 +242,7 @@ s32 sceNpManagerGetNpId(SceNpId* npId)
     if (!npId)
         return SCE_NP_ERROR_INVALID_ARGUMENT;
 
-    /* RPCS3 returns OFFLINE here without filling npId when signed out. */
-    printf("[sceNp] ManagerGetNpId() -> OFFLINE\n");
+    /* Returns OFFLINE without filling npId when signed out. */
     return SCE_NP_ERROR_OFFLINE;
 }
 
@@ -281,10 +256,9 @@ s32 sceNpManagerGetTicket(void* buffer, u32* bufferSize)
     if (!bufferSize)
         return SCE_NP_ERROR_INVALID_ARGUMENT;
 
-    /* Not gated on sign-in state on real hardware/RPCS3: the ticket cache is
+    /* Not gated on sign-in state on real hardware: the ticket cache is
      * simply empty offline, so report a zero-length ticket either way. */
     *bufferSize = 0;
-    printf("[sceNp] ManagerGetTicket() -> empty (offline)\n");
     return CELL_OK;
 }
 
@@ -296,8 +270,7 @@ s32 sceNpManagerGetContentRatingFlag(s32* isRestricted, s32* age)
     if (!isRestricted || !age)
         return SCE_NP_ERROR_INVALID_ARGUMENT;
 
-    /* RPCS3 returns OFFLINE here without filling either output when signed out. */
-    printf("[sceNp] ManagerGetContentRatingFlag() -> OFFLINE\n");
+    /* Returns OFFLINE without filling either output when signed out. */
     return SCE_NP_ERROR_OFFLINE;
 }
 
@@ -313,7 +286,6 @@ s32 sceNpManagerRequestTicket2(const SceNpId* npId, const void* version, const c
     if (!npId || !serviceId || cookieSize > SCE_NP_COOKIE_MAX_SIZE)
         return SCE_NP_ERROR_INVALID_ARGUMENT;
 
-    /* RPCS3 returns OFFLINE here (before issuing the ticket request) when signed out. */
-    printf("[sceNp] ManagerRequestTicket2() -> OFFLINE\n");
+    /* Returns OFFLINE (before issuing the ticket request) when signed out. */
     return SCE_NP_ERROR_OFFLINE;
 }

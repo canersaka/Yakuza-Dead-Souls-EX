@@ -26,16 +26,7 @@ extern "C" {
  * Syscall numbers  (from LV2 kernel)
  * -----------------------------------------------------------------------*/
 
-/* Process / thread management */
-#define SYS_PROCESS_GETPID              1
-#define SYS_PROCESS_WAIT_FOR_CHILD      2
-#define SYS_PROCESS_EXIT                3
-#define SYS_PROCESS_GET_STATUS          4
-#define SYS_PROCESS_DETACH_CHILD        5
-#define SYS_PROCESS_GET_NUMBER_OF_OBJECT 12
-#define SYS_PROCESS_GET_ID              13
-#define SYS_PROCESS_IS_SPU_LOCK_LINE_RESERVATION_ADDRESS 14
-
+/* Thread management */
 #define SYS_PPU_THREAD_CREATE           41
 #define SYS_PPU_THREAD_EXIT             42
 #define SYS_PPU_THREAD_YIELD            43
@@ -88,10 +79,6 @@ extern "C" {
 #define SYS_EVENT_PORT_DISCONNECT       137
 #define SYS_EVENT_PORT_SEND             138
 
-/* Numbers verified against the real lv2 table (RPCS3 lv2.cpp). The old
- * values (139-146) collided with sys_event_flag_get/sys_event_port_
- * connect_ipc/sys_timer_usleep/sys_time_* — SPURS LLE calls usleep(141)
- * and got the event-flag handler. */
 #define SYS_EVENT_FLAG_CREATE           82
 #define SYS_EVENT_FLAG_DESTROY          83
 #define SYS_EVENT_FLAG_WAIT             85
@@ -102,8 +89,7 @@ extern "C" {
 #define SYS_EVENT_FLAG_GET              139
 
 /* lv2 lightweight primitives are the _sys_lw* slow-path syscalls (95-99,
- * 111-117); the old 150-160 values squatted on sys_raw_spu_* (150-154)
- * and sys_spu_image_open/import (156/157). */
+ * 111-117). */
 #define SYS_LWMUTEX_CREATE              95
 #define SYS_LWMUTEX_DESTROY             96
 #define SYS_LWMUTEX_LOCK                97
@@ -119,7 +105,6 @@ extern "C" {
 /* Timer */
 #define SYS_TIMER_CREATE                70
 #define SYS_TIMER_DESTROY               71
-#define SYS_TIMER_GET_INFORMATION       72
 #define SYS_TIMER_START                 73
 #define SYS_TIMER_STOP                  74
 #define SYS_TIMER_CONNECT_EVENT_QUEUE   75
@@ -134,13 +119,9 @@ extern "C" {
 /* Memory management */
 #define SYS_MEMORY_ALLOCATE             348
 #define SYS_MEMORY_FREE                 349
-#define SYS_MEMORY_ALLOCATE_FROM_CONTAINER 350
-#define SYS_MEMORY_GET_PAGE_ATTRIBUTE   351   /* 0x15F (was wrongly 358; verified vs rpcs3/rpcs3/Emu/Cell/lv2/sys_memory.h) */
+#define SYS_MEMORY_GET_PAGE_ATTRIBUTE   351   /* 0x15F */
 #define SYS_MEMORY_GET_USER_MEMORY_SIZE 352
-/* CONTAINER_CREATE/DESTROY/GET_SIZE were wrongly 353/354/355 (355 is really
- * sys_memory_get_user_memory_stat on real HW; 353/354 are unbound null_funcs).
- * Verified vs rpcs3/rpcs3/Emu/Cell/lv2/lv2.cpp:402-403,421 (the DBG-slot
- * aliases at 324/325/343; real HW also aliases these at 341/342/343). */
+/* Container create/destroy/get_size are 324/325/343. */
 #define SYS_MEMORY_CONTAINER_CREATE     324
 #define SYS_MEMORY_CONTAINER_DESTROY    325
 #define SYS_MEMORY_CONTAINER_GET_SIZE   343
@@ -148,21 +129,11 @@ extern "C" {
 #define SYS_MMAPPER_ALLOCATE_ADDRESS     330
 #define SYS_MMAPPER_FREE_ADDRESS         331
 #define SYS_MMAPPER_ALLOCATE_SHARED_MEMORY 332
-/* was wrongly 333 (real HW: 333 = sys_mmapper_set_shared_memory_flag, a
- * NULL_FUNC on real HW too). Verified vs lv2.cpp:407. */
-#define SYS_MMAPPER_FREE_SHARED_MEMORY   329
 #define SYS_MMAPPER_MAP_SHARED_MEMORY    334
-#define SYS_MMAPPER_UNMAP_SHARED_MEMORY  335
-#define SYS_MMAPPER_SEARCH_AND_MAP      337
 
-/* SPU management — numbers verified against the real lv2 table (RPCS3
- * lv2.cpp 155-252). The old block was wrong almost everywhere (e.g.
- * THREAD_INITIALIZE was registered at 181 while the real 172 fell on
- * GROUP_START — Sony's SPURS init failed silently on the id mismatch). */
+/* SPU management */
 #define SYS_SPU_IMAGE_OPEN              156
-#define SYS_SPU_IMAGE_IMPORT            157   /* _sys_spu_image_import */
 #define SYS_SPU_IMAGE_CLOSE             158   /* _sys_spu_image_close */
-#define SYS_SPU_IMAGE_GET_SEGMENTS      159   /* _sys_spu_image_get_segments */
 
 #define SYS_SPU_THREAD_GET_EXIT_STATUS  165
 #define SYS_SPU_THREAD_SET_ARGUMENT     166
@@ -177,40 +148,19 @@ extern "C" {
 #define SYS_SPU_THREAD_GROUP_YIELD      176
 #define SYS_SPU_THREAD_GROUP_TERMINATE  177
 #define SYS_SPU_THREAD_GROUP_JOIN       178
-#define SYS_SPU_THREAD_GROUP_SET_PRIORITY 179
-#define SYS_SPU_THREAD_GROUP_GET_PRIORITY 180
 
 #define SYS_SPU_THREAD_WRITE_LS         181
 #define SYS_SPU_THREAD_READ_LS          182
 #define SYS_SPU_THREAD_WRITE_SNR        184
 #define SYS_SPU_THREAD_SET_SPU_CFG      187
-#define SYS_SPU_THREAD_GET_SPU_CFG      188
 #define SYS_SPU_THREAD_GROUP_CONNECT_EVENT    185
 #define SYS_SPU_THREAD_GROUP_DISCONNECT_EVENT 186
-#define SYS_SPU_THREAD_WRITE_SPU_MB     190
 #define SYS_SPU_THREAD_CONNECT_EVENT    191
 #define SYS_SPU_THREAD_DISCONNECT_EVENT 192
 #define SYS_SPU_THREAD_BIND_QUEUE       193
 #define SYS_SPU_THREAD_UNBIND_QUEUE     194
 #define SYS_SPU_THREAD_GROUP_CONNECT_EVENT_ALL_THREADS 251
 #define SYS_SPU_THREAD_GROUP_DISCONNECT_EVENT_ALL_THREADS 252
-
-/* PRX (module) management */
-#define SYS_PRX_LOAD_MODULE             480
-#define SYS_PRX_START_MODULE            481
-#define SYS_PRX_STOP_MODULE             482
-#define SYS_PRX_UNLOAD_MODULE           483
-#define SYS_PRX_REGISTER_MODULE         484
-#define SYS_PRX_QUERY_MODULE            485
-#define SYS_PRX_REGISTER_LIBRARY        486
-#define SYS_PRX_UNREGISTER_LIBRARY      487
-#define SYS_PRX_LINK_LIBRARY            488
-#define SYS_PRX_UNLINK_LIBRARY          489
-#define SYS_PRX_QUERY_LIBRARY           490
-#define SYS_PRX_GET_MODULE_LIST         491
-#define SYS_PRX_GET_MODULE_INFO         492
-#define SYS_PRX_GET_MODULE_ID_BY_NAME   493
-#define SYS_PRX_GET_MODULE_ID_BY_ADDRESS 494
 
 /* File system */
 #define SYS_FS_OPEN                     801
@@ -228,13 +178,10 @@ extern "C" {
 #define SYS_FS_UNLINK                   814
 #define SYS_FS_LSEEK                    818
 #define SYS_FS_FTRUNCATE                820
-#define SYS_FS_FGET_BLOCK_SIZE          840
-#define SYS_FS_GET_BLOCK_SIZE           841
 
 /* Misc */
 #define SYS_TTY_READ                    402
 #define SYS_TTY_WRITE                   403
-#define SYS_DBG_GET_THREAD_LIST         610
 
 /* Upper limit for the dispatch table */
 #define LV2_SYSCALL_MAX                 1024
@@ -256,11 +203,15 @@ typedef struct lv2_syscall_table {
 
 extern lv2_syscall_table g_lv2_syscalls;
 
-/* Default handler for unimplemented syscalls — logs the call for debugging */
+/* Default handler for unimplemented syscalls; warns once per syscall number */
 static inline int64_t lv2_syscall_unimplemented(ppu_context* ctx)
 {
+    static uint8_t warned[LV2_SYSCALL_MAX];
     uint32_t num = (uint32_t)ctx->gpr[11];
-    fprintf(stderr, "[LV2] unimplemented syscall %u (0x%X)\n", num, num);
+    if (num < LV2_SYSCALL_MAX && !warned[num]) {
+        warned[num] = 1;
+        fprintf(stderr, "[LV2] unimplemented syscall %u (0x%X)\n", num, num);
+    }
     return (int64_t)(int32_t)CELL_ENOSYS;
 }
 
@@ -282,14 +233,6 @@ static inline void lv2_syscall_register(lv2_syscall_table* tbl, uint32_t num, lv
  * Called when the recompiled code encounters an `sc` instruction.
  * The syscall number is in gpr[11].
  * -----------------------------------------------------------------------*/
-/* s28 ([t1-hb] rider, ledger #63/#64 hunt): t1's current in-flight syscall +
- * its first arg — the heartbeat prints them, naming the wait t1 spins in
- * (the LV2:first dedup hides re-entered syscalls; the stalled t1 burns full
- * CPU inside a QPC-polling wait that never satisfies). Written only for
- * tid 1; benign torn reads acceptable (diag). */
-extern uint32_t g_yz_t1_sc;
-extern uint64_t g_yz_t1_sc_r3;
-
 static inline void lv2_syscall_dispatch(lv2_syscall_table* tbl, ppu_context* ctx)
 {
     uint32_t num = (uint32_t)ctx->gpr[11];
@@ -299,12 +242,8 @@ static inline void lv2_syscall_dispatch(lv2_syscall_table* tbl, ppu_context* ctx
         return;
     }
 
-    {   extern uint32_t yz_thread_current_id(void);
-        if (yz_thread_current_id() == 1) { g_yz_t1_sc = num; g_yz_t1_sc_r3 = ctx->gpr[3]; }
-        lv2_syscall_fn handler = tbl->handlers[num];
-        ctx->gpr[3] = (uint64_t)handler(ctx);
-        if (yz_thread_current_id() == 1) g_yz_t1_sc = 0;
-    }
+    lv2_syscall_fn handler = tbl->handlers[num];
+    ctx->gpr[3] = (uint64_t)handler(ctx);
 }
 
 /* Convenience wrapper using the global table */
@@ -324,15 +263,12 @@ static inline void lv2_syscall(ppu_context* ctx)
 #define LV2_ARG_S64(ctx, n)  ((int64_t)(ctx)->gpr[3 + (n)])
 #define LV2_ARG_PTR(ctx, n)  ((uint32_t)(ctx)->gpr[3 + (n)])  /* guest address */
 
-/* Convenience: register a syscall handler with a cleaner syntax */
-#define LV2_REGISTER_SYSCALL(num, func) \
-    lv2_syscall_register(&g_lv2_syscalls, (num), (lv2_syscall_fn)(func))
-
 /* ---------------------------------------------------------------------------
  * Register all HLE syscall modules
  *
  * Initializes and registers handlers for all implemented LV2 subsystems:
- * ppu_thread, mutex, cond, semaphore, rwlock, event, timer, memory, fs.
+ * ppu_thread, mutex, cond, semaphore, rwlock, lwmutex/lwcond, event, timer,
+ * memory, vm, fs, process queries, TTY and SPU.
  * -----------------------------------------------------------------------*/
 void lv2_register_all_syscalls(lv2_syscall_table* tbl);
 

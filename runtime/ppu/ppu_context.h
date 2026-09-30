@@ -1,9 +1,9 @@
 /*
  * ps3recomp - PPU (PowerPC Processing Unit) execution context
  *
- * Models the full architectural state of a Cell PPU thread: 32 GPRs, 32 FPRs,
- * 32 VRs, condition register, link register, count register, XER, FPSCR, VSCR,
- * and the current instruction address (CIA).
+ * PPU thread context shared by lifted code and the syscall layer, with the
+ * condition-register and XER helpers used by the instruction macros. The
+ * field order must match the copy emitted by tools/ppu_lifter.py.
  */
 
 #ifndef PPU_CONTEXT_H
@@ -27,12 +27,7 @@ extern "C" {
 
 /* XER bit positions */
 #define PPU_XER_SO  (1u << 31)
-#define PPU_XER_OV  (1u << 30)
 #define PPU_XER_CA  (1u << 29)
-
-/* VSCR bits */
-#define PPU_VSCR_NJ  (1u << 16)  /* Non-Java mode */
-#define PPU_VSCR_SAT (1u << 0)   /* Saturation */
 
 /* ---------------------------------------------------------------------------
  * PPU thread context
@@ -77,7 +72,8 @@ typedef struct ppu_context {
     /* Thread identification */
     uint64_t thread_id;
 
-    /* Reserve address for lwarx/stwcx (load-linked / store-conditional) */
+    /* Reservation state for lwarx/ldarx and stwcx./stdcx. (reserve_addr 0 means
+     * no reservation) */
     uint64_t reserve_addr;
     uint64_t reserve_value;
     int      reserve_valid;
@@ -98,12 +94,6 @@ static inline void ppu_context_init(ppu_context* ctx)
 /* ---------------------------------------------------------------------------
  * Condition Register helpers
  * -----------------------------------------------------------------------*/
-
-/* Get a 4-bit CR field (0-7). */
-static inline uint8_t ppu_cr_get(const ppu_context* ctx, int field)
-{
-    return (uint8_t)((ctx->cr >> (28 - field * 4)) & 0xF);
-}
 
 /* Set a 4-bit CR field (0-7). */
 static inline void ppu_cr_set(ppu_context* ctx, int field, uint8_t value)
@@ -148,26 +138,12 @@ static inline void ppu_cr_set_u32(ppu_context* ctx, int field, uint32_t a, uint3
 /* ---------------------------------------------------------------------------
  * XER helpers
  * -----------------------------------------------------------------------*/
-static inline int ppu_xer_get_so(const ppu_context* ctx) { return (ctx->xer & PPU_XER_SO) != 0; }
-static inline int ppu_xer_get_ov(const ppu_context* ctx) { return (ctx->xer & PPU_XER_OV) != 0; }
 static inline int ppu_xer_get_ca(const ppu_context* ctx) { return (ctx->xer & PPU_XER_CA) != 0; }
 
 static inline void ppu_xer_set_ca(ppu_context* ctx, int ca)
 {
     if (ca) ctx->xer |= PPU_XER_CA;
     else    ctx->xer &= ~PPU_XER_CA;
-}
-
-static inline void ppu_xer_set_ov(ppu_context* ctx, int ov)
-{
-    if (ov) { ctx->xer |= PPU_XER_OV | PPU_XER_SO; }
-    else    { ctx->xer &= ~PPU_XER_OV; }
-}
-
-/* XER[24:31] byte count field for lswx/stswx */
-static inline uint8_t ppu_xer_get_byte_count(const ppu_context* ctx)
-{
-    return (uint8_t)(ctx->xer & 0x7F);
 }
 
 /* ---------------------------------------------------------------------------
@@ -183,27 +159,6 @@ static inline void ppu_set_stack(ppu_context* ctx, uint64_t stack_top, uint64_t 
     uint64_t sp = (stack_top + stack_size - 48) & ~(uint64_t)0xF;
     ctx->gpr[1] = sp;
 }
-
-/* Get current stack pointer. */
-static inline uint64_t ppu_get_sp(const ppu_context* ctx)
-{
-    return ctx->gpr[1];
-}
-
-/* ---------------------------------------------------------------------------
- * Register accessors by ABI name
- * -----------------------------------------------------------------------*/
-#define PPU_SP(ctx)   ((ctx)->gpr[1])
-#define PPU_TOC(ctx)  ((ctx)->gpr[2])
-#define PPU_ARG0(ctx) ((ctx)->gpr[3])
-#define PPU_ARG1(ctx) ((ctx)->gpr[4])
-#define PPU_ARG2(ctx) ((ctx)->gpr[5])
-#define PPU_ARG3(ctx) ((ctx)->gpr[6])
-#define PPU_ARG4(ctx) ((ctx)->gpr[7])
-#define PPU_ARG5(ctx) ((ctx)->gpr[8])
-#define PPU_ARG6(ctx) ((ctx)->gpr[9])
-#define PPU_ARG7(ctx) ((ctx)->gpr[10])
-#define PPU_RET(ctx)  ((ctx)->gpr[3])
 
 #ifdef __cplusplus
 } /* extern "C" */

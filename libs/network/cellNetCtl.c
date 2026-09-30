@@ -19,7 +19,6 @@
 #include <sys/socket.h>
 #include <netdb.h>
 #include <unistd.h>
-#include <ifaddrs.h>
 #endif
 
 /* ---------------------------------------------------------------------------
@@ -28,10 +27,10 @@
 
 static int s_netctl_initialized = 0;
 
+/* Handlers are registered but never invoked, so only the slot usage is
+ * tracked. */
 typedef struct {
-    int              in_use;
-    cellNetCtlHandler handler;
-    void*            arg;
+    int in_use;
 } NetCtlHandlerSlot;
 
 static NetCtlHandlerSlot s_handlers[CELL_NET_CTL_HANDLER_MAX];
@@ -107,8 +106,6 @@ fallback:
 
 s32 cellNetCtlInit(void)
 {
-    printf("[cellNetCtl] Init()\n");
-
     if (s_netctl_initialized)
         return CELL_NET_CTL_ERROR_NOT_TERMINATED;
 
@@ -119,8 +116,6 @@ s32 cellNetCtlInit(void)
 
 void cellNetCtlTerm(void)
 {
-    printf("[cellNetCtl] Term()\n");
-
     memset(s_handlers, 0, sizeof(s_handlers));
     s_netctl_initialized = 0;
 }
@@ -133,29 +128,11 @@ s32 cellNetCtlGetState(s32* state)
     if (!state)
         return CELL_NET_CTL_ERROR_INVALID_ADDR;
 
-    /* FULLY-OFFLINE POLICY (2026-08-05, REVERTS the same day's item-K fix 9).
-     *
-     * MEASURED ROOT CAUSE (soak boot 9, wt scratch/..._boot9/soak.stdout.log):
-     * reporting IPObtained made the game believe a usable network exists, so
-     * at the title->menu transition it opened
-     *   cellMsgDialogOpen2(type=0x90, "Sign in to PlayStation(R)Network?")
-     * and then waited for a sign-in that CANNOT complete here -- sceNp is an
-     * offline stub with no PSN behind it. The title screen kept rendering at
-     * 30 FPS while every input (auto-start injection AND the user's own
-     * Start presses) went nowhere: the game was parked in its sign-in flow,
-     * not in the menu. Boots 2/6 predate the IPObtained change and reached
-     * the menu normally -- that is the A/B.
-     *
-     * The 08-04 audit's complaint was module SELF-CONSISTENCY, not a demand
-     * to be online. Consistency is satisfied just as well by answering
-     * "no network" everywhere, and that is the correct story for a
-     * firmware-free offline build: no PSN prompt, no sign-in wait, no
-     * online-only code paths entered. If online behavior is ever wanted, the
-     * whole NP surface (sign-in, ticket, manager status) has to come first --
-     * then flip this together with GetInfo and the NetStart dialog. */
+    /* The state is always Disconnected because no PSN backend exists.
+     * Reporting a connected state makes the title open a "sign in to
+     * PlayStation Network" dialog and wait for a sign-in that can never
+     * complete. GetInfo still returns plausible wired-link values. */
     *state = (s32)ps3_bswap32((u32)CELL_NET_CTL_STATE_Disconnected);
-
-    printf("[cellNetCtl] GetState() -> Disconnected (offline policy)\n");
     return CELL_OK;
 }
 
@@ -232,11 +209,9 @@ s32 cellNetCtlGetInfo(s32 code, CellNetCtlInfo* info)
         break;
 
     default:
-        printf("[cellNetCtl] GetInfo(code=%d) - unknown code\n", code);
         return CELL_NET_CTL_ERROR_INVALID_CODE;
     }
 
-    printf("[cellNetCtl] GetInfo(code=%d) -> OK\n", code);
     return CELL_OK;
 }
 
@@ -253,7 +228,6 @@ s32 cellNetCtlGetNatInfo(CellNetCtlNatInfo* natInfo)
     natInfo->stun_status = 0;
     natInfo->upnp_status = 0;
 
-    printf("[cellNetCtl] GetNatInfo() -> NAT Type 2\n");
     return CELL_OK;
 }
 
@@ -265,17 +239,16 @@ s32 cellNetCtlAddHandler(cellNetCtlHandler handler, void* arg, s32* hid)
     if (!handler || !hid)
         return CELL_NET_CTL_ERROR_INVALID_ADDR;
 
+    (void)arg;   /* handlers are never invoked */
+
     for (s32 i = 0; i < CELL_NET_CTL_HANDLER_MAX; i++) {
         if (!s_handlers[i].in_use) {
-            s_handlers[i].in_use  = 1;
-            s_handlers[i].handler = handler;
-            s_handlers[i].arg     = arg;
-            /* item-K fix 9: hid aliases guest BE memory -- store big-endian
-             * like every other numeric out-param in this module (the raw
-             * host-endian store handed the guest a byte-swapped id;
-             * 2026-08-04 audit). Ids 0-2 are endian-visible on PPC. */
+            s_handlers[i].in_use = 1;
+            /* hid aliases guest BE memory: store big-endian like every other
+             * numeric out-param in this module (a raw host-endian store would
+             * hand the guest a byte-swapped id). Ids 0-2 are endian-visible
+             * on PPC. */
             *hid = (s32)ps3_bswap32((u32)i);
-            printf("[cellNetCtl] AddHandler(hid=%d)\n", i);
             return CELL_OK;
         }
     }
@@ -294,11 +267,7 @@ s32 cellNetCtlDelHandler(s32 hid)
     if (!s_handlers[hid].in_use)
         return CELL_NET_CTL_ERROR_ID_NOT_FOUND;
 
-    s_handlers[hid].in_use  = 0;
-    s_handlers[hid].handler = NULL;
-    s_handlers[hid].arg     = NULL;
-
-    printf("[cellNetCtl] DelHandler(hid=%d)\n", hid);
+    s_handlers[hid].in_use = 0;
     return CELL_OK;
 }
 
@@ -307,8 +276,7 @@ s32 cellNetCtlDelHandler(s32 hid)
  *
  * Real hardware shows a system dialog and reports progress asynchronously
  * through the cellSysutil callback queue (LOADED -> FINISHED), after which
- * the game calls UnloadAsync to read the result (RPCS3
- * cellNetCtl.cpp cellNetCtlNetStartDialogLoadAsync/UnloadAsync). We have no
+ * the game calls UnloadAsync to read the result. We have no
  * PSN session to show a dialog for. The explicit connect-dialog path remains
  * an immediate success even though ordinary state queries default to
  * Disconnected: LoadAsync posts LOADED + FINISHED to every registered
@@ -330,7 +298,6 @@ s32 cellNetCtlNetStartDialogLoadAsync(const CellNetCtlNetStartDialogParam* param
     if (!param)
         return CELL_NET_CTL_ERROR_INVALID_ADDR;
 
-    printf("[cellNetCtl] NetStartDialogLoadAsync() -> auto-connect (offline)\n");
     netctl_netstart_broadcast(CELL_SYSUTIL_NET_CTL_NETSTART_LOADED);
     netctl_netstart_broadcast(CELL_SYSUTIL_NET_CTL_NETSTART_FINISHED);
     return CELL_OK;
@@ -344,7 +311,6 @@ s32 cellNetCtlNetStartDialogUnloadAsync(CellNetCtlNetStartDialogResult* result)
     if (result)
         result->result = (s32)ps3_bswap32(0u); /* 0 = connected (guest big-endian) */
 
-    printf("[cellNetCtl] NetStartDialogUnloadAsync() -> result=0 (connected)\n");
     netctl_netstart_broadcast(CELL_SYSUTIL_NET_CTL_NETSTART_UNLOADED);
     return CELL_OK;
 }

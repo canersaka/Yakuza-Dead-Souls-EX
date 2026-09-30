@@ -1,15 +1,10 @@
 /*
  * ps3recomp - cellSysmodule HLE implementation
  *
- * 2026-08-04 doc-conformance audit rework:
- *  - module-ID table regenerated from the SDK (cellSysmodule.h);
- *  - the eleven modules the firmware auto-loads at process start report
- *    loaded from the first call and survive UnloadModule (libsysmodule
- *    Overview p.9/p.12);
- *  - UnloadModule of a not-loaded module returns CELL_OK, the documented
- *    contract (Reference p.10) -- ERROR_UNLOADED belongs to IsLoaded only;
- *  - undocumented ids now return ERROR_UNKNOWN instead of being accepted;
- *  - all documented high-range (0xF0xx) ids are tracked, not just trophy.
+ * Tracks loaded state per module id. Modules the firmware auto-loads report
+ * loaded from the first call and cannot be unloaded. UnloadModule of a
+ * not-loaded module returns CELL_OK; ERROR_UNLOADED is returned by IsLoaded
+ * only. Unknown ids return ERROR_UNKNOWN.
  */
 
 #include "cellSysmodule.h"
@@ -41,8 +36,7 @@ static const u16 s_valid_ids[] = {
 };
 
 /* Modules the firmware loads at process activation; the application need
- * not load them and cannot unload them (libsysmodule Overview p.9, p.12;
- * Reference p.15). */
+ * not load them and cannot unload them. */
 static const u16 s_autoloaded_ids[] = {
     CELL_SYSMODULE_SYSUTIL, CELL_SYSMODULE_GCM_SYS, CELL_SYSMODULE_AUDIO, CELL_SYSMODULE_IO, CELL_SYSMODULE_SYNC, CELL_SYSMODULE_SPURS, CELL_SYSMODULE_OVIS, CELL_SYSMODULE_SHEAP, CELL_SYSMODULE_DAISY, CELL_SYSMODULE_FS, CELL_SYSMODULE_SYSUTIL_NP_TROPHY,
 };
@@ -88,116 +82,6 @@ static int* sysmodule_loaded_slot(u16 id)
     return NULL;
 }
 
-static const char* sysmodule_id_to_name(u16 id)
-{
-    switch (id) {
-    case CELL_SYSMODULE_NET: return "CELL_SYSMODULE_NET";
-    case CELL_SYSMODULE_HTTP: return "CELL_SYSMODULE_HTTP";
-    case CELL_SYSMODULE_HTTP_UTIL: return "CELL_SYSMODULE_HTTP_UTIL";
-    case CELL_SYSMODULE_SSL: return "CELL_SYSMODULE_SSL";
-    case CELL_SYSMODULE_HTTPS: return "CELL_SYSMODULE_HTTPS";
-    case CELL_SYSMODULE_VDEC: return "CELL_SYSMODULE_VDEC";
-    case CELL_SYSMODULE_ADEC: return "CELL_SYSMODULE_ADEC";
-    case CELL_SYSMODULE_DMUX: return "CELL_SYSMODULE_DMUX";
-    case CELL_SYSMODULE_VPOST: return "CELL_SYSMODULE_VPOST";
-    case CELL_SYSMODULE_RTC: return "CELL_SYSMODULE_RTC";
-    case CELL_SYSMODULE_SPURS: return "CELL_SYSMODULE_SPURS";
-    case CELL_SYSMODULE_OVIS: return "CELL_SYSMODULE_OVIS";
-    case CELL_SYSMODULE_SHEAP: return "CELL_SYSMODULE_SHEAP";
-    case CELL_SYSMODULE_SYNC: return "CELL_SYSMODULE_SYNC";
-    case CELL_SYSMODULE_FS: return "CELL_SYSMODULE_FS";
-    case CELL_SYSMODULE_JPGDEC: return "CELL_SYSMODULE_JPGDEC";
-    case CELL_SYSMODULE_GCM_SYS: return "CELL_SYSMODULE_GCM_SYS";
-    case CELL_SYSMODULE_AUDIO: return "CELL_SYSMODULE_AUDIO";
-    case CELL_SYSMODULE_PAMF: return "CELL_SYSMODULE_PAMF";
-    case CELL_SYSMODULE_ATRAC3PLUS: return "CELL_SYSMODULE_ATRAC3PLUS";
-    case CELL_SYSMODULE_NETCTL: return "CELL_SYSMODULE_NETCTL";
-    case CELL_SYSMODULE_SYSUTIL: return "CELL_SYSMODULE_SYSUTIL";
-    case CELL_SYSMODULE_SYSUTIL_NP: return "CELL_SYSMODULE_SYSUTIL_NP";
-    case CELL_SYSMODULE_IO: return "CELL_SYSMODULE_IO";
-    case CELL_SYSMODULE_PNGDEC: return "CELL_SYSMODULE_PNGDEC";
-    case CELL_SYSMODULE_FONT: return "CELL_SYSMODULE_FONT";
-    case CELL_SYSMODULE_FONTFT: return "CELL_SYSMODULE_FONTFT";
-    case CELL_SYSMODULE_FREETYPE: return "CELL_SYSMODULE_FREETYPE";
-    case CELL_SYSMODULE_USBD: return "CELL_SYSMODULE_USBD";
-    case CELL_SYSMODULE_SAIL: return "CELL_SYSMODULE_SAIL";
-    case CELL_SYSMODULE_L10N: return "CELL_SYSMODULE_L10N";
-    case CELL_SYSMODULE_RESC: return "CELL_SYSMODULE_RESC";
-    case CELL_SYSMODULE_DAISY: return "CELL_SYSMODULE_DAISY";
-    case CELL_SYSMODULE_KEY2CHAR: return "CELL_SYSMODULE_KEY2CHAR";
-    case CELL_SYSMODULE_MIC: return "CELL_SYSMODULE_MIC";
-    case CELL_SYSMODULE_CAMERA: return "CELL_SYSMODULE_CAMERA";
-    case CELL_SYSMODULE_VDEC_MPEG2: return "CELL_SYSMODULE_VDEC_MPEG2";
-    case CELL_SYSMODULE_VDEC_AVC: return "CELL_SYSMODULE_VDEC_AVC";
-    case CELL_SYSMODULE_ADEC_LPCM: return "CELL_SYSMODULE_ADEC_LPCM";
-    case CELL_SYSMODULE_ADEC_AC3: return "CELL_SYSMODULE_ADEC_AC3";
-    case CELL_SYSMODULE_ADEC_ATX: return "CELL_SYSMODULE_ADEC_ATX";
-    case CELL_SYSMODULE_ADEC_AT3: return "CELL_SYSMODULE_ADEC_AT3";
-    case CELL_SYSMODULE_DMUX_PAMF: return "CELL_SYSMODULE_DMUX_PAMF";
-    case CELL_SYSMODULE_VDEC_AL: return "CELL_SYSMODULE_VDEC_AL";
-    case CELL_SYSMODULE_ADEC_AL: return "CELL_SYSMODULE_ADEC_AL";
-    case CELL_SYSMODULE_DMUX_AL: return "CELL_SYSMODULE_DMUX_AL";
-    case CELL_SYSMODULE_LV2DBG: return "CELL_SYSMODULE_LV2DBG";
-    case CELL_SYSMODULE_USBPSPCM: return "CELL_SYSMODULE_USBPSPCM";
-    case CELL_SYSMODULE_AVCONF_EXT: return "CELL_SYSMODULE_AVCONF_EXT";
-    case CELL_SYSMODULE_SYSUTIL_USERINFO: return "CELL_SYSMODULE_SYSUTIL_USERINFO";
-    case CELL_SYSMODULE_SYSUTIL_SAVEDATA: return "CELL_SYSMODULE_SYSUTIL_SAVEDATA";
-    case CELL_SYSMODULE_SUBDISPLAY: return "CELL_SYSMODULE_SUBDISPLAY";
-    case CELL_SYSMODULE_SYSUTIL_REC: return "CELL_SYSMODULE_SYSUTIL_REC";
-    case CELL_SYSMODULE_VIDEO_EXPORT: return "CELL_SYSMODULE_VIDEO_EXPORT";
-    case CELL_SYSMODULE_SYSUTIL_GAME_EXEC: return "CELL_SYSMODULE_SYSUTIL_GAME_EXEC";
-    case CELL_SYSMODULE_SYSUTIL_NP2: return "CELL_SYSMODULE_SYSUTIL_NP2";
-    case CELL_SYSMODULE_SYSUTIL_AP: return "CELL_SYSMODULE_SYSUTIL_AP";
-    case CELL_SYSMODULE_SYSUTIL_NP_CLANS: return "CELL_SYSMODULE_SYSUTIL_NP_CLANS";
-    case CELL_SYSMODULE_SYSUTIL_OSK_EXT: return "CELL_SYSMODULE_SYSUTIL_OSK_EXT";
-    case CELL_SYSMODULE_VDEC_DIVX: return "CELL_SYSMODULE_VDEC_DIVX";
-    case CELL_SYSMODULE_JPGENC: return "CELL_SYSMODULE_JPGENC";
-    case CELL_SYSMODULE_SYSUTIL_GAME: return "CELL_SYSMODULE_SYSUTIL_GAME";
-    case CELL_SYSMODULE_BGDL: return "CELL_SYSMODULE_BGDL";
-    case CELL_SYSMODULE_FREETYPE_TT: return "CELL_SYSMODULE_FREETYPE_TT";
-    case CELL_SYSMODULE_SYSUTIL_VIDEO_UPLOAD: return "CELL_SYSMODULE_SYSUTIL_VIDEO_UPLOAD";
-    case CELL_SYSMODULE_SYSUTIL_SYSCONF_EXT: return "CELL_SYSMODULE_SYSUTIL_SYSCONF_EXT";
-    case CELL_SYSMODULE_FIBER: return "CELL_SYSMODULE_FIBER";
-    case CELL_SYSMODULE_SYSUTIL_NP_COMMERCE2: return "CELL_SYSMODULE_SYSUTIL_NP_COMMERCE2";
-    case CELL_SYSMODULE_SYSUTIL_NP_TUS: return "CELL_SYSMODULE_SYSUTIL_NP_TUS";
-    case CELL_SYSMODULE_VOICE: return "CELL_SYSMODULE_VOICE";
-    case CELL_SYSMODULE_ADEC_CELP8: return "CELL_SYSMODULE_ADEC_CELP8";
-    case CELL_SYSMODULE_CELP8ENC: return "CELL_SYSMODULE_CELP8ENC";
-    case CELL_SYSMODULE_SYSUTIL_LICENSEAREA: return "CELL_SYSMODULE_SYSUTIL_LICENSEAREA";
-    case CELL_SYSMODULE_SYSUTIL_MUSIC2: return "CELL_SYSMODULE_SYSUTIL_MUSIC2";
-    case CELL_SYSMODULE_SYSUTIL_SCREENSHOT: return "CELL_SYSMODULE_SYSUTIL_SCREENSHOT";
-    case CELL_SYSMODULE_SYSUTIL_MUSIC_DECODE: return "CELL_SYSMODULE_SYSUTIL_MUSIC_DECODE";
-    case CELL_SYSMODULE_SPURS_JQ: return "CELL_SYSMODULE_SPURS_JQ";
-    case CELL_SYSMODULE_PNGENC: return "CELL_SYSMODULE_PNGENC";
-    case CELL_SYSMODULE_SYSUTIL_MUSIC_DECODE2: return "CELL_SYSMODULE_SYSUTIL_MUSIC_DECODE2";
-    case CELL_SYSMODULE_SYNC2: return "CELL_SYSMODULE_SYNC2";
-    case CELL_SYSMODULE_SYSUTIL_NP_UTIL: return "CELL_SYSMODULE_SYSUTIL_NP_UTIL";
-    case CELL_SYSMODULE_RUDP: return "CELL_SYSMODULE_RUDP";
-    case CELL_SYSMODULE_SYSUTIL_NP_SNS: return "CELL_SYSMODULE_SYSUTIL_NP_SNS";
-    case CELL_SYSMODULE_GEM: return "CELL_SYSMODULE_GEM";
-    case CELL_SYSMODULE_SYSUTIL_CROSS_CONTROLLER: return "CELL_SYSMODULE_SYSUTIL_CROSS_CONTROLLER";
-    case CELL_SYSMODULE_CELPENC: return "CELL_SYSMODULE_CELPENC";
-    case CELL_SYSMODULE_GIFDEC: return "CELL_SYSMODULE_GIFDEC";
-    case CELL_SYSMODULE_ADEC_CELP: return "CELL_SYSMODULE_ADEC_CELP";
-    case CELL_SYSMODULE_ADEC_M2BC: return "CELL_SYSMODULE_ADEC_M2BC";
-    case CELL_SYSMODULE_ADEC_M4AAC: return "CELL_SYSMODULE_ADEC_M4AAC";
-    case CELL_SYSMODULE_ADEC_MP3: return "CELL_SYSMODULE_ADEC_MP3";
-    case CELL_SYSMODULE_IMEJP: return "CELL_SYSMODULE_IMEJP";
-    case CELL_SYSMODULE_SYSUTIL_MUSIC: return "CELL_SYSMODULE_SYSUTIL_MUSIC";
-    case CELL_SYSMODULE_PHOTO_EXPORT: return "CELL_SYSMODULE_PHOTO_EXPORT";
-    case CELL_SYSMODULE_PRINT: return "CELL_SYSMODULE_PRINT";
-    case CELL_SYSMODULE_PHOTO_IMPORT: return "CELL_SYSMODULE_PHOTO_IMPORT";
-    case CELL_SYSMODULE_MUSIC_EXPORT: return "CELL_SYSMODULE_MUSIC_EXPORT";
-    case CELL_SYSMODULE_PHOTO_DECODE: return "CELL_SYSMODULE_PHOTO_DECODE";
-    case CELL_SYSMODULE_SYSUTIL_SEARCH: return "CELL_SYSMODULE_SYSUTIL_SEARCH";
-    case CELL_SYSMODULE_SYSUTIL_AVCHAT2: return "CELL_SYSMODULE_SYSUTIL_AVCHAT2";
-    case CELL_SYSMODULE_SAIL_REC: return "CELL_SYSMODULE_SAIL_REC";
-    case CELL_SYSMODULE_SYSUTIL_NP_TROPHY: return "CELL_SYSMODULE_SYSUTIL_NP_TROPHY";
-    case CELL_SYSMODULE_LIBATRAC3MULTI: return "CELL_SYSMODULE_LIBATRAC3MULTI";
-    default: return "UNKNOWN";
-    }
-}
-
 /* ---------------------------------------------------------------------------
  * API implementations
  * -----------------------------------------------------------------------*/
@@ -208,15 +92,13 @@ s32 cellSysmoduleLoadModule(u16 id)
     int* loaded;
 
     sysmodule_ensure_init();
-    printf("[cellSysmodule] LoadModule(id=0x%04X '%s')\n",
-           id, sysmodule_id_to_name(id));
 
     loaded = sysmodule_loaded_slot(id);
     if (!loaded)
         return CELL_SYSMODULE_ERROR_UNKNOWN;
 
-    /* Already loaded: CELL_OK is the documented contract (Reference p.9 --
-     * DUPLICATED is not in LoadModule's return set). */
+    /* Already loaded: CELL_OK is the documented contract (DUPLICATED is not
+     * in LoadModule's return set). */
     *loaded = 1;
     return CELL_OK;
 }
@@ -227,16 +109,14 @@ s32 cellSysmoduleUnloadModule(u16 id)
     int* loaded;
 
     sysmodule_ensure_init();
-    printf("[cellSysmodule] UnloadModule(id=0x%04X '%s')\n",
-           id, sysmodule_id_to_name(id));
 
     loaded = sysmodule_loaded_slot(id);
     if (!loaded)
         return CELL_SYSMODULE_ERROR_UNKNOWN;
 
-    /* Auto-loaded modules stay resident (Overview p.12); an already-unloaded
-     * module is CELL_OK, not ERROR_UNLOADED (Reference p.10 -- the old error
-     * here was the classic "shutdown asserts" landmine). */
+    /* Auto-loaded modules stay resident; an already-unloaded module is
+     * CELL_OK, not ERROR_UNLOADED (returning an error here trips shutdown
+     * asserts in games). */
     if (!sysmodule_id_autoloaded(id))
         *loaded = 0;
     return CELL_OK;
@@ -248,8 +128,6 @@ s32 cellSysmoduleIsLoaded(u16 id)
     int* loaded;
 
     sysmodule_ensure_init();
-    printf("[cellSysmodule] IsLoaded(id=0x%04X '%s')\n",
-           id, sysmodule_id_to_name(id));
 
     loaded = sysmodule_loaded_slot(id);
     if (!loaded)

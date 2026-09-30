@@ -1,12 +1,12 @@
 /*
- * ps3recomp — Guest callback dispatch hook
+ * ps3recomp - Guest callback dispatch hook
  *
  * The HLE runtime is plain C compiled to host. When a system service
  * (cellSysutil events, cellSaveData callbacks, etc.) needs to invoke a
- * GUEST-side callback the game registered, the runtime can't call it
- * directly — the callback's "function pointer" is actually a guest VM
- * address pointing at an OPD (Official Procedure Descriptor: 4 bytes
- * function entry, 4 bytes TOC, 4 bytes env).
+ * guest-side callback the game registered, the runtime can't call it
+ * directly: the callback's "function pointer" is actually a guest VM
+ * address pointing at an OPD (function descriptor holding the entry and
+ * TOC words).
  *
  * The recompiled code base owns the dispatcher (it has the giant
  * function table mapping guest_addr -> host_func and the trampoline
@@ -30,12 +30,11 @@ extern "C" {
 #endif
 
 /* Hook signature.
- *   opd_addr  – guest address of the OPD entry to invoke (3 x 32-bit)
- *   arg0..7   – first eight args, placed in r3..r10 by the caller
+ *   opd_addr  - guest address of the OPD to invoke (entry and TOC words)
+ *   arg0..7   - first eight args, placed in r3..r10 by the caller
  *
- * The hook may run synchronously or queue + return; cellSysutilCheckCallback
- * is the typical synchronous dispatch site so games observe the callback
- * complete before returning. */
+ * The hook runs the callback synchronously; cellSysutilCheckCallback relies
+ * on that so games observe the callback complete before it returns. */
 typedef void (*ps3_guest_caller_fn)(uint32_t opd_addr,
                                     uint64_t arg0, uint64_t arg1,
                                     uint64_t arg2, uint64_t arg3,
@@ -45,16 +44,15 @@ typedef void (*ps3_guest_caller_fn)(uint32_t opd_addr,
 /* Returning variant: identical dispatch, but hands back the guest function's
  * r3 return value. Needed by the few callbacks whose return value carries
  * protocol meaning -- e.g. SceNpTrophyStatusCallback, where a negative
- * return instructs sceNpTrophyRegisterContext to abort registration
- * (NP_Trophy-Reference p.23). The void variant stays for the common
- * fire-and-forget case so existing dispatch sites are untouched. */
+ * return instructs sceNpTrophyRegisterContext to abort registration.
+ * The void variant serves the common fire-and-forget case. */
 typedef uint64_t (*ps3_guest_caller_ret_fn)(uint32_t opd_addr,
                                             uint64_t arg0, uint64_t arg1,
                                             uint64_t arg2, uint64_t arg3,
                                             uint64_t arg4, uint64_t arg5,
                                             uint64_t arg6, uint64_t arg7);
 
-/* Set by the game's host code (e.g. flow main.cpp) at startup. NULL until
+/* Installed by the runner at startup (yakuza/main.cpp). NULL until
  * installed; HLE bridges that need to call back into guest code must
  * check for NULL before invoking. */
 extern ps3_guest_caller_fn g_ps3_guest_caller;
@@ -65,7 +63,7 @@ extern ps3_guest_caller_fn g_ps3_guest_caller;
  * the callback as having returned 0 -- when only the void hook is set. */
 extern ps3_guest_caller_ret_fn g_ps3_guest_caller_ret;
 
-/* Convenience wrapper — checks for NULL and invokes if set. */
+/* Convenience wrapper: checks for NULL and invokes if set. */
 static inline void ps3_invoke_guest(uint32_t opd_addr,
                                     uint64_t arg0, uint64_t arg1,
                                     uint64_t arg2, uint64_t arg3,

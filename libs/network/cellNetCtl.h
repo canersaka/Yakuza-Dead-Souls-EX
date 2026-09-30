@@ -41,10 +41,8 @@ extern "C" {
 
 /* ---------------------------------------------------------------------------
  * Handler event codes (the `event` argument of cellNetCtlHandler).
- * Values ORACLE(SDK netex/libnetctl.h:106-112). Added 2026-08-05 (item-K
- * fix 9; the 2026-08-04 audit flagged them missing). No handler is ever
- * fired by this offline runtime today; the constants exist so guest-facing
- * code and future dispatch use the documented values.
+ * Handlers are stored but never invoked; the constants document the event
+ * codes.
  * -----------------------------------------------------------------------*/
 #define CELL_NET_CTL_EVENT_CONNECT_REQ          0
 #define CELL_NET_CTL_EVENT_ESTABLISH            1
@@ -110,8 +108,7 @@ extern "C" {
 
 /* Net-start ("connect to PSN") dialog completion is signalled through the
  * cellSysutil callback queue with these status codes (delivered as the
- * `status` argument). Values verified against RPCS3
- * (rpcs3/rpcs3/Emu/Cell/Modules/cellNetCtl.h). */
+ * `status` argument). */
 #define CELL_SYSUTIL_NET_CTL_NETSTART_LOADED    0x0801
 #define CELL_SYSUTIL_NET_CTL_NETSTART_FINISHED  0x0802
 #define CELL_SYSUTIL_NET_CTL_NETSTART_UNLOADED  0x0803
@@ -195,8 +192,8 @@ s32 cellNetCtlAddHandler(cellNetCtlHandler handler, void* arg, s32* hid);
 s32 cellNetCtlDelHandler(s32 hid);
 
 /* Net-start ("connect to PSN") dialog. We have no PSN session to show a
- * dialog for and already report a full wired connection (see GetState
- * above), so this reports an immediate successful connect. */
+ * dialog for, so this reports an immediate successful connect even though
+ * GetState reports Disconnected. */
 s32 cellNetCtlNetStartDialogLoadAsync(const CellNetCtlNetStartDialogParam* param);
 s32 cellNetCtlNetStartDialogUnloadAsync(CellNetCtlNetStartDialogResult* result);
 

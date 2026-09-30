@@ -4,15 +4,13 @@
  * HTTP client: clients, transactions, request/response, auto-redirect,
  * chunked transfer decoding.
  *
- * Guest-facing contract follows the SDK 4.75 headers (read-only oracles):
- *   ORACLE(cell/http/client.h)  - export names, prototypes, callback pairs
- *   ORACLE(cell/http/util.h)    - CellHttpUri / CellHttpHeader guest layout
- *   ORACLE(cell/http/error.h)   - error namespaces:
+ * Guest-facing layout, export names and error values follow the PS3 libhttp
+ * ABI. Error namespaces:
  *       libhttp      0x8071_0001 - 0x8071_0fff
  *       https        0x8071_0a01 - 0x8071_0aff
  *       libhttp_util 0x8071_1001 - 0x8071_10ff
- *   ORACLE(libhttp-Reference_e.pdf p.47/p.51) - auto-redirect and
- *       auto-authentication both default ENABLED, at most 5 attempts each.
+ * Auto-redirect and auto-authentication both default to enabled, with at
+ * most 5 attempts each.
  *
  * ABI note: every pointer parameter arrives as a HOST pointer into guest
  * memory (the import bridge translates guest EA -> host).  Anything
@@ -32,64 +30,64 @@ extern "C" {
 #endif
 
 /* ---------------------------------------------------------------------------
- * Error codes -- values verbatim from ORACLE(cell/http/error.h)
+ * Error codes -- values as used by the PS3 libhttp ABI
  * -----------------------------------------------------------------------*/
-#define CELL_HTTP_ERROR_ALREADY_INITIALIZED     0x80710001  /* error.h:33  */
-#define CELL_HTTP_ERROR_NOT_INITIALIZED         0x80710002  /* error.h:37  */
-#define CELL_HTTP_ERROR_NO_MEMORY               0x80710003  /* error.h:41  */
-#define CELL_HTTP_ERROR_NO_BUFFER               0x80710004  /* error.h:45  */
-#define CELL_HTTP_ERROR_NO_STRING               0x80710005  /* error.h:49  */
-#define CELL_HTTP_ERROR_INSUFFICIENT            0x80710006  /* error.h:53  */
-#define CELL_HTTP_ERROR_INVALID_URI             0x80710007  /* error.h:56  */
-#define CELL_HTTP_ERROR_INVALID_HEADER          0x80710008  /* error.h:59  */
-#define CELL_HTTP_ERROR_BAD_METHOD              0x80710009  /* error.h:62  */
-#define CELL_HTTP_ERROR_BAD_CLIENT              0x80710010  /* error.h:66  */
-#define CELL_HTTP_ERROR_BAD_TRANS               0x80710011  /* error.h:70  */
-#define CELL_HTTP_ERROR_NO_CONNECTION           0x80710012  /* error.h:74  */
-#define CELL_HTTP_ERROR_NO_REQUEST_SENT         0x80710013  /* error.h:78  */
-#define CELL_HTTP_ERROR_ALREADY_BUILT           0x80710014  /* error.h:82  */
-#define CELL_HTTP_ERROR_ALREADY_SENT            0x80710015  /* error.h:86  */
-#define CELL_HTTP_ERROR_NO_HEADER               0x80710016  /* error.h:90  */
-#define CELL_HTTP_ERROR_NO_CONTENT_LENGTH       0x80710017  /* error.h:94  */
-#define CELL_HTTP_ERROR_TOO_MANY_REDIRECTS      0x80710018  /* error.h:98  */
-#define CELL_HTTP_ERROR_TOO_MANY_AUTHS          0x80710019  /* error.h:102 */
-#define CELL_HTTP_ERROR_TRANS_NO_CONNECTION     0x80710020  /* error.h:106 */
-#define CELL_HTTP_ERROR_CB_FAILED               0x80710021  /* error.h:110 */
-#define CELL_HTTP_ERROR_TRANS_ABORTED           0x80710024  /* error.h:122 */
-#define CELL_HTTP_ERROR_UNAVAILABLE             0x80710026  /* error.h:132 */
-#define CELL_HTTP_ERROR_INVALID_VALUE           0x80710027  /* error.h:136 */
-#define CELL_HTTP_ERROR_CANNOT_AUTHENTICATE     0x80710028  /* error.h:140 */
-#define CELL_HTTP_ERROR_CACHE_ALREADY_INITIALIZED 0x80710043 /* error.h:152 */
-#define CELL_HTTP_ERROR_CACHE_NOT_INITIALIZED   0x80710044  /* error.h:156 */
-#define CELL_HTTP_ERROR_LINE_EXCEEDS_MAX        0x80710045  /* error.h:160 */
-#define CELL_HTTP_ERROR_UNKNOWN                 0x80710051  /* error.h:169 */
-#define CELL_HTTP_ERROR_INTERNAL                0x80710052  /* error.h:173 */
-#define CELL_HTTP_ERROR_BROKEN_CHUNK            0x8071005a  /* error.h:205 */
+#define CELL_HTTP_ERROR_ALREADY_INITIALIZED     0x80710001
+#define CELL_HTTP_ERROR_NOT_INITIALIZED         0x80710002
+#define CELL_HTTP_ERROR_NO_MEMORY               0x80710003
+#define CELL_HTTP_ERROR_NO_BUFFER               0x80710004
+#define CELL_HTTP_ERROR_NO_STRING               0x80710005
+#define CELL_HTTP_ERROR_INSUFFICIENT            0x80710006
+#define CELL_HTTP_ERROR_INVALID_URI             0x80710007
+#define CELL_HTTP_ERROR_INVALID_HEADER          0x80710008
+#define CELL_HTTP_ERROR_BAD_METHOD              0x80710009
+#define CELL_HTTP_ERROR_BAD_CLIENT              0x80710010
+#define CELL_HTTP_ERROR_BAD_TRANS               0x80710011
+#define CELL_HTTP_ERROR_NO_CONNECTION           0x80710012
+#define CELL_HTTP_ERROR_NO_REQUEST_SENT         0x80710013
+#define CELL_HTTP_ERROR_ALREADY_BUILT           0x80710014
+#define CELL_HTTP_ERROR_ALREADY_SENT            0x80710015
+#define CELL_HTTP_ERROR_NO_HEADER               0x80710016
+#define CELL_HTTP_ERROR_NO_CONTENT_LENGTH       0x80710017
+#define CELL_HTTP_ERROR_TOO_MANY_REDIRECTS      0x80710018
+#define CELL_HTTP_ERROR_TOO_MANY_AUTHS          0x80710019
+#define CELL_HTTP_ERROR_TRANS_NO_CONNECTION     0x80710020
+#define CELL_HTTP_ERROR_CB_FAILED               0x80710021
+#define CELL_HTTP_ERROR_TRANS_ABORTED           0x80710024
+#define CELL_HTTP_ERROR_UNAVAILABLE             0x80710026
+#define CELL_HTTP_ERROR_INVALID_VALUE           0x80710027
+#define CELL_HTTP_ERROR_CANNOT_AUTHENTICATE     0x80710028
+#define CELL_HTTP_ERROR_CACHE_ALREADY_INITIALIZED 0x80710043
+#define CELL_HTTP_ERROR_CACHE_NOT_INITIALIZED   0x80710044
+#define CELL_HTTP_ERROR_LINE_EXCEEDS_MAX        0x80710045
+#define CELL_HTTP_ERROR_UNKNOWN                 0x80710051
+#define CELL_HTTP_ERROR_INTERNAL                0x80710052
+#define CELL_HTTP_ERROR_BROKEN_CHUNK            0x8071005a
 
 /* Network errors: low byte carries the socket errno/h_errno in the real
- * library (error.h:361-364); we report the class value. */
-#define CELL_HTTP_ERROR_NET_FIN                 0x80710091  /* error.h:347 */
-#define CELL_HTTP_ERROR_NET_CONNECT_TIMEOUT     0x80710092  /* error.h:351 */
-#define CELL_HTTP_ERROR_NET_SELECT_TIMEOUT      0x80710093  /* error.h:355 */
-#define CELL_HTTP_ERROR_NET_SEND_TIMEOUT        0x80710094  /* error.h:359 */
-#define CELL_HTTP_ERROR_NET_RESOLVER            0x80710100  /* error.h:366 */
-#define CELL_HTTP_ERROR_NET_ABORT               0x80710200  /* error.h:369 */
-#define CELL_HTTP_ERROR_NET_OPTION              0x80710300  /* error.h:372 */
-#define CELL_HTTP_ERROR_NET_SOCKET              0x80710400  /* error.h:375 */
-#define CELL_HTTP_ERROR_NET_CONNECT             0x80710500  /* error.h:378 */
-#define CELL_HTTP_ERROR_NET_SEND                0x80710600  /* error.h:381 */
-#define CELL_HTTP_ERROR_NET_RECV                0x80710700  /* error.h:384 */
+ * library; we report the class value. */
+#define CELL_HTTP_ERROR_NET_FIN                 0x80710091
+#define CELL_HTTP_ERROR_NET_CONNECT_TIMEOUT     0x80710092
+#define CELL_HTTP_ERROR_NET_SELECT_TIMEOUT      0x80710093
+#define CELL_HTTP_ERROR_NET_SEND_TIMEOUT        0x80710094
+#define CELL_HTTP_ERROR_NET_RESOLVER            0x80710100
+#define CELL_HTTP_ERROR_NET_ABORT               0x80710200
+#define CELL_HTTP_ERROR_NET_OPTION              0x80710300
+#define CELL_HTTP_ERROR_NET_SOCKET              0x80710400
+#define CELL_HTTP_ERROR_NET_CONNECT             0x80710500
+#define CELL_HTTP_ERROR_NET_SEND                0x80710600
+#define CELL_HTTP_ERROR_NET_RECV                0x80710700
 
 /* HTTPS errors (0x80710a0x block) */
-#define CELL_HTTPS_ERROR_CERTIFICATE_LOAD       0x80710a01  /* error.h:395 */
-#define CELL_HTTPS_ERROR_BAD_MEMORY             0x80710a02  /* error.h:399 */
-#define CELL_HTTPS_ERROR_CONTEXT_CREATION       0x80710a03  /* error.h:403 */
-#define CELL_HTTPS_ERROR_CONNECTION_CREATION    0x80710a04  /* error.h:407 */
-#define CELL_HTTPS_ERROR_SOCKET_ASSOCIATION     0x80710a05  /* error.h:411 */
-#define CELL_HTTPS_ERROR_HANDSHAKE              0x80710a06  /* error.h:415 */
-#define CELL_HTTPS_ERROR_LOOKUP_CERTIFICATE     0x80710a07  /* error.h:419 */
-#define CELL_HTTPS_ERROR_NO_SSL                 0x80710a08  /* error.h:423 */
-#define CELL_HTTPS_ERROR_KEY_LOAD               0x80710a09  /* error.h:427 */
+#define CELL_HTTPS_ERROR_CERTIFICATE_LOAD       0x80710a01
+#define CELL_HTTPS_ERROR_BAD_MEMORY             0x80710a02
+#define CELL_HTTPS_ERROR_CONTEXT_CREATION       0x80710a03
+#define CELL_HTTPS_ERROR_CONNECTION_CREATION    0x80710a04
+#define CELL_HTTPS_ERROR_SOCKET_ASSOCIATION     0x80710a05
+#define CELL_HTTPS_ERROR_HANDSHAKE              0x80710a06
+#define CELL_HTTPS_ERROR_LOOKUP_CERTIFICATE     0x80710a07
+#define CELL_HTTPS_ERROR_NO_SSL                 0x80710a08
+#define CELL_HTTPS_ERROR_KEY_LOAD               0x80710a09
 
 /* ---------------------------------------------------------------------------
  * Guest structures
@@ -99,8 +97,8 @@ extern "C" {
  * scalars elsewhere.  All producers/consumers must bswap on access.
  * -----------------------------------------------------------------------*/
 
-/* ORACLE(cell/http/util.h:12-20): scheme, hostname, username, password,
- * path, port, reserved[4] -- 28 bytes on the guest. */
+/* scheme, hostname, username, password, path, port, reserved[4]:
+ * 28 bytes on the guest. */
 typedef struct CellHttpUri {
     u32 scheme;      /* BE guest EA -> const char* */
     u32 hostname;    /* BE guest EA -> const char* */
@@ -112,15 +110,15 @@ typedef struct CellHttpUri {
 } CellHttpUri;
 typedef char cellhttp_assert_uri_28[(sizeof(CellHttpUri) == 28) ? 1 : -1];
 
-/* ORACLE(cell/http/util.h:45-48): { name, value } -- 8 bytes on the guest. */
+/* { name, value }: 8 bytes on the guest. */
 typedef struct CellHttpHeader {
     u32 name;        /* BE guest EA -> const char* */
     u32 value;       /* BE guest EA -> const char* */
 } CellHttpHeader;
 typedef char cellhttp_assert_hdr_8[(sizeof(CellHttpHeader) == 8) ? 1 : -1];
 
-/* ORACLE(cell/http/util.h:36-43): protocol, majorVersion, minorVersion,
- * reasonPhrase, statusCode, reserved[4] -- 24 bytes on the guest. */
+/* protocol, majorVersion, minorVersion, reasonPhrase, statusCode,
+ * reserved[4]: 24 bytes on the guest. */
 typedef struct CellHttpStatusLine {
     u32 protocol;      /* BE guest EA -> const char* */
     u32 majorVersion;  /* BE u32 */
@@ -131,8 +129,7 @@ typedef struct CellHttpStatusLine {
 } CellHttpStatusLine;
 typedef char cellhttp_assert_sl_24[(sizeof(CellHttpStatusLine) == 24) ? 1 : -1];
 
-/* ORACLE(cell/http/client.h:19-22): { char *ptr; size_t size; } -- two
- * 4-byte BE fields on the guest. */
+/* { char *ptr; size_t size; }: two 4-byte BE fields on the guest. */
 typedef struct CellHttpsData {
     u32 ptr;         /* BE guest EA */
     u32 size;        /* BE u32 */
@@ -151,9 +148,9 @@ typedef u32 CellHttpTransId;
 #define CELL_HTTP_MAX_CUSTOM_HEADERS 16
 
 /* ---------------------------------------------------------------------------
- * Functions -- names spelled exactly as the SDK exports them
- * (ORACLE(cell/http/client.h)); the import generator hashes these C symbol
- * names into NIDs, so the spelling is load-bearing.
+ * Functions -- names spelled exactly as the library exports them; the
+ * import generator hashes these C symbol names into NIDs, so the spelling
+ * is load-bearing.
  * -----------------------------------------------------------------------*/
 
 /* lifecycle */

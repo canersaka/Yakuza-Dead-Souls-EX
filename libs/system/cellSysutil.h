@@ -107,8 +107,8 @@ s32 cellSysutilCheckCallback(void);
  * is one of the CELL_SYSUTIL_* event codes (REQUEST_EXITGAME,
  * SYSTEM_MENU_OPEN, DRAWING_BEGIN/END, etc.). param is event-specific.
  *
- * The slot must match the slot the game registered against; flOw and most
- * games use slot 0. */
+ * The slot must match the slot the game registered against (games normally
+ * use slot 0). */
 void cellSysutilQueueEvent(int slot, u32 status, u32 param);
 
 s32 cellSysutilGetSystemParamInt(s32 id, s32* value);

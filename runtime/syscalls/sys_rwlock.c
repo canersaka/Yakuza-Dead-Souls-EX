@@ -26,12 +26,11 @@ static void write_be32(uint32_t addr, uint32_t val)
  * sys_rwlock_create
  *
  * r3 = pointer to receive rwlock ID (u32*)
- * r4 = pointer to attribute struct
+ * r4 = pointer to attribute struct (not read)
  * -----------------------------------------------------------------------*/
 int64_t sys_rwlock_create(ppu_context* ctx)
 {
     uint32_t id_out_addr = LV2_ARG_PTR(ctx, 0);
-    uint32_t attr_addr   = LV2_ARG_PTR(ctx, 1);
 
     int slot = -1;
     for (int i = 0; i < SYS_RWLOCK_MAX; i++) {
@@ -44,21 +43,8 @@ int64_t sys_rwlock_create(ppu_context* ctx)
     memset(r, 0, sizeof(*r));
     r->active = 1;
 
-    if (attr_addr != 0) {
-        uint8_t* attr_raw = (uint8_t*)vm_to_host(attr_addr);
-        uint32_t proto_be;
-        memcpy(&proto_be, attr_raw, 4);
-#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__ || defined(_WIN32)
-        proto_be = ((proto_be >> 24) & 0xFF) | ((proto_be >> 8) & 0xFF00) |
-                   ((proto_be << 8) & 0xFF0000) | ((proto_be << 24) & 0xFF000000u);
-#endif
-        r->protocol = proto_be;
-        memcpy(r->name, attr_raw + 8, 8);
-    }
-
 #ifdef _WIN32
     InitializeSRWLock(&r->srw);
-    r->readers = 0;
     r->writer  = 0;
 #else
     pthread_rwlock_init(&r->rwl, NULL);
@@ -108,11 +94,9 @@ int64_t sys_rwlock_rlock(ppu_context* ctx)
     if (timeout_us == 0) {
         AcquireSRWLockShared(&r->srw);
     } else {
-        /* Lv2 Reference p.190: a finite timeout must produce CELL_ETIMEDOUT.
-         * The argument used to be discarded, turning every timed rlock into
-         * an unbounded block (2026-08-04 doc-conformance audit). SRWLocks
-         * have no timed acquire; poll the try form against a QPC deadline
-         * (same shape as the sub-ms waits in sys_event.c). */
+        /* A finite timeout must produce CELL_ETIMEDOUT. SRWLocks have no
+         * timed acquire; poll the try form against a QPC deadline (same
+         * shape as the sub-ms waits in sys_event.c). */
         int64_t deadline = lv2_usec_deadline(timeout_us);
         while (!TryAcquireSRWLockShared(&r->srw)) {
             if (!r->active)
@@ -122,7 +106,6 @@ int64_t sys_rwlock_rlock(ppu_context* ctx)
             SwitchToThread();
         }
     }
-    InterlockedIncrement(&r->readers);
 #else
     if (timeout_us == 0) {
         pthread_rwlock_rdlock(&r->rwl);
@@ -154,7 +137,6 @@ int64_t sys_rwlock_tryrlock(ppu_context* ctx)
 #ifdef _WIN32
     if (!TryAcquireSRWLockShared(&r->srw))
         return (int64_t)(int32_t)CELL_EBUSY;
-    InterlockedIncrement(&r->readers);
 #else
     int rc = pthread_rwlock_tryrdlock(&r->rwl);
     if (rc != 0)
@@ -176,7 +158,6 @@ int64_t sys_rwlock_runlock(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_ESRCH;
 
 #ifdef _WIN32
-    InterlockedDecrement(&r->readers);
     ReleaseSRWLockShared(&r->srw);
 #else
     pthread_rwlock_unlock(&r->rwl);
@@ -205,7 +186,7 @@ int64_t sys_rwlock_wlock(ppu_context* ctx)
     if (timeout_us == 0) {
         AcquireSRWLockExclusive(&r->srw);
     } else {
-        /* Lv2 Reference p.193: finite timeout -> CELL_ETIMEDOUT (see rlock). */
+        /* Finite timeout -> CELL_ETIMEDOUT (see rlock). */
         int64_t deadline = lv2_usec_deadline(timeout_us);
         while (!TryAcquireSRWLockExclusive(&r->srw)) {
             if (!r->active)

@@ -2,8 +2,7 @@
  * ps3recomp - sys_net module
  *
  * BSD socket API for PS3 games. Wraps the host OS socket layer
- * (Winsock on Windows, POSIX sockets on Linux/macOS) to provide
- * the PS3 sys_net interface.
+ * (Winsock on Windows) to provide the PS3 sys_net interface.
  *
  * PS3 uses its own socket descriptor space and error codes.
  * This module translates between PS3 and host conventions.
@@ -22,18 +21,16 @@ extern "C" {
 #endif
 
 /* ---------------------------------------------------------------------------
- * PS3 network error codes (2026-08-05, doc-conformance item D).
+ * PS3 network error codes.
  *
- * Two REAL namespaces, per ORACLE(netex/errno.h) + libnet-Reference p.117:
+ * Two namespaces:
  * - bnet_* BSD-style calls return -1 and publish a plain BSD-numbered int
  *   errno (per thread, via _sys_net_errno_loc). These are the SYS_NET_E*
- *   values below. Conveniently Winsock's WSAE* codes are WSABASEERR(10000)
- *   + the SAME numbering, so translation is mechanical.
+ *   values below. Winsock's WSAE* codes are WSABASEERR(10000) + the same
+ *   numbering, so translation is mechanical.
  * - the non-BSD "sys_net_*" module API returns CELL codes 0x80010200+n
- *   (SYS_NET_ERROR_E*). The previous 0x80410100-based values were a
- *   fabricated third namespace matching neither.
+ *   (SYS_NET_ERROR_E*).
  * -----------------------------------------------------------------------*/
-#define SYS_NET_EPERM               1
 #define SYS_NET_EINTR               4
 #define SYS_NET_EBADF               9
 #define SYS_NET_ENOMEM              12
@@ -43,23 +40,17 @@ extern "C" {
 #define SYS_NET_EWOULDBLOCK         SYS_NET_EAGAIN
 #define SYS_NET_EINPROGRESS         36
 #define SYS_NET_EALREADY            37
-#define SYS_NET_ENOTSOCK            38
-#define SYS_NET_EMSGSIZE            40
 #define SYS_NET_ENOPROTOOPT         42
 #define SYS_NET_EADDRINUSE          48
 #define SYS_NET_ECONNABORTED        53
 #define SYS_NET_ECONNRESET          54
-#define SYS_NET_ENOBUFS             55
-#define SYS_NET_EISCONN             56
 #define SYS_NET_ENOTCONN            57
 #define SYS_NET_ETIMEDOUT           60
 #define SYS_NET_ECONNREFUSED        61
 #define SYS_NET_EHOSTUNREACH        65
 
 /* CELL-namespace forms for the non-BSD module API (0x80010200 + errno). */
-#define SYS_NET_ERROR_EINVAL        (s32)0x80010216
 #define SYS_NET_ERROR_ENOMEM        (s32)0x8001020c
-#define SYS_NET_ERROR_EBUSY         (s32)0x80010210
 
 /* PS3 address families */
 #define SYS_NET_AF_INET             2
@@ -71,7 +62,6 @@ extern "C" {
 /* PS3 IPPROTO */
 #define SYS_NET_IPPROTO_IP          0
 #define SYS_NET_IPPROTO_TCP         6
-#define SYS_NET_IPPROTO_UDP         17
 
 /* PS3 socket options */
 #define SYS_NET_SOL_SOCKET          0xFFFF
@@ -102,10 +92,11 @@ extern "C" {
 #define SYS_NET_MAX_SOCKETS         128
 
 /* ---------------------------------------------------------------------------
- * PS3 network structures (big-endian on PS3, host-endian in our impl)
+ * PS3 network structures (multi-byte fields as laid out in guest memory)
  * -----------------------------------------------------------------------*/
 
-/* PS3 sockaddr_in — identical layout to BSD but fields are big-endian */
+/* PS3 sockaddr_in: identical layout to BSD; port and address are in
+ * network byte order, as laid out in guest memory */
 typedef struct sys_net_sockaddr_in {
     uint8_t  sin_len;       /* length */
     uint8_t  sin_family;    /* AF_INET */
@@ -120,25 +111,11 @@ typedef struct sys_net_sockaddr {
     uint8_t  sa_data[14];
 } sys_net_sockaddr;
 
-typedef struct sys_net_linger {
-    int32_t l_onoff;
-    int32_t l_linger;
-} sys_net_linger;
-
 typedef struct sys_net_pollfd {
     int32_t fd;
     int16_t events;
     int16_t revents;
 } sys_net_pollfd;
-
-/* PS3 hostent */
-typedef struct sys_net_hostent {
-    uint32_t h_name;        /* guest pointer to name string */
-    uint32_t h_aliases;     /* guest pointer to aliases array */
-    int32_t  h_addrtype;
-    int32_t  h_length;
-    uint32_t h_addr_list;   /* guest pointer to address list */
-} sys_net_hostent;
 
 /* ---------------------------------------------------------------------------
  * API functions (matching PS3 NID exports from sys_net)
@@ -177,11 +154,12 @@ int32_t sys_net_bnet_select(int32_t nfds, void* readfds, void* writefds,
 
 /* DNS */
 int32_t sys_net_bnet_inet_aton(const char* cp, uint32_t* inp);
-/* gethostbyname returns a guest pointer to a static hostent */
+/* gethostbyname resolves the name and returns nonzero on success; no guest
+ * hostent is produced. */
 uint32_t sys_net_bnet_gethostbyname(const char* name);
 
-/* Thread-local errno. Real export name has the leading underscore
- * (libnet-Reference p.117); the NID hashes "_sys_net_errno_loc". */
+/* Thread-local errno. The export name has the leading underscore; the NID
+ * hashes "_sys_net_errno_loc". */
 int32_t* _sys_net_errno_loc(void);
 
 #ifdef __cplusplus

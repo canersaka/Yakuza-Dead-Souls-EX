@@ -1,14 +1,10 @@
 /*
  * ps3recomp - cellSail HLE implementation
  *
- * Stub. Player lifecycle and state management work.
- * No actual media playback occurs — games typically show
- * a black screen for cutscenes, which is acceptable for
- * initial recompilation testing.
+ * Stub: player and descriptor handles are tracked; no media is decoded.
  */
 
 #include "cellSail.h"
-#include <stdio.h>
 #include <string.h>
 
 /* Internal state */
@@ -28,7 +24,6 @@ static SailPlayer s_players[CELL_SAIL_PLAYER_MAX];
 
 s32 cellSailInit(void)
 {
-    printf("[cellSail] Init()\n");
     if (s_initialized)
         return (s32)CELL_SAIL_ERROR_ALREADY_INITIALIZED;
     memset(s_players, 0, sizeof(s_players));
@@ -38,7 +33,6 @@ s32 cellSailInit(void)
 
 s32 cellSailTerm(void)
 {
-    printf("[cellSail] Term()\n");
     s_initialized = 0;
     return CELL_OK;
 }
@@ -52,7 +46,6 @@ s32 cellSailPlayerCreate(const CellSailPlayerAttribute* attr,
                            CellSailPlayerHandle* handle)
 {
     (void)attr; (void)resource;
-    printf("[cellSail] PlayerCreate()\n");
 
     if (!s_initialized) return (s32)CELL_SAIL_ERROR_NOT_INITIALIZED;
     if (!handle) return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
@@ -73,7 +66,6 @@ s32 cellSailPlayerCreate(const CellSailPlayerAttribute* attr,
 
 s32 cellSailPlayerDestroy(CellSailPlayerHandle handle)
 {
-    printf("[cellSail] PlayerDestroy(%u)\n", handle);
     if (handle >= CELL_SAIL_PLAYER_MAX || !s_players[handle].in_use)
         return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
     s_players[handle].in_use = 0;
@@ -84,7 +76,6 @@ s32 cellSailPlayerDestroy(CellSailPlayerHandle handle)
 s32 cellSailPlayerBoot(CellSailPlayerHandle handle, u64 userParam)
 {
     (void)userParam;
-    printf("[cellSail] PlayerBoot(%u)\n", handle);
     if (handle >= CELL_SAIL_PLAYER_MAX || !s_players[handle].in_use)
         return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
     s_players[handle].state = CELL_SAIL_PLAYER_STATE_RUNNING;
@@ -93,8 +84,7 @@ s32 cellSailPlayerBoot(CellSailPlayerHandle handle, u64 userParam)
 
 s32 cellSailPlayerOpenStream(CellSailPlayerHandle handle, const char* path)
 {
-    printf("[cellSail] PlayerOpenStream(%u, \"%s\") - stub\n", handle,
-           path ? path : "null");
+    (void)path;
     if (handle >= CELL_SAIL_PLAYER_MAX || !s_players[handle].in_use)
         return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
     /* Stub: don't actually open anything */
@@ -110,10 +100,8 @@ s32 cellSailPlayerCloseStream(CellSailPlayerHandle handle)
 
 s32 cellSailPlayerStart(CellSailPlayerHandle handle)
 {
-    printf("[cellSail] PlayerStart(%u)\n", handle);
     if (handle >= CELL_SAIL_PLAYER_MAX || !s_players[handle].in_use)
         return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
-    s_players[handle].state = CELL_SAIL_PLAYER_STATE_RUNNING;
     /* Immediately signal finished since we don't play anything */
     s_players[handle].state = CELL_SAIL_PLAYER_STATE_FINISHED;
     return CELL_OK;
@@ -121,7 +109,6 @@ s32 cellSailPlayerStart(CellSailPlayerHandle handle)
 
 s32 cellSailPlayerStop(CellSailPlayerHandle handle)
 {
-    printf("[cellSail] PlayerStop(%u)\n", handle);
     if (handle >= CELL_SAIL_PLAYER_MAX || !s_players[handle].in_use)
         return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
     s_players[handle].state = CELL_SAIL_PLAYER_STATE_FINISHED;
@@ -198,7 +185,6 @@ s32 cellSailPlayerIsPaused(CellSailPlayerHandle handle)
 s32 cellSailPlayerSetRepeatMode(CellSailPlayerHandle handle, s32 repeatMode, void* command)
 {
     (void)command;
-    printf("[cellSail] SetRepeatMode(%u, %d)\n", handle, repeatMode);
     if (handle >= CELL_SAIL_PLAYER_MAX || !s_players[handle].in_use)
         return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
     /* Real ABI returns the (now-set) repeat mode in r3, not an error code. */
@@ -225,9 +211,7 @@ s32 cellSailPlayerCreateDescriptor(CellSailPlayerHandle handle,
                                      char* uri,
                                      CellSailDescriptorHandle* desc)
 {
-    (void)mediaInfo;
-    printf("[cellSail] CreateDescriptor(player=%u, type=%d, uri=\"%s\")\n", handle,
-           streamType, uri ? uri : "null");
+    (void)mediaInfo; (void)uri;
     if (!desc) return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
 
     for (int i = 0; i < MAX_DESCRIPTORS; i++) {
@@ -257,7 +241,6 @@ s32 cellSailPlayerAddDescriptor(CellSailPlayerHandle handle,
                                   CellSailDescriptorHandle desc)
 {
     (void)handle;
-    printf("[cellSail] AddDescriptor(player=%u, desc=%u)\n", handle, desc);
     if (desc >= MAX_DESCRIPTORS || !s_descs[desc].in_use)
         return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
     return CELL_OK;
@@ -276,7 +259,6 @@ s32 cellSailDescriptorCreateDatabase(CellSailDescriptorHandle desc,
                                        void* dbAddr, u32 dbSize, u64 arg)
 {
     (void)dbAddr; (void)dbSize; (void)arg;
-    printf("[cellSail] DescriptorCreateDatabase(desc=%u)\n", desc);
     if (desc >= MAX_DESCRIPTORS || !s_descs[desc].in_use)
         return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
     return CELL_OK;
@@ -319,7 +301,6 @@ s32 cellSailDescriptorGetUri(CellSailDescriptorHandle desc, char* uri, u32 maxLe
 s32 cellSailMemAllocatorInitialize(CellSailMemAllocator* allocator,
                                      CellSailMemAllocatorFuncs* pFuncs)
 {
-    printf("[cellSail] MemAllocatorInitialize()\n");
     if (!allocator) return (s32)CELL_SAIL_ERROR_INVALID_ARGUMENT;
     if (pFuncs) {
         allocator->alloc = (void* (*)(void*, u32, u32))pFuncs->pAlloc;

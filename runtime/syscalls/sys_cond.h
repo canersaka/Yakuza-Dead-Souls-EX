@@ -27,31 +27,27 @@ extern "C" {
 
 #define SYS_COND_MAX  256
 
-/* Per-cond committed-waiter thread-id registry (2026-08-05 item-K fix 1).
+/* Per-cond committed-waiter thread-id registry.
  * sys_cond_signal_to must distinguish "target thread is parked on this cond"
- * (deliver) from "target is not waiting" (EPERM, Lv2 Reference p.184). The
+ * (deliver) from "target is not waiting" (EPERM). The
  * committed/pending counters can't answer per-thread membership, so waits
  * record their guest tid here (under the sig lock) for the wait's lifetime.
- * 32 concurrent waiters per cond is far above anything observed; overflow
- * entries are simply untracked (signal_to would then miss them -- capped,
- * documented approximation). */
+ * Up to 32 concurrent waiters per cond are tracked; overflow entries are
+ * untracked (signal_to would then miss them). */
 #define SYS_COND_WAITER_TIDS_MAX  32
 
 typedef struct sys_cond_info {
     int      active;
     uint32_t mutex_id;   /* associated mutex */
-    char     name[8];
 
-    /* Rendezvous state (2026-07-03 s8): real lv2 enqueues the waiter on the
-     * kernel sleep queue AT WAIT-SYSCALL ENTRY (under the kernel lock), so a
-     * signal arriving any time after that is delivered even if the waiter
-     * hasn't parked in the host CV yet. A bare Win32 CV drops that signal
-     * (edge-triggered) — measured as the E5/CRI staging-pump death (the
-     * SEGA-logo boot freeze) and suspected in the ~1/6 late-audio race.
-     * `committed`/`pending` under the internal sig lock close the window
-     * without touching the guest mutex (preserving the 3f1377c no-hold-and-
-     * wait fix). Signals with no committed waiter are still discarded —
-     * faithful lv2. */
+    /* Rendezvous state: real lv2 enqueues the waiter on the kernel sleep
+     * queue at wait-syscall entry (under the kernel lock), so a signal
+     * arriving any time after that is delivered even if the waiter hasn't
+     * parked in the host CV yet. A bare Win32 CV drops that signal
+     * (edge-triggered). `committed`/`pending` under the internal sig lock
+     * close the window without touching the guest mutex (so the wait never
+     * holds one lock while waiting on another). Signals with no committed
+     * waiter are still discarded, as on lv2. */
     int      committed;  /* waiters inside the wait syscall */
     int      pending;    /* signals held for committed waiters */
 

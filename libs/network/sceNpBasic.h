@@ -10,6 +10,7 @@
 
 #include "ps3emu/ps3types.h"
 #include "ps3emu/error_codes.h"
+#include "sceNp.h"   /* SceNpOnlineId */
 
 #ifdef __cplusplus
 extern "C" {
@@ -21,41 +22,18 @@ extern "C" {
 #define SCE_NP_BASIC_ERROR_NOT_INITIALIZED         0x8002AA01
 #define SCE_NP_BASIC_ERROR_ALREADY_INITIALIZED     0x8002AA02
 #define SCE_NP_BASIC_ERROR_INVALID_ARGUMENT        0x8002AA03
-#define SCE_NP_BASIC_ERROR_NOT_SUPPORTED           0x8002AA04
-#define SCE_NP_BASIC_ERROR_OUT_OF_MEMORY           0x8002AA05
-#define SCE_NP_BASIC_ERROR_EXCEEDS_MAX             0x8002AA06
 #define SCE_NP_BASIC_ERROR_NOT_CONNECTED           0x8002AA07
 #define SCE_NP_BASIC_ERROR_DATA_NOT_FOUND          0x8002AA08
 
 /* ---------------------------------------------------------------------------
  * Constants
  * -----------------------------------------------------------------------*/
-#define SCE_NP_BASIC_MAX_FRIENDS           100
-#define SCE_NP_BASIC_MAX_BLOCKLIST         100
 #define SCE_NP_BASIC_MAX_MESSAGE_SIZE      512
 #define SCE_NP_BASIC_PRESENCE_MAX_SIZE     128
-#define SCE_NP_ONLINEID_MAX_LENGTH         16
-
-/* Friend status */
-#define SCE_NP_BASIC_FRIEND_STATUS_OFFLINE    0
-#define SCE_NP_BASIC_FRIEND_STATUS_ONLINE     1
-#define SCE_NP_BASIC_FRIEND_STATUS_AWAY       2
-
-/* Event types for the event handler callback */
-#define SCE_NP_BASIC_EVENT_INCOMING_MESSAGE   1
-#define SCE_NP_BASIC_EVENT_FRIEND_ONLINE      2
-#define SCE_NP_BASIC_EVENT_FRIEND_OFFLINE     3
-#define SCE_NP_BASIC_EVENT_INCOMING_INVITE    4
-#define SCE_NP_BASIC_EVENT_FRIEND_PRESENCE    5
 
 /* ---------------------------------------------------------------------------
  * Types
  * -----------------------------------------------------------------------*/
-
-typedef struct SceNpOnlineId {
-    char data[SCE_NP_ONLINEID_MAX_LENGTH + 1];
-    char padding[3];
-} SceNpOnlineId;
 
 typedef struct SceNpBasicFriendListEntry {
     SceNpOnlineId onlineId;

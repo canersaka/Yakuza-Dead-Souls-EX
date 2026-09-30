@@ -1,33 +1,28 @@
 /*
  * ps3recomp - cellHttp HLE implementation
  *
- * Real HTTP client using native sockets (Winsock2 on Windows, POSIX
- * elsewhere).  Resolves hostnames, connects via TCP, sends HTTP/1.1
- * requests, receives responses with header parsing, chunked transfer
- * decoding, and documented auto-redirect/auto-authentication behavior.
+ * HTTP client over native sockets (Winsock2 on Windows, POSIX elsewhere).
+ * Resolves hostnames, connects via TCP, sends HTTP/1.1 requests, parses
+ * response headers, decodes chunked bodies, and applies auto-redirect and
+ * Basic auto-authentication.
  *
- * Conformance notes (2026-08-05 rework against the SDK 4.75 oracles):
- *  - Export names/prototypes: ORACLE(cell/http/client.h).
- *  - Error values: ORACLE(cell/http/error.h) -- see cellHttp.h.
- *  - CellHttpUri/CellHttpHeader are GUEST structs of big-endian 4-byte EAs;
+ *  - Error values are defined in cellHttp.h.
+ *  - CellHttpUri/CellHttpHeader are guest structs of big-endian 4-byte EAs;
  *    every access goes through ps3_bswap32 + vm_to_host.
  *  - Every multi-byte out-parameter write is big-endian (guest memory).
  *  - Auto-redirect: default enabled, max 5, 304/306 never redirected,
  *    301/302/303/305/307 always, other 3xx only for GET/HEAD, performed
- *    inside the library during request sending
- *    (ORACLE(libhttp-Reference_e.pdf p.47)).
- *  - Auto-authentication: default enabled (ORACLE(libhttp-Reference p.51));
- *    we can honor it only with URI-supplied Basic credentials -- guest
- *    authentication callbacks cannot be invoked from HLE, so exhausting
- *    the URI credentials yields CELL_HTTP_ERROR_CANNOT_AUTHENTICATE
- *    ("not enough info", ORACLE(cell/http/error.h:138-140)).
- *  - TLS is NOT implemented (firmware-free build, no crypto stack).
- *    https transactions fail at cellHttpSendRequest with the documented
- *    CELL_HTTPS_ERROR_HANDSHAKE instead of silently talking plaintext.
- *  - Preserved from the audited version (CONFIRMED CORRECT): timeout
- *    defaults connect 30s / send 120s / recv 120s (microseconds),
- *    race-free bounded resolve/connect helpers, method passed as string,
- *    recvd==0 EOF convention, no pipelining (obsolete API).
+ *    inside the library during request sending.
+ *  - Auto-authentication: default enabled; only URI-supplied Basic
+ *    credentials are used, because guest authentication callbacks cannot be
+ *    invoked from here. Without usable credentials a 401 yields
+ *    CELL_HTTP_ERROR_CANNOT_AUTHENTICATE.
+ *  - TLS is not implemented: https transactions fail at cellHttpSendRequest
+ *    with CELL_HTTPS_ERROR_HANDSHAKE instead of silently talking plaintext.
+ *  - Timeout defaults are connect 30s / send 120s / recv 120s
+ *    (microseconds); the resolve/connect helpers are bounded by the connect
+ *    timeout. The method is passed as a string, recvd==0 means EOF, and
+ *    there is no pipelining.
  */
 
 #include "cellHttp.h"
@@ -43,9 +38,6 @@
 #ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
 #include <windows.h>
 #include <process.h>
 #pragma comment(lib, "ws2_32.lib")
@@ -82,20 +74,14 @@ static int s_wsa_initialized = 0;
 typedef struct {
     int in_use;
     /* Timeouts, microseconds, client-scoped 64-bit per the SDK
-     * (cellHttpClientSet{Conn,Send,Recv}Timeout).  Defaults CONFIRMED
-     * CORRECT by the 2026-08-04 audit: connect 30s, send 120s, recv 120s. */
+     * (cellHttpClientSet{Conn,Send,Recv}Timeout).  Defaults: connect 30s,
+     * send 120s, recv 120s. */
     s64 conn_timeout_usec;
     s64 send_timeout_usec;
     s64 recv_timeout_usec;
-    /* ORACLE(libhttp-Reference_e.pdf p.47/p.51): both default ENABLED. */
+    /* Both default to enabled. */
     int auto_redirect;
     int auto_auth;
-    int cookie_enabled;
-    /* Raw guest callback descriptors + args; stored, never invoked (no
-     * cookie engine / no TLS verify path in this HLE). */
-    u32 cookie_send_cb, cookie_send_cb_arg;
-    u32 cookie_recv_cb, cookie_recv_cb_arg;
-    u32 ssl_cb, ssl_cb_arg;
 } HttpClientSlot;
 
 /* Custom header key/value pair */
@@ -144,10 +130,8 @@ typedef struct {
     s32  status_code;
     u64  content_length;
     int  content_length_known;
-    int  conn_close;        /* server sent Connection: close */
     int  eof_reached;
     u32  redirect_count;
-    u32  auth_count;
 
     /* chunked transfer decoding (Transfer-Encoding: chunked) */
     int  chunked;
@@ -171,7 +155,7 @@ static HttpClientSlot s_clients[CELL_HTTP_MAX_CLIENTS];
 static HttpTransSlot  s_transactions[CELL_HTTP_MAX_TRANSACTIONS];
 
 /* ---------------------------------------------------------------------------
- * Handle helpers -- guest handles are 1-based so a valid id is never 0
+ * Handle helpers: guest handles are 1-based so a valid id is never 0
  * (real library hands out pointers; NULL must stay invalid).
  * -----------------------------------------------------------------------*/
 
@@ -226,7 +210,6 @@ static void http_reset_response_state(HttpTransSlot* t)
     t->status_code          = 0;
     t->content_length       = 0;
     t->content_length_known = 0;
-    t->conn_close           = 0;
     t->eof_reached          = 0;
     t->chunked              = 0;
     t->chunk_phase          = HTTP_CHUNK_SIZE_LINE;
@@ -283,8 +266,7 @@ static int http_strieq_n(const char* a, const char* b, size_t n)
  *
  * The actual getaddrinfo()/connect() calls run bounded by the client's
  * connection timeout so a stalled DNS server or an unreachable host cannot
- * hang the transaction forever.  (Race-free helper design CONFIRMED
- * CORRECT by the 2026-08-04 audit -- do not restructure casually.)
+ * hang the transaction forever.
  * -----------------------------------------------------------------------*/
 
 /* getaddrinfo() has no portable cancel, so a bounded wait needs a helper
@@ -334,7 +316,7 @@ static void* http_resolve_worker(void* arg)
  * a timeout reports -1 with out_result == NULL, without leaking the
  * in-flight resolution (the worker cleans itself up once it eventually
  * completes). timeout_usec == 0 means "no bound configured" -> resolve
- * inline as before. */
+ * inline. */
 static int http_resolve_with_timeout(const char* hostname, const char* port_str,
                                      const struct addrinfo* hints, u32 timeout_usec,
                                      struct addrinfo** out_result)
@@ -416,10 +398,10 @@ static int http_resolve_with_timeout(const char* hostname, const char* port_str,
 
 /* Connect with a bound of *timeout_usec* microseconds: switch the socket to
  * non-blocking, kick off the connect, and wait for writability via select().
- * Restores blocking mode before returning either way -- the rest of the
+ * Restores blocking mode before returning either way; the rest of the
  * transaction path assumes a blocking socket bounded by SO_SNDTIMEO/
  * SO_RCVTIMEO instead (see http_apply_timeout()).
- * timeout_usec == 0 means "no bound configured" -> connect inline as before.
+ * timeout_usec == 0 means "no bound configured" -> connect inline.
  * Returns 0 ok, -1 connect failure, -2 timeout. */
 static int http_connect_with_timeout(http_socket_t sock, const struct sockaddr* addr,
                                      int addrlen, u32 timeout_usec)
@@ -504,11 +486,11 @@ static const char* http_find_header_end(const char* buf, u32 len)
     return NULL;
 }
 
-/* ANCHORED header lookup in the stored raw header block: the name must
- * start a line and be followed immediately by ':'.  (The old substring
- * search let "X-Original-Content-Length" satisfy a "Content-Length"
- * query -- audit 2026-08-04 MEDIUM.)  Returns 1 with *out_val/*out_len
- * pointing at the trimmed value bytes (NOT NUL-terminated), and, if
+/* Anchored header lookup in the stored raw header block: the name must
+ * start a line and be followed immediately by ':', so
+ * "X-Original-Content-Length" does not match a "Content-Length" query.
+ * Returns 1 with *out_val/*out_len
+ * pointing at the trimmed value bytes (not NUL-terminated), and, if
  * out_name_len is non-NULL, the on-wire name length. */
 static int http_find_response_header(const HttpTransSlot* t, const char* name,
                                      const char** out_val, u32* out_len,
@@ -553,8 +535,8 @@ static int http_find_response_header(const HttpTransSlot* t, const char* name,
 }
 
 /* Parse the response headers accumulated in hdr_buf.  Extracts status code,
- * Content-Length, Connection: close, Transfer-Encoding: chunked.
- * Returns CELL_OK or a documented error. */
+ * Content-Length and Transfer-Encoding: chunked.
+ * Returns CELL_OK or an error code. */
 static s32 http_parse_response_headers(HttpTransSlot* t, const char* hdr_end)
 {
     t->hdr_len = (u32)(hdr_end - t->hdr_buf);
@@ -562,11 +544,9 @@ static s32 http_parse_response_headers(HttpTransSlot* t, const char* hdr_end)
     /* Parse status line: "HTTP/1.x SSS reason\r\n" */
     int major = 0, minor = 0, status = 0;
     if (sscanf(t->hdr_buf, "HTTP/%d.%d %d", &major, &minor, &status) < 3) {
-        printf("[cellHttp]   Failed to parse status line\n");
         return (s32)CELL_HTTP_ERROR_INVALID_VALUE;
     }
     t->status_code = (s32)status;
-    printf("[cellHttp]   Response status: %d\n", status);
 
     const char* val;
     u32 vlen;
@@ -595,19 +575,6 @@ static s32 http_parse_response_headers(HttpTransSlot* t, const char* hdr_end)
         tmp[n] = '\0';
         t->content_length = (u64)strtoull(tmp, NULL, 10);
         t->content_length_known = 1;
-        printf("[cellHttp]   Content-Length: %llu\n",
-               (unsigned long long)t->content_length);
-    }
-
-    /* Connection: close */
-    t->conn_close = 0;
-    if (http_find_response_header(t, "Connection", &val, &vlen, NULL, NULL)) {
-        for (u32 i = 0; i + 5 <= vlen; i++) {
-            if (http_strieq_n(val + i, "close", 5)) {
-                t->conn_close = 1;
-                break;
-            }
-        }
     }
 
     /* Store leftover body bytes that arrived with the header read */
@@ -626,7 +593,7 @@ static s32 http_parse_response_headers(HttpTransSlot* t, const char* hdr_end)
 }
 
 /* Read from the socket until the full header section is buffered, then
- * parse it.  Returns CELL_OK or a documented error. */
+ * parse it.  Returns CELL_OK or an error code. */
 static s32 http_read_response_headers(HttpTransSlot* t)
 {
     if (t->headers_parsed)
@@ -638,14 +605,11 @@ static s32 http_read_response_headers(HttpTransSlot* t)
         int n = recv(t->sock, t->hdr_buf + t->hdr_buf_len,
                      (int)(HTTP_HDR_BUF_SIZE - 1 - t->hdr_buf_len), 0);
         if (n < 0) {
-            printf("[cellHttp]   recv() failed during header read\n");
             http_close_slot_socket(t);
             return (s32)CELL_HTTP_ERROR_NET_RECV;
         }
         if (n == 0) {
-            /* EOF before the header section completed.
-             * ORACLE(cell/http/error.h:345-347): NET_FIN. */
-            printf("[cellHttp]   EOF during header read\n");
+            /* EOF before the header section completed: NET_FIN. */
             http_close_slot_socket(t);
             return (s32)CELL_HTTP_ERROR_NET_FIN;
         }
@@ -660,10 +624,7 @@ static s32 http_read_response_headers(HttpTransSlot* t)
         }
     }
 
-    /* Header section exceeds our buffer.
-     * ORACLE(cell/http/error.h:158-160): LINE_EXCEEDS_MAX. */
-    printf("[cellHttp]   Header section exceeds %u bytes\n",
-           (unsigned)HTTP_HDR_BUF_SIZE);
+    /* Header section exceeds our buffer: LINE_EXCEEDS_MAX. */
     http_close_slot_socket(t);
     return (s32)CELL_HTTP_ERROR_LINE_EXCEEDS_MAX;
 }
@@ -699,9 +660,8 @@ static int http_body_read_raw(HttpTransSlot* t, char* dst, u32 want)
 }
 
 /* ---------------------------------------------------------------------------
- * Chunked transfer decoding (audit 2026-08-04 HIGH: previously absent while
- * advertising HTTP/1.1).  Delivers decoded body bytes; recvd==0 signals
- * "end of chunks" per ORACLE(libhttp-Reference_e.pdf p.121).
+ * Chunked transfer decoding.  Delivers decoded body bytes; recvd==0 signals
+ * "end of chunks".
  * -----------------------------------------------------------------------*/
 
 /* Read one text line (through '\n') from the body source. Returns 0 on
@@ -739,8 +699,7 @@ static s32 http_chunked_read(HttpTransSlot* t, char* out, u32 size, u32* filled)
         case HTTP_CHUNK_SIZE_LINE: {
             int rc = http_read_chunk_line(t, line, sizeof(line));
             if (rc == -2) {
-                /* connection lost mid-chunk-framing.
-                 * ORACLE(cell/http/error.h:203-205): BROKEN_CHUNK. */
+                /* Connection lost mid-chunk-framing: BROKEN_CHUNK. */
                 return (s32)CELL_HTTP_ERROR_BROKEN_CHUNK;
             }
             if (rc == -1) return (s32)CELL_HTTP_ERROR_NET_RECV;
@@ -806,8 +765,8 @@ static s32 http_chunked_read(HttpTransSlot* t, char* out, u32 size, u32* filled)
 
 #define HTTP_REQ_BUF_SIZE 8192
 
-/* Append to the request buffer with hard bounds checking (the old code
- * accumulated snprintf() would-have-written counts -- audit MEDIUM). */
+/* Append to the request buffer with hard bounds checking; returns -1 if the
+ * formatted text does not fit. */
 static int http_req_append(char* buf, int* len, const char* fmt, ...)
 {
     if (*len < 0 || *len >= HTTP_REQ_BUF_SIZE)
@@ -848,10 +807,9 @@ static s32 http_perform_request(HttpTransSlot* t, const HttpClientSlot* c,
     int gai = http_resolve_with_timeout(t->hostname, port_str, &hints,
                                         conn_usec, &result);
     if (gai != 0 || !result) {
-        printf("[cellHttp]   getaddrinfo failed for '%s': %d\n", t->hostname, gai);
         if (result) freeaddrinfo(result);
-        /* ORACLE(cell/http/error.h:361-366): resolver failures are the
-         * NET_RESOLVER class (low bits carry h_errno in the real lib). */
+        /* Resolver failures are the NET_RESOLVER class (low bits carry
+         * h_errno in the real lib). */
         return (s32)CELL_HTTP_ERROR_NET_RESOLVER;
     }
 
@@ -859,7 +817,6 @@ static s32 http_perform_request(HttpTransSlot* t, const HttpClientSlot* c,
     http_socket_t sock = socket(result->ai_family, result->ai_socktype,
                                 result->ai_protocol);
     if (sock == HTTP_INVALID_SOCKET) {
-        printf("[cellHttp]   socket() failed\n");
         freeaddrinfo(result);
         return (s32)CELL_HTTP_ERROR_NET_SOCKET;
     }
@@ -871,8 +828,6 @@ static s32 http_perform_request(HttpTransSlot* t, const HttpClientSlot* c,
     int crc = http_connect_with_timeout(sock, result->ai_addr,
                                         (int)result->ai_addrlen, conn_usec);
     if (crc != 0) {
-        printf("[cellHttp]   connect() %s to %s:%u\n",
-               crc == -2 ? "timed out" : "failed", t->hostname, t->port);
         http_closesocket(sock);
         freeaddrinfo(result);
         return crc == -2 ? (s32)CELL_HTTP_ERROR_NET_CONNECT_TIMEOUT
@@ -880,7 +835,6 @@ static s32 http_perform_request(HttpTransSlot* t, const HttpClientSlot* c,
     }
 
     freeaddrinfo(result);
-    printf("[cellHttp]   Connected to %s:%u\n", t->hostname, t->port);
 
     /* ---- Format HTTP request (bounds-checked) ---- */
     char req_buf[HTTP_REQ_BUF_SIZE];
@@ -912,15 +866,12 @@ static s32 http_perform_request(HttpTransSlot* t, const HttpClientSlot* c,
     bad |= http_req_append(req_buf, &req_len, "\r\n");
 
     if (bad) {
-        printf("[cellHttp]   Request exceeds %u-byte build buffer\n",
-               (unsigned)HTTP_REQ_BUF_SIZE);
         http_closesocket(sock);
         return (s32)CELL_HTTP_ERROR_NO_MEMORY;
     }
 
     /* ---- Send header ---- */
     if (http_send_all(sock, req_buf, (u32)req_len) != 0) {
-        printf("[cellHttp]   Failed to send request headers\n");
         http_closesocket(sock);
         return (s32)CELL_HTTP_ERROR_NET_SEND;
     }
@@ -928,14 +879,10 @@ static s32 http_perform_request(HttpTransSlot* t, const HttpClientSlot* c,
     /* ---- Send body if provided ---- */
     if (body && size > 0) {
         if (http_send_all(sock, (const char*)body, size) != 0) {
-            printf("[cellHttp]   Failed to send request body\n");
             http_closesocket(sock);
             return (s32)CELL_HTTP_ERROR_NET_SEND;
         }
     }
-
-    printf("[cellHttp]   Request sent (%d header bytes + %u body bytes)\n",
-           req_len, size);
 
     t->sock = sock;
     return CELL_OK;
@@ -971,7 +918,7 @@ static int http_apply_redirect_location(HttpTransSlot* t, const char* loc, u32 l
     buf[len] = '\0';
 
     if (http_strieq_n(buf, "https://", 8)) {
-        /* No TLS in this build: do not follow into https -- surface the
+        /* No TLS in this build: do not follow into https; surface the
          * 3xx response to the guest instead of downgrading. */
         return 0;
     }
@@ -1024,8 +971,8 @@ s32 cellHttpInit(void* pool, u32 poolSize)
 {
     /* The real library carves clients/transactions out of this pool; we use
      * fixed caps and only require the argument shape. */
-    printf("[cellHttp] Init(pool=%p, poolSize=%u)\n", pool, poolSize);
-
+    (void)pool;
+    (void)poolSize;
     if (s_http_initialized)
         return (s32)CELL_HTTP_ERROR_ALREADY_INITIALIZED;
 
@@ -1033,7 +980,6 @@ s32 cellHttpInit(void* pool, u32 poolSize)
     if (!s_wsa_initialized) {
         WSADATA wsa;
         if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
-            printf("[cellHttp] WSAStartup failed\n");
             return (s32)CELL_HTTP_ERROR_INTERNAL;
         }
         s_wsa_initialized = 1;
@@ -1054,8 +1000,6 @@ s32 cellHttpInit(void* pool, u32 poolSize)
 
 s32 cellHttpEnd(void)
 {
-    printf("[cellHttp] End()\n");
-
     if (!s_http_initialized)
         return (s32)CELL_HTTP_ERROR_NOT_INITIALIZED;
 
@@ -1090,7 +1034,7 @@ s32 cellHttpEnd(void)
 s32 cellHttpInitCookie(void* pool, u32 poolSize)
 {
     (void)pool;
-    printf("[cellHttp] InitCookie(poolSize=%u)\n", poolSize);
+    (void)poolSize;
     if (!s_http_initialized)
         return (s32)CELL_HTTP_ERROR_NOT_INITIALIZED;
     if (s_cookie_initialized)
@@ -1101,7 +1045,6 @@ s32 cellHttpInitCookie(void* pool, u32 poolSize)
 
 s32 cellHttpEndCookie(void)
 {
-    printf("[cellHttp] EndCookie()\n");
     if (!s_cookie_initialized)
         return (s32)CELL_HTTP_ERROR_CACHE_NOT_INITIALIZED;
     s_cookie_initialized = 0;
@@ -1121,15 +1064,13 @@ s32 cellHttpCreateClient(u32* clientId)
             HttpClientSlot* c = &s_clients[i];
             memset(c, 0, sizeof(*c));
             c->in_use = 1;
-            /* Defaults CONFIRMED CORRECT by the 2026-08-04 audit */
             c->conn_timeout_usec = 30000000ll;   /* 30s  */
             c->send_timeout_usec = 120000000ll;  /* 120s */
             c->recv_timeout_usec = 120000000ll;  /* 120s */
-            /* ORACLE(libhttp-Reference_e.pdf p.47/p.51): both enabled */
+            /* Both enabled by default. */
             c->auto_redirect = 1;
             c->auto_auth     = 1;
             *clientId = ps3_bswap32(i + 1);      /* guest BE; handles 1-based */
-            printf("[cellHttp] CreateClient(id=%u)\n", i + 1);
             return CELL_OK;
         }
     }
@@ -1156,7 +1097,6 @@ s32 cellHttpDestroyClient(u32 clientId)
     }
 
     c->in_use = 0;
-    printf("[cellHttp] DestroyClient(id=%u)\n", clientId);
     return CELL_OK;
 }
 
@@ -1168,7 +1108,6 @@ s32 cellHttpClientSetAutoRedirect(u32 clientId, u32 enable)
     HttpClientSlot* c = http_client_from_handle(clientId);
     if (!c) return (s32)CELL_HTTP_ERROR_BAD_CLIENT;
     c->auto_redirect = enable ? 1 : 0;
-    printf("[cellHttp] ClientSetAutoRedirect(id=%u, %u)\n", clientId, enable ? 1u : 0u);
     return CELL_OK;
 }
 
@@ -1188,7 +1127,6 @@ s32 cellHttpClientSetAutoAuthentication(u32 clientId, u32 enable)
     HttpClientSlot* c = http_client_from_handle(clientId);
     if (!c) return (s32)CELL_HTTP_ERROR_BAD_CLIENT;
     c->auto_auth = enable ? 1 : 0;
-    printf("[cellHttp] ClientSetAutoAuthentication(id=%u, %u)\n", clientId, enable ? 1u : 0u);
     return CELL_OK;
 }
 
@@ -1207,8 +1145,7 @@ s32 cellHttpClientSetCookieStatus(u32 clientId, u32 enable)
     if (!s_http_initialized) return (s32)CELL_HTTP_ERROR_NOT_INITIALIZED;
     HttpClientSlot* c = http_client_from_handle(clientId);
     if (!c) return (s32)CELL_HTTP_ERROR_BAD_CLIENT;
-    c->cookie_enabled = enable ? 1 : 0;
-    printf("[cellHttp] ClientSetCookieStatus(id=%u, %u)\n", clientId, enable ? 1u : 0u);
+    (void)enable;   /* no cookie engine */
     return CELL_OK;
 }
 
@@ -1217,9 +1154,8 @@ s32 cellHttpClientSetCookieSendCallback(u32 clientId, u32 cbfunc, u32 userArg)
     if (!s_http_initialized) return (s32)CELL_HTTP_ERROR_NOT_INITIALIZED;
     HttpClientSlot* c = http_client_from_handle(clientId);
     if (!c) return (s32)CELL_HTTP_ERROR_BAD_CLIENT;
-    c->cookie_send_cb     = cbfunc;   /* raw guest values; never invoked */
-    c->cookie_send_cb_arg = userArg;
-    printf("[cellHttp] ClientSetCookieSendCallback(id=%u)\n", clientId);
+    (void)cbfunc;   /* callbacks are never invoked */
+    (void)userArg;
     return CELL_OK;
 }
 
@@ -1228,9 +1164,8 @@ s32 cellHttpClientSetCookieRecvCallback(u32 clientId, u32 cbfunc, u32 userArg)
     if (!s_http_initialized) return (s32)CELL_HTTP_ERROR_NOT_INITIALIZED;
     HttpClientSlot* c = http_client_from_handle(clientId);
     if (!c) return (s32)CELL_HTTP_ERROR_BAD_CLIENT;
-    c->cookie_recv_cb     = cbfunc;
-    c->cookie_recv_cb_arg = userArg;
-    printf("[cellHttp] ClientSetCookieRecvCallback(id=%u)\n", clientId);
+    (void)cbfunc;   /* callbacks are never invoked */
+    (void)userArg;
     return CELL_OK;
 }
 
@@ -1239,9 +1174,8 @@ s32 cellHttpClientSetSslCallback(u32 clientId, u32 cbfunc, u32 userArg)
     if (!s_http_initialized) return (s32)CELL_HTTP_ERROR_NOT_INITIALIZED;
     HttpClientSlot* c = http_client_from_handle(clientId);
     if (!c) return (s32)CELL_HTTP_ERROR_BAD_CLIENT;
-    c->ssl_cb     = cbfunc;   /* stored only: no TLS verify path exists */
-    c->ssl_cb_arg = userArg;
-    printf("[cellHttp] ClientSetSslCallback(id=%u)\n", clientId);
+    (void)cbfunc;   /* no TLS verify path exists */
+    (void)userArg;
     return CELL_OK;
 }
 
@@ -1251,8 +1185,6 @@ s32 cellHttpClientSetConnTimeout(u32 clientId, s64 usec)
     HttpClientSlot* c = http_client_from_handle(clientId);
     if (!c) return (s32)CELL_HTTP_ERROR_BAD_CLIENT;
     c->conn_timeout_usec = usec;
-    printf("[cellHttp] ClientSetConnTimeout(id=%u, %lld us)\n", clientId,
-           (long long)usec);
     return CELL_OK;
 }
 
@@ -1272,8 +1204,6 @@ s32 cellHttpClientSetSendTimeout(u32 clientId, s64 usec)
     HttpClientSlot* c = http_client_from_handle(clientId);
     if (!c) return (s32)CELL_HTTP_ERROR_BAD_CLIENT;
     c->send_timeout_usec = usec;
-    printf("[cellHttp] ClientSetSendTimeout(id=%u, %lld us)\n", clientId,
-           (long long)usec);
     return CELL_OK;
 }
 
@@ -1293,8 +1223,6 @@ s32 cellHttpClientSetRecvTimeout(u32 clientId, s64 usec)
     HttpClientSlot* c = http_client_from_handle(clientId);
     if (!c) return (s32)CELL_HTTP_ERROR_BAD_CLIENT;
     c->recv_timeout_usec = usec;
-    printf("[cellHttp] ClientSetRecvTimeout(id=%u, %lld us)\n", clientId,
-           (long long)usec);
     return CELL_OK;
 }
 
@@ -1324,10 +1252,9 @@ s32 cellHttpCreateTransaction(u32* transId, u32 clientId, const char* method,
     if (!http_client_from_handle(clientId))
         return (s32)CELL_HTTP_ERROR_BAD_CLIENT;
 
-    /* CellHttpUri is a GUEST struct: five big-endian 4-byte EAs plus a
-     * big-endian port (ORACLE(cell/http/util.h:12-20)).  Translate each EA
-     * separately -- the old code declared host pointers and fused adjacent
-     * fields into wild 64-bit pointers (audit 2026-08-04 HIGH). */
+    /* CellHttpUri is a guest struct: five big-endian 4-byte EAs plus a
+     * big-endian port.  Each EA is translated separately; the fields are
+     * 4 bytes wide, so they cannot be read as host pointers. */
     u32 scheme_ea   = ps3_bswap32(uri->scheme);
     u32 hostname_ea = ps3_bswap32(uri->hostname);
     u32 username_ea = ps3_bswap32(uri->username);
@@ -1365,9 +1292,6 @@ s32 cellHttpCreateTransaction(u32* transId, u32 clientId, const char* method,
             t->port = port ? port : (t->is_https ? 443u : 80u);
 
             *transId = ps3_bswap32(i + 1);   /* guest BE; handles 1-based */
-            printf("[cellHttp] CreateTransaction(client=%u, %s %s://%s:%u%s) -> trans=%u\n",
-                   clientId, t->method, t->scheme, t->hostname, t->port,
-                   t->path, i + 1);
             return CELL_OK;
         }
     }
@@ -1387,7 +1311,6 @@ s32 cellHttpDestroyTransaction(u32 transId)
     http_close_slot_socket(t);
     http_reset_response_state(t);
     t->in_use = 0;
-    printf("[cellHttp] DestroyTransaction(trans=%u)\n", transId);
     return CELL_OK;
 }
 
@@ -1401,17 +1324,17 @@ s32 cellHttpSendRequest(u32 transId, const void* buf, u32 size, u32* sent)
         return (s32)CELL_HTTP_ERROR_BAD_TRANS;
 
     if (t->aborted) {
-        printf("[cellHttp] SendRequest(trans=%u) - transaction aborted\n", transId);
         return (s32)CELL_HTTP_ERROR_TRANS_ABORTED;
     }
 
     if (t->is_https) {
-        /* TLS is not implemented in this firmware-free build.  Fail the
-         * transaction cleanly with the documented handshake error instead
-         * of silently talking plaintext (audit 2026-08-04 HIGH).
-         * ORACLE(cell/http/error.h:413-415): CELL_HTTPS_ERROR_HANDSHAKE. */
-        printf("[cellHttp] SendRequest(trans=%u) - https unsupported (no TLS)\n",
-               transId);
+        /* TLS is not implemented.  Fail the transaction with the handshake
+         * error instead of silently talking plaintext. */
+        static int warned_no_tls = 0;
+        if (!warned_no_tls) {
+            warned_no_tls = 1;
+            fprintf(stderr, "[cellHttp] https requests are not supported (no TLS)\n");
+        }
         if (sent) *sent = ps3_bswap32(0u);
         return (s32)CELL_HTTPS_ERROR_HANDSHAKE;
     }
@@ -1420,17 +1343,12 @@ s32 cellHttpSendRequest(u32 transId, const void* buf, u32 size, u32* sent)
     if (!c)
         return (s32)CELL_HTTP_ERROR_BAD_CLIENT;
 
-    printf("[cellHttp] SendRequest(trans=%u, %s %s, bodySize=%u)\n",
-           transId, t->method, t->path, size);
-
     /* Send + read response headers, following redirects/auth inside the
-     * library per ORACLE(libhttp-Reference_e.pdf p.47): "Request sending/
-     * response receiving for automatic redirection is performed within the
-     * library" and TOO_MANY_REDIRECTS surfaces from the send function. */
+     * library (automatic redirection is performed within the library), and
+     * TOO_MANY_REDIRECTS surfaces from the send function. */
     const void* body      = buf;
     u32         body_size = size;
     t->redirect_count = 0;
-    t->auth_count     = 0;
 
     for (;;) {
         s32 rc = http_perform_request(t, c, body, body_size);
@@ -1448,9 +1366,8 @@ s32 cellHttpSendRequest(u32 transId, const void* buf, u32 size, u32* sent)
 
         s32 st = t->status_code;
 
-        /* --- documented auto-redirect rules (Reference p.47):
-         *     304/306 never; 301/302/303/305/307 always; other 3xx only
-         *     for GET/HEAD; at most 5 attempts. --- */
+        /* Auto-redirect: 304/306 never; 301/302/303/305/307 always; other
+         * 3xx only for GET/HEAD; at most 5 attempts. */
         if (c->auto_redirect && st >= 300 && st <= 399 &&
             st != 304 && st != 306) {
             int always = (st == 301 || st == 302 || st == 303 || st == 305 ||
@@ -1478,8 +1395,6 @@ s32 cellHttpSendRequest(u32 transId, const void* buf, u32 size, u32* sent)
                             body      = NULL;
                             body_size = 0;
                         }
-                        printf("[cellHttp]   redirect %u -> %s:%u%s\n",
-                               t->redirect_count, t->hostname, t->port, t->path);
                         continue;
                     }
                     /* Unfollowable target (e.g. https): surface the 3xx */
@@ -1487,10 +1402,9 @@ s32 cellHttpSendRequest(u32 transId, const void* buf, u32 size, u32* sent)
             }
         }
 
-        /* --- documented auto-authentication (Reference p.51): use URI
-         *     credentials first; guest callbacks are unreachable from HLE,
-         *     so without usable credentials this is the documented
-         *     "not enough info" failure. --- */
+        /* Auto-authentication: use the URI credentials for Basic; guest
+         * callbacks cannot be invoked from here, so without usable
+         * credentials the request fails with CANNOT_AUTHENTICATE. */
         if (c->auto_auth && st == 401) {
             const char* ch; u32 chlen;
             int basic = 0;
@@ -1508,11 +1422,6 @@ s32 cellHttpSendRequest(u32 transId, const void* buf, u32 size, u32* sent)
                 snprintf(t->auth_header, sizeof(t->auth_header),
                          "Authorization: Basic %s", b64);
                 t->auth_applied = 1;
-                if (++t->auth_count > 5) {
-                    if (sent) *sent = ps3_bswap32(0u);
-                    return (s32)CELL_HTTP_ERROR_TOO_MANY_AUTHS;
-                }
-                printf("[cellHttp]   retrying with Basic credentials\n");
                 continue;
             }
             if (sent) *sent = ps3_bswap32(0u);
@@ -1538,14 +1447,12 @@ s32 cellHttpRecvResponse(u32 transId, void* buf, u32 size, u32* recvd)
         return (s32)CELL_HTTP_ERROR_BAD_TRANS;
 
     if (t->aborted) {
-        printf("[cellHttp] RecvResponse(trans=%u) - transaction aborted\n", transId);
         if (recvd) *recvd = ps3_bswap32(0u);
         return (s32)CELL_HTTP_ERROR_TRANS_ABORTED;
     }
 
     if (!t->request_sent) {
-        /* ORACLE(cell/http/error.h:76-78): "no request has been sent yet" */
-        printf("[cellHttp] RecvResponse(trans=%u) - no request sent\n", transId);
+        /* No request has been sent yet. */
         if (recvd) *recvd = ps3_bswap32(0u);
         return (s32)CELL_HTTP_ERROR_NO_REQUEST_SENT;
     }
@@ -1605,14 +1512,12 @@ s32 cellHttpRecvResponse(u32 transId, void* buf, u32 size, u32* recvd)
             /* Error - if we already have some data, return it */
             if (filled > 0)
                 break;
-            printf("[cellHttp]   recv() error during body read\n");
             if (recvd) *recvd = ps3_bswap32(0u);
             return (s32)CELL_HTTP_ERROR_NET_RECV;
         }
         if (n == 0) {
-            /* FIN/RST: per ORACLE(libhttp-Reference p.121) recvd goes to 0
-             * regardless of Content-Length completeness -- EOF is not an
-             * error here. */
+            /* FIN/RST: recvd goes to 0 regardless of Content-Length
+             * completeness; EOF is not an error here. */
             t->eof_reached = 1;
             if (!t->content_length_known) {
                 t->content_length = t->body_received;
@@ -1641,7 +1546,6 @@ s32 cellHttpTransactionCloseConnection(u32 transId)
         return (s32)CELL_HTTP_ERROR_BAD_TRANS;
 
     http_close_slot_socket(t);
-    printf("[cellHttp] TransactionCloseConnection(trans=%u)\n", transId);
     return CELL_OK;
 }
 
@@ -1656,7 +1560,6 @@ s32 cellHttpTransactionAbortConnection(u32 transId)
 
     t->aborted = 1;
     http_close_slot_socket(t);
-    printf("[cellHttp] TransactionAbortConnection(trans=%u)\n", transId);
     return CELL_OK;
 }
 
@@ -1673,8 +1576,6 @@ s32 cellHttpRequestSetContentLength(u32 transId, u64 totalSize)
 
     t->request_content_length     = totalSize;
     t->request_content_length_set = 1;
-    printf("[cellHttp] RequestSetContentLength(trans=%u, %llu)\n",
-           transId, (unsigned long long)totalSize);
     return CELL_OK;
 }
 
@@ -1696,7 +1597,7 @@ s32 cellHttpRequestGetContentLength(u32 transId, u64* totalSize)
 }
 
 /* Shared body of Add/SetHeader.  header is a HOST pointer to the guest
- * CellHttpHeader (two BE EAs, ORACLE(cell/http/util.h:45-48)). */
+ * CellHttpHeader (two BE EAs). */
 static s32 http_request_put_header(u32 transId, const CellHttpHeader* header,
                                    int replace)
 {
@@ -1731,8 +1632,6 @@ static s32 http_request_put_header(u32 transId, const CellHttpHeader* header,
     }
 
     if (t->custom_header_count >= CELL_HTTP_MAX_CUSTOM_HEADERS) {
-        printf("[cellHttp] Request%sHeader - too many custom headers\n",
-               replace ? "Set" : "Add");
         return (s32)CELL_HTTP_ERROR_NO_MEMORY;
     }
 
@@ -1743,8 +1642,6 @@ static s32 http_request_put_header(u32 transId, const CellHttpHeader* header,
     h->value[sizeof(h->value) - 1] = '\0';
     t->custom_header_count++;
 
-    printf("[cellHttp] Request%sHeader(trans=%u, '%s: %s')\n",
-           replace ? "Set" : "Add", transId, h->name, h->value);
     return CELL_OK;
 }
 
@@ -1760,9 +1657,8 @@ s32 cellHttpRequestSetHeader(u32 transId, const CellHttpHeader* header)
 
 /* ---- response ----------------------------------------------------------- */
 
-/* Doc contract for all Response* getters: "If the response headers are not
- * yet processed by the time this function is called, it will first read the
- * response headers" (ORACLE(libhttp-Reference p.121-125)). */
+/* Contract for all Response* getters: if the response headers have not been
+ * processed yet, the call reads them first. */
 static s32 http_ensure_response_headers(HttpTransSlot* t)
 {
     if (t->headers_parsed)
@@ -1807,9 +1703,9 @@ s32 cellHttpResponseGetContentLength(u32 transId, u64* length)
         return rc;
 
     if (!t->content_length_known) {
-        /* ORACLE(libhttp-Reference p.124): "If no Content-Length field was
-         * received ... it will return the CELL_HTTP_ERROR_NO_CONTENT_LENGTH
-         * error." (chunked responses land here too) */
+        /* Without a Content-Length field the call returns
+         * CELL_HTTP_ERROR_NO_CONTENT_LENGTH (chunked responses land here
+         * too). */
         return (s32)CELL_HTTP_ERROR_NO_CONTENT_LENGTH;
     }
 
@@ -1838,7 +1734,7 @@ s32 cellHttpResponseGetHeader(u32 transId, CellHttpHeader* header,
     const char* wire_name; u32 wire_name_len;
     if (!http_find_response_header(t, name, &val, &vlen,
                                    &wire_name, &wire_name_len)) {
-        /* ORACLE(cell/http/error.h:88-90): "that header doesn't exist" */
+        /* The requested header does not exist. */
         return (s32)CELL_HTTP_ERROR_NO_HEADER;
     }
 

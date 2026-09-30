@@ -3,11 +3,6 @@
  *
  * Calls all sys_X_init functions to populate the syscall dispatch table
  * with real HLE handlers.
- *
- * Registration order matters for conflicting syscall numbers:
- * timers are registered before events, so event handlers take precedence
- * for the colliding numbers (141, 142, 145). Timer sleep/time functions
- * remain available as direct C calls for the runtime to use.
  */
 
 #include "lv2_syscall_table.h"
@@ -22,9 +17,7 @@
 #include "sys_vm.h"
 #include "sys_fs.h"
 #include "ps3emu/spu_fallback.h"
-#include "sys_event.h"
 #include "../ppu/ppu_memory.h"
-#include "ps3emu/yz_frontier_trace.h"
 
 #include <stdio.h>
 #include <stdlib.h>  /* calloc/free: without the prototype MSVC assumed int
@@ -34,60 +27,11 @@
 /* ---------------------------------------------------------------------------
  * TTY syscalls (used by PS3 CRT for debug output)
  *
- * sys_tty_read  (402) — read from TTY (stdin)
- * sys_tty_write (403) — write to TTY (stdout/stderr)
+ * sys_tty_read  (402): read from TTY (stdin)
+ * sys_tty_write (403): write to TTY (stdout/stderr)
  *
  * These are among the most commonly called syscalls in CRT startup.
  * -----------------------------------------------------------------------*/
-
-extern uint8_t* vm_base;
-
-void yz_frontier_sync_snapshot(void)
-{
-    uint32_t i;
-    for (i = 0; i < SYS_SEMAPHORE_MAX; ++i) {
-        const sys_semaphore_info* s = &g_sys_semaphores[i];
-        if (!s->active) continue;
-        yz_frontier_trace_emit(
-            YZ_FT_SYNC_STATE, i + 1u, 1u,
-            (uint32_t)s->value, (uint32_t)s->max_value,
-            (uint32_t)s->waiters, 0u, 0u, s->protocol);
-    }
-    for (i = 0; i < SYS_MUTEX_MAX; ++i) {
-        const sys_mutex_info* m = &g_sys_mutexes[i];
-        if (!m->active) continue;
-        yz_frontier_trace_emit(
-            YZ_FT_SYNC_STATE, i + 1u, 2u,
-            (uint32_t)m->lock_count, m->recursive ? 1u : 0u,
-            0u, (uint32_t)(m->owner_tid >> 32), (uint32_t)m->owner_tid,
-            (m->protocol & 0xffffu) | ((uint32_t)m->cond_count << 16));
-    }
-    for (i = 0; i < SYS_COND_MAX; ++i) {
-        const sys_cond_info* c = &g_sys_conds[i];
-        if (!c->active) continue;
-        yz_frontier_trace_emit(
-            YZ_FT_SYNC_STATE, i + 1u, 3u,
-            (uint32_t)c->pending, 0u, (uint32_t)c->committed,
-            c->mutex_id,
-            (uint32_t)c->waiter_tids[0],
-            (uint32_t)(c->waiter_tids[0] >> 32));
-    }
-    for (i = 0; i < SYS_RWLOCK_MAX; ++i) {
-        const sys_rwlock_info* r = &g_sys_rwlocks[i];
-        if (!r->active) continue;
-#ifdef _WIN32
-        yz_frontier_trace_emit(
-            YZ_FT_SYNC_STATE, i + 1u, 4u,
-            (uint32_t)r->readers, (uint32_t)r->writer, 0u,
-            (uint32_t)(r->writer_tid >> 32), (uint32_t)r->writer_tid,
-            r->protocol);
-#else
-        yz_frontier_trace_emit(
-            YZ_FT_SYNC_STATE, i + 1u, 4u,
-            0u, 0u, 0u, 0u, 0u, r->protocol);
-#endif
-    }
-}
 
 static int64_t sys_tty_write(ppu_context* ctx)
 {
@@ -120,7 +64,7 @@ static int64_t sys_tty_read(ppu_context* ctx)
     /* s32 sys_tty_read(s32 ch, void* buf, u32 len, u32* preadlen) */
     uint32_t prd_ea = (uint32_t)ctx->gpr[6];
 
-    /* No TTY input available — return 0 bytes read */
+    /* No TTY input available: return 0 bytes read */
     if (prd_ea && vm_base)
         memset(vm_base + prd_ea, 0, 4);
 
@@ -128,56 +72,39 @@ static int64_t sys_tty_read(ppu_context* ctx)
 }
 
 /* ---------------------------------------------------------------------------
- * Registration
- * -----------------------------------------------------------------------*/
-
-#define SYS_TTY_READ   402
-#define SYS_TTY_WRITE  403
-
-/* ---------------------------------------------------------------------------
  * Stateful SPU thread group tracker
  *
- * We don't execute SPU programs — SPURS job queues, SPU tasks, and raw SPU
- * threads all resolve to an empty "thread completed normally" result. But
- * the PPU-side wrappers (PhyreEngine's SPURS wrapper in particular) check
- * returned IDs, out-param cause/status fields, and per-thread exit codes
- * after every call. A flat "return 0" stub leaves the out-params as heap
- * garbage and the wrapper then throws a C++ exception.
+ * Groups whose thread entry points resolve to lifted SPU code run that code
+ * on host threads; threads with no lifted entry complete immediately with
+ * status 0. Guest wrappers check returned IDs, out-param cause/status fields
+ * and per-thread exit codes after every call, so each syscall writes them.
  *
  * This tracker assigns monotonically-increasing IDs, walks a small state
- * machine, and writes all the out-params each syscall is documented to
- * set. It doesn't try to emulate actual SPU work — the group transitions
- * straight from STARTED to STOPPED with exit code 0.
+ * machine, and writes all the out-params each syscall is documented to set.
  *
- * Cause values match RPCS3's lv2 definitions:
- *   GROUP_EXIT       = 0x0001 — sys_spu_thread_group_exit() was called
- *   ALL_THREADS_EXIT = 0x0002 — all threads completed their entry fn
- *   TERMINATED       = 0x0004 — sys_spu_thread_group_terminate() fired
+ * Cause values match the lv2 definitions:
+ *   GROUP_EXIT       = 0x0001: sys_spu_thread_group_exit() was called
+ *   ALL_THREADS_EXIT = 0x0002: all threads completed their entry fn
+ *   TERMINATED       = 0x0004: sys_spu_thread_group_terminate() fired
  * -----------------------------------------------------------------------*/
 
 #define SPU_GROUP_STATE_INITIALIZED  0
 #define SPU_GROUP_STATE_READY        1
 #define SPU_GROUP_STATE_RUNNING      2
 #define SPU_GROUP_STATE_STOPPED      3
-#define SPU_GROUP_STATE_DESTROYED    4
 
 #define SPU_GROUP_CAUSE_GROUP_EXIT        0x0001u
 #define SPU_GROUP_CAUSE_ALL_THREADS_EXIT  0x0002u
 #define SPU_GROUP_CAUSE_TERMINATED        0x0004u
 
-/* s33 conformance fix: sys_spu_thread_group_connect_event(id, eq, et) event
- * source types and their event keys, per RPCS3 sys_spu.h:35-44
- * (numeric et values + key constants, semantics only -- oracle, not copied).
- * RUN, EXCEPTION and SYSTEM_MODULE are three INDEPENDENT event sources with
- * independent connect/EBUSY slots; our handler used to collapse all of them
- * into one slot and always tag the pushed event RUN_KEY. */
+/* sys_spu_thread_group_connect_event(id, eq, et) event source types and their
+ * event keys. RUN, EXCEPTION and SYSTEM_MODULE are three independent event
+ * sources with independent connect/EBUSY slots. */
 #define SYS_SPU_THREAD_GROUP_EVENT_RUN            1u
 #define SYS_SPU_THREAD_GROUP_EVENT_EXCEPTION      2u
 #define SYS_SPU_THREAD_GROUP_EVENT_SYSTEM_MODULE  4u
 
 #define SYS_SPU_THREAD_GROUP_EVENT_RUN_KEY           0xFFFFFFFF53505500ull
-#define SYS_SPU_THREAD_GROUP_EVENT_EXCEPTION_KEY     0xFFFFFFFF53505503ull
-#define SYS_SPU_THREAD_GROUP_EVENT_SYSTEM_MODULE_KEY 0xFFFFFFFF53505504ull
 
 #define MAX_SPU_GROUPS   32
 #define MAX_SPU_THREADS  (MAX_SPU_GROUPS * 8)
@@ -200,14 +127,13 @@ typedef struct {
     int      in_use;
     uint32_t tid;            /* thread id (unique across all groups) */
     uint32_t group_id;       /* parent group */
-    uint32_t index;          /* slot within the group */
     int32_t  exit_status;
     uint32_t entry_point;    /* initial SPU image entry (informational) */
     uint32_t img_ea;         /* guest sys_spu_image struct (segment table) */
-    /* Thread arguments captured AT sys_spu_thread_initialize time (lv2
-     * copies them then — games reuse one guest block for all threads,
-     * rewriting it between calls; reading it lazily hands every thread
-     * the last thread's values. Observed live with SPURS spu_num). */
+    /* Thread arguments captured at sys_spu_thread_initialize time (lv2
+     * copies them then; games reuse one guest block for all threads,
+     * rewriting it between calls, so reading it lazily would hand every
+     * thread the last thread's values). */
     uint64_t args[4];
     /* Real SPU execution (lifted images): full architectural context.
      * Allocated at group_start when the entry resolves to lifted code. */
@@ -218,7 +144,6 @@ typedef struct {
      * The PPU fallback receives args_ea so it can decode whatever format
      * the registered job expects. */
     uint32_t args_ea;
-    uint32_t args_size;
     /* Async fallback execution. host_thread is set when group_start spawned
      * a host thread for this SPU thread's PPU fallback; finish_event is
      * signalled when the handler returns; running indicates the thread is
@@ -235,10 +160,10 @@ typedef struct {
      * common pattern where the PPU writes job state into LS, the SPU runs
      * and writes results back to LS, then PPU reads them. */
     uint8_t*            local_store;
-    /* SPU run-control configuration (sc-187 sys_spu_thread_set_spu_cfg):
+    /* SPU run-control configuration (sys_spu_thread_set_spu_cfg):
      * bit 0 = SNR1 in OR mode, bit 1 = SNR2 in OR mode (CBE Registers v1.5
-     * SPU_Cfg; default 0 = overwrite mode for both). Read by sc-184
-     * write_snr below. */
+     * SPU_Cfg; default 0 = overwrite mode for both). Read by
+     * sys_spu_thread_write_snr below. */
     uint64_t            spu_cfg;
 } spu_thread_t;
 
@@ -252,23 +177,17 @@ typedef struct {
     int32_t  exit_status;        /* final ppu-side status the group reports */
     uint32_t cause;              /* how the group ended */
     /* Event queues connected via sys_spu_thread_group_connect_event(id, eq, et).
-     * s33 conformance fix: et selects one of three INDEPENDENT event sources
-     * (RPCS3 sys_spu.h:35-44 + sys_spu.cpp connect_event) -- each gets its
+     * et selects one of three independent event sources, each with its
      * own connect/EBUSY slot:
      *   event_queue_run       (et=SYS_SPU_THREAD_GROUP_EVENT_RUN)
      *     fired once from group_join when the group reaches STOPPED;
      *     source=RUN_KEY, data1=group id, data2/data3=N/A.
      *   event_queue_exception (et=SYS_SPU_THREAD_GROUP_EVENT_EXCEPTION)
-     *     fired per faulting SPU thread from spu_exec_thread_proc's fault
-     *     path; source=EXCEPTION_KEY, data1=group_id<<32|thread_id,
-     *     data2=NPC<<32|cause (cause zeroed -- no oracle-verified numeric
-     *     encoding available, see spu_exec_thread_proc).
+     *     tracked for connect/EBUSY bookkeeping; SPU faults are reported on
+     *     the host only (see spu_exec_thread_proc), not delivered here.
      *   event_queue_sysmodule (et=SYS_SPU_THREAD_GROUP_EVENT_SYSTEM_MODULE)
      *     slot tracked for connect/EBUSY bookkeeping only; nothing in this
-     *     runtime posts to it (no system-module cooperation path).
-     * YZ_SPU_ET_LEGACY=1 reverts to the pre-s33 behavior: every connect
-     * (regardless of et) collapses into event_queue_run, and group_join is
-     * the only source that ever fires. */
+     *     runtime posts to it (no system-module cooperation path). */
     uint32_t event_queue_run;
     uint32_t event_queue_exception;
     uint32_t event_queue_sysmodule;
@@ -276,11 +195,9 @@ typedef struct {
      * free port from `req`, binds the queue to it, and returns the port in *spup.
      * spup_queue[port] = the connected event-queue id (0 = unconnected). The SPU's
      * outbound interrupt mailbox (SPU_WrOutIntrMbox) delivers a class-2 event to
-     * the queue on its port. (2026-06-21 pt29: this was unimplemented -> SPU->PPU
-     * events were silently dropped -> SPURS/CRI coordination stalled.) */
+     * the queue on its port. */
     uint32_t spup_queue[64];
-    /* Batch fixes item 10 (RPCS3 sys_spu.cpp:1654-1658): only one thread may
-     * be joined on a group at a time. 0 = no joiner. */
+    /* Only one thread may be joined on a group at a time. 0 = no joiner. */
     int      joiner;
 } spu_group_t;
 
@@ -288,7 +205,6 @@ static spu_group_t  s_spu_groups[MAX_SPU_GROUPS];
 static spu_thread_t s_spu_threads[MAX_SPU_THREADS];
 static uint32_t     s_spu_next_group_id  = 0x1000;
 static uint32_t     s_spu_next_thread_id = 0x2000;
-static int          s_spu_initialized    = 0;
 
 static spu_group_t* spu_find_group(uint32_t id)
 {
@@ -301,7 +217,7 @@ static spu_group_t* spu_find_group(uint32_t id)
 
 /* Event queue bound to an SPU->PPU user-event port of a group (0 = none).
  * Used by spu_wrch(SPU_WrOutIntrMbox) to deliver sys_spu_thread_send_event /
- * throw_event class-2 events (the pt29 "NOT forwarded yet" gap). */
+ * throw_event class-2 events. */
 uint32_t spu_group_spup_queue(uint32_t group_id, uint32_t spup)
 {
     spu_group_t* g = spu_find_group(group_id);
@@ -309,34 +225,10 @@ uint32_t spu_group_spup_queue(uint32_t group_id, uint32_t spup)
     return g->spup_queue[spup];
 }
 
-/* Kill-switch for the s33 per-source event-type fix: reverts
- * sys_spu_thread_group_connect_event to the pre-fix single-slot behavior
- * (every et collapses into event_queue_run). getenv is cached (checked
- * once) per LESSONS-consistent static-cache convention elsewhere in this
- * file; banner only fires when legacy mode is actually active. */
-static int spu_et_legacy(void)
-{
-    static int cached = -1;
-    if (cached < 0) {
-        const char* e = getenv("YZ_SPU_ET_LEGACY");
-        cached = (e && e[0] && e[0] != '0') ? 1 : 0;
-        if (cached) {
-            fprintf(stderr, "[SPU] YZ_SPU_ET_LEGACY=1: group_connect_event collapses "
-                    "RUN/EXCEPTION/SYSTEM_MODULE into one slot (pre-s33 behavior)\n");
-            fflush(stderr);
-        }
-    }
-    return cached;
-}
-
 /* Resolve the per-group connection slot for a given et. Returns NULL for an
- * invalid et (caller returns EINVAL). Under YZ_SPU_ET_LEGACY, every et
- * (valid or not) resolves to event_queue_run, matching the pre-s33 single
- * collapsed slot. */
+ * invalid et (caller returns EINVAL). */
 static uint32_t* spu_group_event_slot(spu_group_t* g, uint32_t et)
 {
-    if (spu_et_legacy())
-        return &g->event_queue_run;
     switch (et) {
         case SYS_SPU_THREAD_GROUP_EVENT_RUN:           return &g->event_queue_run;
         case SYS_SPU_THREAD_GROUP_EVENT_EXCEPTION:     return &g->event_queue_exception;
@@ -385,7 +277,6 @@ static spu_thread_t* spu_alloc_thread(void)
 
 static void vm_write_be32(uint32_t guest_addr, uint32_t val)
 {
-    extern uint8_t* vm_base;
     if (!vm_base || !guest_addr) return;
     uint8_t* p = vm_base + guest_addr;
     p[0] = (uint8_t)(val >> 24);
@@ -396,55 +287,43 @@ static void vm_write_be32(uint32_t guest_addr, uint32_t val)
 
 static uint32_t vm_read_be32(uint32_t guest_addr)
 {
-    extern uint8_t* vm_base;
     if (!vm_base || !guest_addr) return 0;
     const uint8_t* p = vm_base + guest_addr;
     return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
            ((uint32_t)p[2] <<  8) | (uint32_t)p[3];
 }
 
-/* sys_spu_initialize(nspu, nrawspu) — one-shot global init */
+/* sys_spu_initialize(nspu, nrawspu): accepted; no state is kept */
 static int64_t sys_spu_initialize_handler(ppu_context* ctx)
 {
-    uint32_t nspu    = (uint32_t)ctx->gpr[3];
-    uint32_t nrawspu = (uint32_t)ctx->gpr[4];
-    fprintf(stderr, "[SPU] initialize(nspu=%u, nrawspu=%u)\n", nspu, nrawspu);
-    fflush(stderr);
-    s_spu_initialized = 1;
     ctx->gpr[3] = 0;
     return 0;
 }
 
 /* sys_spu_thread_group_create(out_id_ea, num, prio, attr_ea)
  *
- * lv2 signature per RPCS3 sys_spu.h: r5 is the group PRIORITY (SPURS
- * passes 250), NOT a name pointer. The name lives inside the attribute
+ * r5 is the group priority (SPURS passes 250), not a name pointer. The
+ * name lives inside the attribute
  * struct, reduced_sys_spu_thread_group_attribute (BE):
  *   +0 u32 nsize (name length incl. NUL), +4 u32 name ptr, +8 s32 type. */
 static int64_t sys_spu_thread_group_create_handler(ppu_context* ctx)
 {
-    extern uint8_t* vm_base;
     uint32_t out_ea   = (uint32_t)ctx->gpr[3];
     uint32_t num      = (uint32_t)ctx->gpr[4];
-    int32_t  prio     = (int32_t)ctx->gpr[5];
     uint32_t attr_ea  = (uint32_t)ctx->gpr[6];
 
     spu_group_t* g = spu_alloc_group();
     if (!g) {
-        fprintf(stderr, "[SPU] group_create: out of groups\n");
-        fflush(stderr);
         ctx->gpr[3] = (uint64_t)(int64_t)-1; /* EAGAIN-ish */
         return -1;
     }
     if (num > 8) num = 8;
     g->num_threads = num;
 
-    int32_t  gtype   = 0;
     uint32_t name_ea = 0;
     if (attr_ea) {
         uint32_t nsize = vm_read_be32(attr_ea + 0);
         name_ea        = vm_read_be32(attr_ea + 4);
-        gtype          = (int32_t)vm_read_be32(attr_ea + 8);
         if (!nsize) name_ea = 0;
     }
     if (name_ea && vm_base) {
@@ -457,9 +336,6 @@ static int64_t sys_spu_thread_group_create_handler(ppu_context* ctx)
 
     vm_write_be32(out_ea, g->id);
 
-    fprintf(stderr, "[SPU] group_create -> id=0x%X num=%u prio=%d type=0x%X name=%.31s\n",
-            g->id, num, prio, gtype, g->name);
-    fflush(stderr);
     ctx->gpr[3] = 0;
     return 0;
 }
@@ -476,8 +352,6 @@ static int64_t sys_spu_thread_initialize_handler(ppu_context* ctx)
 
     spu_group_t* g = spu_find_group(group_id);
     if (!g) {
-        fprintf(stderr, "[SPU] thread_init: group 0x%X not found\n", group_id);
-        fflush(stderr);
         ctx->gpr[3] = (uint64_t)(int64_t)-1;
         return -1;
     }
@@ -487,14 +361,12 @@ static int64_t sys_spu_thread_initialize_handler(ppu_context* ctx)
         return -1;
     }
     t->group_id = group_id;
-    t->index    = thread_num;
     t->img_ea   = img_ea;
     /* Read entry point from the SPU image struct if available.
-     * sys_spu_image layout: type/entry/segs/nsegs — entry at +4. */
+     * sys_spu_image layout: type/entry/segs/nsegs, entry at +4. */
     if (img_ea) t->entry_point = vm_read_be32(img_ea + 4);
     t->args_ea   = args_ea;
-    t->args_size = 0;  /* not known until decoder reads it; sys_spu_thread_args is 32 B */
-    /* Capture the 4 u64 args NOW (lv2 copy semantics — see struct note). */
+    /* Capture the 4 u64 args now (lv2 copy semantics; see struct note). */
     for (int a = 0; a < 4; a++) {
         uint64_t hi = args_ea ? vm_read_be32(args_ea + (uint32_t)a * 8)     : 0;
         uint64_t lo = args_ea ? vm_read_be32(args_ea + (uint32_t)a * 8 + 4) : 0;
@@ -506,20 +378,16 @@ static int64_t sys_spu_thread_initialize_handler(ppu_context* ctx)
 
     vm_write_be32(out_tid_ea, t->tid);
 
-    fprintf(stderr, "[SPU] thread_init group=0x%X index=%u img=0x%08X args=0x%08X -> tid=0x%X entry=0x%08X\n",
-            group_id, thread_num, img_ea, args_ea, t->tid, t->entry_point);
-    fflush(stderr);
     ctx->gpr[3] = 0;
     return 0;
 }
 
 /* ---------------------------------------------------------------------------
- * Real SPU execution (lifted images, e.g. Sony's SPURS kernel)
+ * Real SPU execution (lifted images, for example the SPURS kernel image)
  *
  * The thread's sys_spu_image segment table is deployed into a fresh
  * 256 KB local store, args land in gpr[3..6] (one 64-bit value each, in
- * the preferred doubleword — RPCS3 sys_spu.cpp: gpr[3+i] = from64(0,
- * arg[i])), pc = entry, and the lifted code runs until it stops. The
+ * the preferred doubleword), pc = entry, and the lifted code runs until it stops. The
  * lifted code tail-calls between functions; the host thread gets a large
  * stack in case the compiler does not collapse a long chain.
  * -----------------------------------------------------------------------*/
@@ -542,7 +410,6 @@ extern _Thread_local char*    g_spu_stack_base;
 
 static void spu_deploy_image(spu_context* sctx, uint32_t img_ea)
 {
-    extern uint8_t* vm_base;
     uint32_t segs_ea = vm_read_be32(img_ea + 0x8);
     int32_t  nsegs   = (int32_t)vm_read_be32(img_ea + 0xC);
     for (int32_t i = 0; i < nsegs && segs_ea; i++) {
@@ -567,23 +434,11 @@ static void* spu_exec_thread_proc(void* arg)
     spu_thread_t* t = (spu_thread_t*)arg;
     spu_context* sctx = t->sctx;
 
-    /* s42 YZ_SPU_LOCKSTEP: register at thread entry, BEFORE any lifted SPU
-     * code runs -- yz_lockstep_register blocks until this ctx actually holds
-     * the run token. No-op when YZ_SPU_LOCKSTEP is unset. */
-    if (g_yz_runtime_config.spu_lockstep)
-        yz_lockstep_register(sctx);
-
 #ifdef _WIN32
-    /* pt35e: reserve stack so the unhandled-exception filter (yz_crash_handler) can
-     * still RUN on a STACK OVERFLOW. The SPURS dispatch overflows via a brsl call/return
-     * nesting imbalance; without this the process dies silently (no [crash] dump, so the
-     * recursion is invisible). 512 KB is plenty for the handler's trampoline-ring dump,
-     * which reveals the repeating recursion cycle. */
+    /* Reserve stack so the unhandled-exception filter can still run on a
+     * stack overflow. */
     { ULONG guarantee = 512 * 1024; SetThreadStackGuarantee(&guarantee); }
 #endif
-
-    fprintf(stderr, "[SPU] tid=0x%X RUNNING lifted image entry=0x%05X\n",
-            t->tid, sctx->pc);
 
     sctx->status = SPU_STATUS_RUNNING;
     jmp_buf halt_jb, restart_jb;
@@ -610,23 +465,12 @@ static void* spu_exec_thread_proc(void* arg)
     g_spu_stack_base = 0;
     g_spu_trampoline_fn = 0;
 
-    /* s42 YZ_SPU_LOCKSTEP: unregister in the outermost frame -- this thread is
-     * really done running lifted SPU code (the context-replacement/restart
-     * longjmp above re-enters at `restart_jb`, INSIDE the setjmp block, so it
-     * never reaches here without a genuine halt/stop). No-op when unset. */
-    if (g_yz_runtime_config.spu_lockstep)
-        yz_lockstep_unregister(sctx);
-
-    fprintf(stderr, "[SPU] tid=0x%X stopped (status=0x%X pc=0x%05X code=0x%X)\n",
-            t->tid, sctx->status, sctx->pc, sctx->stop_code);
-    fflush(stderr);
-
-    /* F18: surface the real SPU exit status instead of hardcoding 0. The SPU-side
-     * sys_spu_thread_exit ABI writes the status to SPU_WrOutMbox, then executes
-     * stop 0x102 (THREAD_EXIT); lv2 pops that mailbox value as the exit status.
-     * The 14-bit stop code (sctx->stop_code) is only the dispatch selector, NOT
-     * the status itself (CBEA p97 SPU_Status.StopCode). 0x102 THREAD_EXIT ->
-     * this thread's status; 0x101 GROUP_EXIT -> the group's status. specaudit F18. */
+    /* Surface the real SPU exit status. The SPU-side sys_spu_thread_exit ABI
+     * writes the status to SPU_WrOutMbox, then executes stop 0x102
+     * (THREAD_EXIT); lv2 pops that mailbox value as the exit status. The
+     * 14-bit stop code (sctx->stop_code) is only the dispatch selector, not
+     * the status itself (SPU_Status.StopCode). 0x102 THREAD_EXIT ->
+     * this thread's status; 0x101 GROUP_EXIT -> the group's status. */
     if (sctx->status == SPU_STATUS_STOPPED_BY_STOP &&
         sctx->stop_code == 0x102u /* THREAD_EXIT */ && sctx->ch_out_mbox.count) {
         t->exit_status = (int32_t)sctx->ch_out_mbox.value;   /* guest-written status */
@@ -636,76 +480,19 @@ static void* spu_exec_thread_proc(void* arg)
         spu_group_t* grp = spu_find_group(t->group_id);
         if (grp) {
             grp->exit_status = (int32_t)sctx->ch_out_mbox.value;
-            /* s23 conformance fix: record the GROUP_EXIT cause so group_join
-             * reports SYS_SPU_THREAD_GROUP_JOIN_GROUP_EXIT, not the generic
-             * ALL_THREADS_EXIT. The join handler used to overwrite g->cause
-             * unconditionally, so a game-initiated sys_spu_thread_group_exit()
-             * was indistinguishable from natural all-threads completion (the
-             * platform Lv2 reference, local notes; RPCS3 sys_spu.h:297 join_state). */
+            /* Record the GROUP_EXIT cause so group_join reports
+             * SYS_SPU_THREAD_GROUP_JOIN_GROUP_EXIT, not the generic
+             * ALL_THREADS_EXIT; a game-initiated sys_spu_thread_group_exit()
+             * must stay distinguishable from natural all-threads completion. */
             grp->cause = SPU_GROUP_CAUSE_GROUP_EXIT;
         }
         sctx->ch_out_mbox.count = 0;
         t->exit_status = 0;
     } else {
-        /* Anything that stops the thread outside the documented THREAD_EXIT/
-         * GROUP_EXIT protocol -- STOPPED_BY_HALT (spu_channels.c's fault
-         * unwind for a bad dispatch/unknown branch) or STOPPED_BY_STOP with
-         * any other stop code -- is the SPU-exception class
-         * (SYS_SPU_THREAD_GROUP_EVENT_EXCEPTION). s33 conformance fix: post
-         * that event to the group's EXCEPTION slot if one is connected,
-         * instead of silently swallowing the fault. Contract:
-         * source=EXCEPTION_KEY, data1=group_id<<32|thread_id,
-         * data2=NPC<<32|cause, data3=option. We have sctx->pc for NPC
-         * (best-effort: the value at halt time, not a captured SPU SRR0);
-         * we do NOT have an oracle-verified numeric encoding for `cause`
-         * (not defined in RPCS3's in-repo sys_spu.h) or `option`, so those
-         * are zeroed rather than guessed. This is a minimal
-         * one-post-per-fault observability hookup, not a full
-         * exception-cause classifier. */
+        /* Any other stop (halt, an unresolved branch, or another stop code)
+         * ends the thread with status 0. SPU faults are not delivered to
+         * guest exception handlers. */
         t->exit_status = 0;
-        if (!spu_et_legacy()) {
-            spu_group_t* grp = spu_find_group(t->group_id);
-            if (grp && grp->event_queue_exception) {
-                /* Host-side observability: ALWAYS say the fault happened
-                 * (lowercase tag on purpose -- golden_boot.ps1's exceptions
-                 * counter greps for "EXCEPTION", which must keep meaning
-                 * host/guest crashes, not this probe). */
-                /* Wording note: golden_boot.ps1 counts real crashes by a
-                 * case-INSENSITIVE grep for "EXCEPTION" -- this probe line
-                 * must not contain that word in any case. */
-                fprintf(stderr, "[spu-exc] tid=0x%X group=0x%X fault, exc-evt queue "
-                        "connected (status=0x%X code=0x%X pc=0x%05X)\n",
-                        t->tid, t->group_id, sctx->status, sctx->stop_code, sctx->pc);
-                fflush(stderr);
-                /* GUEST-VISIBLE delivery is opt-in (YZ_SPU_EXC_EVT=1) for
-                 * now: every SPU fault we currently see is an EMULATION
-                 * artifact that the task resume machinery heals -- on real
-                 * hardware these never happen, so the game's handler never
-                 * runs during boot. First live delivery (golden, 2026-07-11)
-                 * proved the plumbing works: Sony's default SPURS handler
-                 * received the event and printed its diagnostic dump. But
-                 * feeding the game our internal recoverable hiccups is
-                 * unfaithful noise and risks the handler fighting the
-                 * resurrection path. Flip the default once SPU faults are
-                 * real guest faults (i.e. the death classes are extinct). */
-                static int exc_evt = -1;
-                if (exc_evt < 0) {
-                    exc_evt = getenv("YZ_SPU_EXC_EVT") ? 1 : 0;
-                    if (exc_evt) {
-                        fprintf(stderr, "[spu-exc] ARMED (YZ_SPU_EXC_EVT): guest-visible "
-                                "exc-event delivery ON\n");
-                        fflush(stderr);
-                    }
-                }
-                if (exc_evt) {
-                    uint64_t data1 = ((uint64_t)t->group_id << 32) | (uint64_t)t->tid;
-                    uint64_t data2 = (uint64_t)sctx->pc << 32; /* cause: unmapped, zeroed */
-                    sys_event_queue_push_by_id(grp->event_queue_exception,
-                                               SYS_SPU_THREAD_GROUP_EVENT_EXCEPTION_KEY,
-                                               data1, data2, 0 /* option: unmapped */);
-                }
-            }
-        }
     }
 #ifdef _WIN32
     t->running = 0;
@@ -731,7 +518,7 @@ static void* spu_fallback_thread_proc(void* arg)
     spu_thread_t* t = (spu_thread_t*)arg;
     int32_t rc = 0;
     if (t->fb_handler) {
-        rc = t->fb_handler(t->tid, t->args_ea, t->args_size, t->fb_user);
+        rc = t->fb_handler(t->tid, t->args_ea, 0, t->fb_user);
     }
     t->exit_status = rc;
     /* Mark complete and signal anyone waiting in group_join. */
@@ -763,7 +550,6 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
      * a fallback complete instantly with status 0.
      * group_join() blocks until all spawned host threads finish. */
     int spawned = 0;
-    int instant = 0;
     for (uint32_t i = 0; i < g->num_threads && i < 8; i++) {
         uint32_t idx = g->thread_indices[i];
         if (idx >= MAX_SPU_THREADS) continue;
@@ -779,13 +565,8 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
                 memset(sctx, 0, sizeof(*sctx));
                 sctx->spu_id       = t->tid;
                 sctx->spu_group_id = id;
-                /* s24: every group thread starts IN the SPURS kernel — adopt
-                 * the kernel's own image id explicitly. The old default 0
-                 * collided with gs_task's registration (image 0 = the
-                 * wildcard), so a wild kernel-era branch resolved into
-                 * gs_task's dense lift and the tid-0x2004 deaths were
-                 * mis-attributed (adoption-trace analysis, ledger #34/#49).
-                 * 16 = kernel image, registered in yakuza/main.cpp. */
+                /* Group threads start in image 16; image 0 is the wildcard
+                 * image id. */
                 sctx->image_id     = 16;
                 if (t->img_ea) spu_deploy_image(sctx, t->img_ea);
                 /* args captured at thread_initialize -> gpr[3..6]
@@ -795,21 +576,11 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
                     sctx->gpr[3 + a]._u32[1] = (uint32_t)t->args[a];
                 }
                 sctx->pc = t->entry_point & SPU_LS_MASK;
-                /* s23 conformance fix: START THE DECREMENTER. This live path
-                 * builds sctx via memset and never calls spu_context_init(), so
-                 * every real lifted SPU thread was getting dec_running=0 /
-                 * dec_start_tb=0 -- every `rdch SPU_RdDec` frozen at 0 forever
-                 * (13 read sites, 0 WrDec writes in the lifted images per
-                 * specaudit_spu.md F21). Spec: the decrementer counts from thread
-                 * creation (CBEA v1.02 Section 9.7; RPCS3 SPUThread.cpp:1313-1315
-                 * starts it at cpu_init). Mirror spu_context_init's three lines
-                 * here. Kill-switch YZ_NO_SPUDEC (behavioral: it feeds SPURS
-                 * timing, so A/B it against the frontier). */
-                { static int nd = -1; if (nd < 0) { nd = getenv("YZ_NO_SPUDEC") ? 1 : 0;
-                    fprintf(stderr, "[spudec] armed (decrementer start %s)\n",
-                            nd ? "DISABLED by YZ_NO_SPUDEC" : "on"); }
-                  if (!nd) { sctx->dec_value = 0;
-                      sctx->dec_start_tb = ppu_timebase_now(); sctx->dec_running = 1; } }
+                /* Start the decrementer as spu_context_init does; it counts
+                 * from thread creation. */
+                sctx->dec_value = 0;
+                sctx->dec_start_tb = ppu_timebase_now();
+                sctx->dec_running = 1;
                 t->running = 1;
 #ifdef _WIN32
                 if (!t->finish_event)
@@ -828,13 +599,6 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
                 t->finish_event.done = 0;
                 pthread_create(&t->host_thread, NULL, spu_exec_thread_proc, t);
 #endif
-                fprintf(stderr, "[SPU] group_start id=0x%X tid=0x%X entry=0x%08X "
-                        "args=0x%08X -> REAL SPU execution "
-                        "(arg1=0x%08X%08X arg2=0x%08X%08X arg3=0x%08X%08X)\n",
-                        id, t->tid, t->entry_point, t->args_ea,
-                        sctx->gpr[3]._u32[0], sctx->gpr[3]._u32[1],
-                        sctx->gpr[4]._u32[0], sctx->gpr[4]._u32[1],
-                        sctx->gpr[5]._u32[0], sctx->gpr[5]._u32[1]);
                 spawned++;
                 continue;
             }
@@ -845,7 +609,6 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
         if (!fb) {
             t->exit_status = 0;
             t->running = 0;
-            instant++;
             continue;
         }
         t->fb_handler = fb;
@@ -864,8 +627,6 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
         t->finish_event.done = 0;
         pthread_create(&t->host_thread, NULL, spu_fallback_thread_proc, t);
 #endif
-        fprintf(stderr, "[SPU] group_start id=0x%X tid=0x%X entry=0x%08X args=0x%08X -> spawned host thread\n",
-                id, t->tid, t->entry_point, t->args_ea);
         spawned++;
     }
 
@@ -873,13 +634,7 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
         g->state = SPU_GROUP_STATE_STOPPED;
         g->cause = SPU_GROUP_CAUSE_ALL_THREADS_EXIT;
         g->exit_status = 0;
-        fprintf(stderr, "[SPU] group_start id=0x%X (no fallback for any of %u thread(s); instantly completed)\n",
-                id, g->num_threads);
-    } else {
-        fprintf(stderr, "[SPU] group_start id=0x%X (%d host threads running, %d instant)\n",
-                id, spawned, instant);
     }
-    fflush(stderr);
     ctx->gpr[3] = 0;
     return 0;
 }
@@ -893,18 +648,14 @@ static int64_t sys_spu_thread_group_join_handler(ppu_context* ctx)
 
     spu_group_t* g = spu_find_group(id);
     if (!g) {
-        /* Unknown group id — Sony returns CELL_ESRCH but we've seen
-         * games probe with stale IDs, so be lenient and fake a success. */
+        /* Unknown group ids are treated as an already-completed group. */
         vm_write_be32(cause_ea,  SPU_GROUP_CAUSE_ALL_THREADS_EXIT);
         vm_write_be32(status_ea, 0);
-        fprintf(stderr, "[SPU] group_join id=0x%X (unknown, faked ok)\n", id);
-        fflush(stderr);
         ctx->gpr[3] = 0;
         return 0;
     }
 
-    /* Batch fixes item 10 (RPCS3 sys_spu.cpp:1654-1658): only one thread may
-     * be joined on a group at a time. */
+    /* Only one thread may be joined on a group at a time. */
     if (g->joiner) {
         ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)CELL_EBUSY;
         return (int64_t)(int32_t)CELL_EBUSY;
@@ -919,7 +670,7 @@ static int64_t sys_spu_thread_group_join_handler(ppu_context* ctx)
     }
 
     /* Wait for any host-thread fallbacks to finish, then collect the
-     * worst exit status. Real SPU group_join is a blocking syscall —
+     * worst exit status. Real SPU group_join is a blocking syscall;
      * games rely on it to know all SPU work is done before reading
      * back results. */
     if (g->state == SPU_GROUP_STATE_RUNNING) {
@@ -950,40 +701,23 @@ static int64_t sys_spu_thread_group_join_handler(ppu_context* ctx)
             if (t->exit_status < worst) worst = t->exit_status;
         }
         g->exit_status = worst;
-        /* s23 conformance fix: only DEFAULT to ALL_THREADS_EXIT. If a thread
-         * reported GROUP_EXIT (or a terminate set TERMINATED) the exit
-         * dispatcher already set g->cause -- don't clobber it. cause==0 is the
-         * unset sentinel (GROUP_EXIT=1/ALL_THREADS_EXIT=2/TERMINATED=4). */
+        /* Only default to ALL_THREADS_EXIT. If a thread reported GROUP_EXIT
+         * (or a terminate set TERMINATED) the exit dispatcher already set
+         * g->cause; don't clobber it. cause==0 is the unset sentinel
+         * (GROUP_EXIT=1/ALL_THREADS_EXIT=2/TERMINATED=4). */
         if (g->cause != SPU_GROUP_CAUSE_GROUP_EXIT &&
             g->cause != SPU_GROUP_CAUSE_TERMINATED)
             g->cause   = SPU_GROUP_CAUSE_ALL_THREADS_EXIT;
         g->state       = SPU_GROUP_STATE_STOPPED;
     }
 
-    /* Notify the RUN-slot event queue only. Real PS3 sends the SPU Thread
-     * Group Run Event (SYS_SPU_THREAD_GROUP_EVENT_RUN) here, per Lv2
-     * Reference p.148: source=RUN_KEY, data1=SPU thread group ID,
-     * data2=N/A, data3=N/A. PPU code blocked in sys_event_queue_receive on
-     * event_queue_run wakes up here.
-     *
-     * s33 conformance fix: this used to push to whatever single queue_id
-     * was connected regardless of the et the game asked for, and packed
-     * (exit_status, cause) into data1/data2 -- neither matches the spec's
-     * (group id, N/A, N/A) shape, and a queue connected for et=EXCEPTION
-     * (observed live: SPURS kernel group 0x1000 requests et=2) got this
-     * RUN-tagged event instead of nothing. Now only event_queue_run is
-     * notified, with the spec's data1=group id.
-     *
-     * Audit sec.5 item 5 (2026-07-03, user-confirmed) established the
-     * RUN_KEY source value itself -- RPCS3 sys_spu.h:42/311 +
-     * sys_spu.cpp:1266 (group->send_run_event()) sends via `ep_run` with
-     * source=RUN_KEY (0xFFFFFFFF53505500, sys_spu.h:42). SPURS uses the
-     * separate user-key event path instead of this group-event path, so
-     * this event's consumers (if any) are non-SPURS PPU-side wrappers. */
+    /* Notify the RUN-slot event queue only: source=RUN_KEY, data1 = group id,
+     * data2/data3 unused. PPU code blocked in sys_event_queue_receive on
+     * event_queue_run wakes up here. */
     if (g->event_queue_run) {
         sys_event_queue_push_by_id(g->event_queue_run,
                                    SYS_SPU_THREAD_GROUP_EVENT_RUN_KEY,
-                                   (uint64_t)id,  /* data1 = group id (RPCS3 send_run_event) */
+                                   (uint64_t)id,  /* data1 = group id */
                                    0,             /* data2 = N/A */
                                    0);            /* data3 = N/A */
     }
@@ -991,9 +725,6 @@ static int64_t sys_spu_thread_group_join_handler(ppu_context* ctx)
     vm_write_be32(cause_ea,  g->cause);
     vm_write_be32(status_ea, (uint32_t)g->exit_status);
 
-    fprintf(stderr, "[SPU] group_join id=0x%X cause=%u status=%d (event_queue_run=0x%X)\n",
-            id, g->cause, g->exit_status, g->event_queue_run);
-    fflush(stderr);
     g->joiner = 0;
     ctx->gpr[3] = 0;
     return 0;
@@ -1009,13 +740,14 @@ static int64_t sys_spu_thread_group_destroy_handler(ppu_context* ctx)
             uint32_t idx = g->thread_indices[i];
             if (idx < MAX_SPU_THREADS) {
                 spu_thread_t* t = &s_spu_threads[idx];
-                /* Free the MFC context-registry slot (runtime/spu/spu_channels.c
-                 * s_mfc_slots) keyed on this thread's spu_context pointer -- the
-                 * registry never cleared it before, so SPU_MAX_CONTEXTS
-                 * destroy/create cycles exhausted the registry and pushed every
+                /* Free the MFC context-registry slot
+                 * (runtime/spu/spu_channels.c s_mfc_slots) keyed on this
+                 * thread's spu_context pointer. Without this, SPU_MAX_CONTEXTS
+                 * destroy/create cycles exhaust the registry and push every
                  * later context onto the shared-state-hazard fallback engine.
                  * No-op if this thread never registered (e.g. it only ever ran
-                 * a PPU fallback, or was destroyed before its first MFC access). */
+                 * a PPU fallback, or was destroyed before its first MFC
+                 * access). */
                 spu_mfc_unregister(t->sctx);
                 if (t->local_store) {
                     free(t->local_store);
@@ -1026,8 +758,6 @@ static int64_t sys_spu_thread_group_destroy_handler(ppu_context* ctx)
         }
         g->in_use = 0;
     }
-    fprintf(stderr, "[SPU] group_destroy id=0x%X\n", id);
-    fflush(stderr);
     ctx->gpr[3] = 0;
     return 0;
 }
@@ -1043,8 +773,6 @@ static int64_t sys_spu_thread_group_terminate_handler(ppu_context* ctx)
         g->cause = SPU_GROUP_CAUSE_TERMINATED;
         g->exit_status = status;
     }
-    fprintf(stderr, "[SPU] group_terminate id=0x%X status=%d\n", id, status);
-    fflush(stderr);
     ctx->gpr[3] = 0;
     return 0;
 }
@@ -1063,9 +791,8 @@ static int64_t sys_spu_thread_get_exit_status_handler(ppu_context* ctx)
         return -1;
     }
     if (t->running) {
-        /* Still in flight — Sony's behaviour. Games that want the exit code
-         * synchronously should call group_join first. */
-        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x8001000F; /* CELL_ESTAT (was 0x80010003 = ENOSYS) */
+        /* Returns CELL_ESTAT while the thread runs; join the group first. */
+        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x8001000F; /* CELL_ESTAT */
         return -1;
     }
     vm_write_be32(status_ea, (uint32_t)t->exit_status);
@@ -1073,7 +800,7 @@ static int64_t sys_spu_thread_get_exit_status_handler(ppu_context* ctx)
     return 0;
 }
 
-/* sys_spu_thread_set_argument(tid, arg_ea) — doesn't affect us, log only */
+/* sys_spu_thread_set_argument(tid, arg_ea) */
 static int64_t sys_spu_thread_set_argument_handler(ppu_context* ctx)
 {
     uint32_t tid    = (uint32_t)ctx->gpr[3];
@@ -1081,7 +808,7 @@ static int64_t sys_spu_thread_set_argument_handler(ppu_context* ctx)
 
     /* Update the per-thread args pointer so any registered PPU fallback
      * picks it up at sys_spu_thread_group_start time. The shape of the
-     * struct at arg_ea is whatever the game registered for — typically
+     * struct at arg_ea is whatever the game registered for, typically
      * a packed (arg1,arg2,arg3,arg4) tuple of 4 u64s on real SPUs. */
     spu_thread_t* t = spu_find_thread(tid);
     if (t) {
@@ -1093,24 +820,16 @@ static int64_t sys_spu_thread_set_argument_handler(ppu_context* ctx)
         }
     }
 
-    fprintf(stderr, "[SPU] thread_set_argument tid=0x%X arg=0x%08X\n",
-            tid, arg_ea);
-    fflush(stderr);
     ctx->gpr[3] = 0;
     return 0;
 }
 
 /* sys_spu_thread_group_connect_event(group_id, queue_id, event_type)
  *
- * s33 conformance fix (oracle: RPCS3 sys_spu.cpp connect_event): et selects
- * one of three INDEPENDENT event sources (RUN / EXCEPTION / SYSTEM_MODULE),
- * each with its own connection slot. Previously this handler never read
- * gpr[5] (et) at all and stored a single collapsed queue id, so an
- * EXCEPTION-only connect (observed live: SPURS kernel group 0x1000 requests
- * et=2 during boot) shared the same slot as a RUN connect and got RUN-tagged
- * "group stopped" events instead of exception data. Contract: EINVAL for an
- * invalid et, EBUSY if that specific source is already connected.
- * YZ_SPU_ET_LEGACY=1 restores the old single-slot behavior. */
+ * gpr[5] (et) selects one of three independent event sources (RUN /
+ * EXCEPTION / SYSTEM_MODULE), each with its own connection slot. Contract:
+ * EINVAL for an invalid et, EBUSY if that specific source is already
+ * connected. */
 static int64_t sys_spu_thread_group_connect_event_handler(ppu_context* ctx)
 {
     uint32_t group_id = (uint32_t)ctx->gpr[3];
@@ -1123,35 +842,23 @@ static int64_t sys_spu_thread_group_connect_event_handler(ppu_context* ctx)
     }
     uint32_t* slot = spu_group_event_slot(g, et);
     if (!slot) {
-        fprintf(stderr, "[SPU] group_connect_event group=0x%X queue=0x%X et=%u INVALID\n",
-                group_id, queue_id, et);
-        fflush(stderr);
         ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)CELL_EINVAL;
         return -1;
     }
     if (*slot) {
-        fprintf(stderr, "[SPU] group_connect_event group=0x%X et=%u EBUSY "
-                "(queue=0x%X already connected)\n", group_id, et, *slot);
-        fflush(stderr);
         ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)CELL_EBUSY;
         return -1;
     }
     *slot = queue_id;
-    fprintf(stderr, "[SPU] group_connect_event group=0x%X queue=0x%X et=%u\n",
-            group_id, queue_id, et);
-    fflush(stderr);
     ctx->gpr[3] = 0;
     return 0;
 }
 
 /* sys_spu_thread_group_connect_event_all_threads(group_id, queue_id, req, spup)
  * (syscall 251). req = bitmask of allowed SPU ports; allocate the first free port
- * in req, bind the queue to it (per group), and WRITE the chosen port number to the
- * *spup out-param (u8). The caller (libsre/libmixer) uses that port to identify
- * SPU-emitted class-2 events. Our prior handler ignored req + never wrote *spup, so
- * the caller got a garbage port -> SPU<->PPU event routing was broken -> libmixer's
- * setup never completed (no cellAudioPortStart) and the CRI player stalled.
- * Matches RPCS3 sys_spu.cpp:sys_spu_thread_group_connect_event_all_threads. */
+ * in req, bind the queue to it (per group), and write the chosen port number to the
+ * *spup out-param (u8). The caller uses that port to identify SPU-emitted
+ * class-2 events. */
 static int64_t sys_spu_thread_group_connect_event_all_threads_handler(ppu_context* ctx)
 {
     uint32_t group_id = (uint32_t)ctx->gpr[3];
@@ -1166,13 +873,9 @@ static int64_t sys_spu_thread_group_connect_event_all_threads_handler(ppu_contex
         if (!(req & (1ull << p))) continue;
         if (g->spup_queue[p] == 0) { port = p; break; }
     }
-    if (port < 0) { ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010015; return -1; } /* CELL_EISCONN (was 0x8001000C = EABORT) */
+    if (port < 0) { ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010015; return -1; } /* CELL_EISCONN */
     g->spup_queue[port] = queue_id;
     if (spup_ea) vm_write8(spup_ea, (uint8_t)port);   /* the out-param the caller reads */
-    fprintf(stderr, "[SPU] group_connect_event_all_threads group=0x%X queue=0x%X "
-            "req=0x%llX -> port=%d (spup@0x%X)\n", group_id, queue_id,
-            (unsigned long long)req, port, spup_ea);
-    fflush(stderr);
     ctx->gpr[3] = 0;
     return 0;
 }
@@ -1180,8 +883,8 @@ static int64_t sys_spu_thread_group_connect_event_all_threads_handler(ppu_contex
 /* sys_spu_thread_group_disconnect_event_all_threads(group_id, spup)
  * (syscall 252). The port binding installed by syscall 251 is shared by all
  * threads in our group model, so clearing the group slot is equivalent to
- * clearing that port on every member. RPCS3/CellOS return EINVAL for ports
- * outside 0..63 and ESRCH for a stale group id. */
+ * clearing that port on every member. Ports outside 0..63 return EINVAL and
+ * a stale group id returns ESRCH. */
 static int64_t sys_spu_thread_group_disconnect_event_all_threads_handler(
     ppu_context* ctx)
 {
@@ -1196,23 +899,14 @@ static int64_t sys_spu_thread_group_disconnect_event_all_threads_handler(
         ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)CELL_ESRCH;
         return (int64_t)(int32_t)CELL_ESRCH;
     }
-    const uint32_t queue_id = g->spup_queue[spup];
     g->spup_queue[spup] = 0;
-    fprintf(stderr,
-            "[SPU] group_disconnect_event_all_threads group=0x%X "
-            "port=%u queue=0x%X\n",
-            group_id, spup, queue_id);
-    fflush(stderr);
     ctx->gpr[3] = 0;
     return 0;
 }
 
-/* sys_spu_thread_group_disconnect_event(id, et) -- takes et as its second
- * argument (same source-type enum as connect_event; oracle: RPCS3
- * sys_spu.cpp disconnect_event); s33 conformance fix: read gpr[4]=et and
- * clear only that source's slot instead of the single collapsed queue id.
- * Under YZ_SPU_ET_LEGACY, et is ignored and the one legacy slot is cleared,
- * matching the old behavior. */
+/* sys_spu_thread_group_disconnect_event(id, et): takes et as its second
+ * argument (same source-type enum as connect_event) and clears only that
+ * source's slot. */
 static int64_t sys_spu_thread_group_disconnect_event_handler(ppu_context* ctx)
 {
     uint32_t group_id = (uint32_t)ctx->gpr[3];
@@ -1222,16 +916,13 @@ static int64_t sys_spu_thread_group_disconnect_event_handler(ppu_context* ctx)
         uint32_t* slot = spu_group_event_slot(g, et);
         if (slot) *slot = 0;
     }
-    fprintf(stderr, "[SPU] group_disconnect_event group=0x%X et=%u\n", group_id, et);
-    fflush(stderr);
     ctx->gpr[3] = 0;
     return 0;
 }
 
 /* SPU virtual local store. Real hardware: 256 KB per SPU. We allocate on
  * first read/write so the common case (group with no LS access) doesn't
- * waste 256 KB × num_threads. */
-#define SPU_LS_SIZE  (256 * 1024)
+ * waste 256 KB x num_threads. */
 static uint8_t* spu_thread_get_or_alloc_ls(spu_thread_t* t)
 {
     if (!t) return NULL;
@@ -1258,7 +949,7 @@ static int64_t sys_spu_thread_write_ls_handler(ppu_context* ctx)
         return -1;
     }
     if (ls_offset + type > SPU_LS_SIZE) {
-        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x8001000D; /* CELL_EFAULT (was 0x80010002 = EINVAL) */
+        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x8001000D; /* CELL_EFAULT */
         return -1;
     }
     uint8_t* ls = spu_thread_get_or_alloc_ls(t);
@@ -1288,7 +979,6 @@ static int64_t sys_spu_thread_write_ls_handler(ppu_context* ctx)
 /* sys_spu_thread_read_ls(tid, ls_offset, *value_out, type) */
 static int64_t sys_spu_thread_read_ls_handler(ppu_context* ctx)
 {
-    extern uint8_t* vm_base;
     uint32_t tid       = (uint32_t)ctx->gpr[3];
     uint32_t ls_offset = (uint32_t)ctx->gpr[4];
     uint32_t value_ea  = (uint32_t)ctx->gpr[5];
@@ -1299,7 +989,7 @@ static int64_t sys_spu_thread_read_ls_handler(ppu_context* ctx)
         return -1;
     }
     if (ls_offset + type > SPU_LS_SIZE) {
-        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x8001000D; /* CELL_EFAULT (was 0x80010002 = EINVAL) */
+        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x8001000D; /* CELL_EFAULT */
         return -1;
     }
     uint8_t* ls = spu_thread_get_or_alloc_ls(t);
@@ -1307,7 +997,7 @@ static int64_t sys_spu_thread_read_ls_handler(ppu_context* ctx)
         ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010004;
         return -1;
     }
-    /* Big-endian load → write to guest as 8 bytes (always); the syscall
+    /* Big-endian load, written to the guest as 8 bytes; the syscall
      * is documented to write a u64 with the value zero-extended in the
      * high bits. */
     uint64_t value = 0;
@@ -1334,21 +1024,19 @@ static int64_t sys_spu_thread_read_ls_handler(ppu_context* ctx)
     return 0;
 }
 
-/* sys_spu_thread_write_snr (sc-184): tid, number (0/1), value.
+/* sys_spu_thread_write_snr: tid, number (0/1), value.
  * Writes an SPU Signal Notification Register. CBE Registers v1.5
- * (SPU_Sig_Notify_1/2): in OR mode (SPU_Cfg bit 0/1, sc-187) the value is
- * ORed into the pending register; in overwrite mode (default) it replaces
- * it. The SPU reads via RdSigNotify1/2 (read-and-clear; channel count = 1
- * while a value is pending). Was a silent no-op stub until 2026-07-03
- * (CBEA audit P8) -- every lv2-side signal was dropped.
- * NOTE: the SNR-write SPU event edge (CBEA event facility S1/S2 bits) is
- * not raised here -- consistent with the rest of the channel model (audit
- * F10, its own queued fix). */
+ * (SPU_Sig_Notify_1/2): in OR mode (SPU_Cfg bit 0/1, set by
+ * sys_spu_thread_set_spu_cfg) the value is ORed into the pending register;
+ * in overwrite mode (default) it replaces it. The SPU reads via RdSigNotify1/2 (read-and-clear; channel count = 1
+ * while a value is pending).
+ * The SNR-write SPU event edge (CBEA event facility S1/S2 bits) is not
+ * raised here, consistent with the rest of the channel model. */
 /* Global lock-line spinlock (defined runtime/spu/spu_channels.c, declared
  * locally the same way runtime/spu/spu_dma.h does, to avoid pulling that
  * header's whole MFC/DMA surface into this translation unit for two
- * function prototypes). See the FIX 1 comment below for why write_snr's
- * OR-mode path takes it. */
+ * function prototypes). See the comment in the handler below for why
+ * write_snr's OR-mode path takes it. */
 extern void spu_lockline_lock(void);
 extern void spu_lockline_unlock(void);
 
@@ -1369,59 +1057,23 @@ static int64_t sys_spu_thread_write_snr_handler(ppu_context* ctx)
     if (t->sctx) {
         spu_channel* ch = &t->sctx->ch_sig_notify[num];
         int or_mode = (t->spu_cfg >> num) & 1;
-        /* FIX 1 (2026-07-17, s43 review): serialize the whole
-         * check-count-then-mutate-value sequence against the SPU host
-         * thread's paired read-value-then-clear-count sequence
-         * (SPU_RdSigNotify1/2 in spu_rdch, spu_channels.c ~2135-2141) with
-         * the existing global lock-line spinlock (spu_dma.h
-         * spu_lockline_lock/unlock, already used for the analogous
-         * WrEventAck-vs-coherence-write race -- spu_channels.c SPU_WrEventAck,
-         * spu_context.h event_status comment).
-         *
-         * FIX 2 (2026-07-17) alone (count promoted to _Atomic uint32_t) does
-         * NOT close this race: `count` and `value` together form ONE
-         * compound mailbox slot (empty+count==0, or pending+count==1+
-         * value==X), and OR-mode's CBEA contract ("accumulate written bits
-         * until read-and-cleared") needs that whole slot updated as a unit.
-         * A lone atomic_fetch_or on value cannot provide that: if the SPU's
-         * spu_channel_read plain-reads value and release-stores count=0 in
-         * between this handler's count-check and its value mutation, the
-         * fetch_or still lands (bits are not lost from `value`), but it
-         * lands AFTER the reader already cleared count -- so `value` holds
-         * merged bits while count says "nothing pending", and the SPU never
-         * observes a pending signal for them (it already consumed the old
-         * value and has no reason to poll again). That is a silently lost
-         * SNR write, not a torn one, so promoting only `value` to atomic
-         * cannot fix it -- the check-then-act pair must be mutually
-         * exclusive with the reader's read-then-clear pair, hence the lock.
-         *
-         * memory_order_relaxed on the count check: the lock's
-         * acquire/release pair (spu_lockline_lock/unlock) already provides
-         * the happens-before edge for everything inside the critical
-         * section, same reasoning as SPU_WrEventAck's atomic_fetch_and
-         * under the same lock (spu_channels.c: "the lock keeps ordering
-         * correct, the atomic RMW keeps the operation itself a single
-         * indivisible op -- defense in depth, not a replacement for the
-         * lock"). `ch->value |= val` stays a plain RMW here: it is no
-         * longer raced against the reader now that both sides hold the
-         * lock, so promoting it to an atomic op would be pure overhead with
-         * no correctness benefit (nothing outside this lock touches
-         * ch_sig_notify's `value` field). */
+        /* The lock-line spinlock makes the check-count-then-update of the
+         * signal register atomic against the SPU thread's paired
+         * read-value-then-clear-count (SPU_RdSigNotify1/2 in spu_rdch), so
+         * an OR-mode write cannot land after the reader cleared the count.
+         * The lock also orders the relaxed count load and the plain
+         * `value |= val`. */
         spu_lockline_lock();
         if (or_mode && atomic_load_explicit(&ch->count, memory_order_relaxed))
             ch->value |= val;
         else
             spu_channel_write(ch, val);
         spu_lockline_unlock();
-        /* s39: this is the cross-thread producer for a blocked RdSigNotify1/2
+        /* This is the cross-thread producer for a blocked RdSigNotify1/2
          * (the SPU host thread parks in spu_ch_wait until count!=0). Wake it now
          * that the signal is pending; the store above is ordered before the wake
          * on x86 TSO, and the waiter re-polls every 10 ms as a safety net. */
         spu_ch_wake(t->sctx);
-        { static int n = 0; if (n < 12) { n++;
-            fprintf(stderr, "[SPU] write_snr tid=0x%X snr%u <- 0x%08X (%s)\n",
-                    tid, num + 1, val, or_mode ? "OR" : "overwrite");
-            fflush(stderr); } }
     }
     /* No live SPU context (thread never started as lifted code): accept and
      * drop, like real lv2 writing a problem-state register of a stopped SPU. */
@@ -1429,8 +1081,7 @@ static int64_t sys_spu_thread_write_snr_handler(ppu_context* ctx)
     return 0;
 }
 
-/* sys_spu_thread_set_spu_cfg (sc-187): tid, value (bits 0-1 = SNR1/SNR2 OR
- * mode). Was entirely absent from the syscall table (CBEA audit P8). */
+/* sys_spu_thread_set_spu_cfg: tid, value (bits 0-1 = SNR1/SNR2 OR mode). */
 static int64_t sys_spu_thread_set_spu_cfg_handler(ppu_context* ctx)
 {
     uint32_t tid = (uint32_t)ctx->gpr[3];
@@ -1458,30 +1109,11 @@ uint8_t* spu_thread_get_local_store(uint32_t tid)
 
 uint32_t spu_thread_local_store_size(void) { return SPU_LS_SIZE; }
 
-/* sys_spu_image_import(*img, *source, type) — just log entry & return success.
- * We could parse the SPU ELF header and write entry into the image struct,
- * but no real use without SPU execution; zero-initialize so downstream
- * reads see a valid-looking image. */
-static int64_t sys_spu_image_import_handler(ppu_context* ctx)
-{
-    extern uint8_t* vm_base;
-    uint32_t img_ea = (uint32_t)ctx->gpr[3];
-    uint32_t src_ea = (uint32_t)ctx->gpr[4];
-    if (img_ea && vm_base) {
-        memset(vm_base + img_ea, 0, 16);
-        /* sys_spu_image.type = 0 (SYS_SPU_IMAGE_TYPE_KERNEL), entry=0, segs=0, nsegs=0 */
-    }
-    fprintf(stderr, "[SPU] image_import img=0x%08X src=0x%08X\n", img_ea, src_ea);
-    fflush(stderr);
-    ctx->gpr[3] = 0;
-    return 0;
-}
-
-/* sys_spu_image_open(*img, *path) — load an SPU ELF from the VFS, parse its
+/* sys_spu_image_open(*img, *path): load an SPU ELF from the VFS, parse its
  * ELF32 header, and write the entry point + USER image type into the
- * sys_spu_image struct. The actual segment/code data isn't materialised
- * (we don't execute SPU); we only need entry to be correct so the SPU
- * PPU-fallback registry (ps3emu/spu_fallback.h) can match jobs by entry.
+ * sys_spu_image struct. The segment table is not materialised; only the
+ * entry point is filled in, which the lifted-code lookup and the PPU-fallback
+ * registry (ps3emu/spu_fallback.h) use to match jobs.
  *
  * sys_spu_image layout (16 bytes):
  *   +0  type    : u32  (0 = KERNEL, 1 = USER)
@@ -1491,7 +1123,6 @@ static int64_t sys_spu_image_import_handler(ppu_context* ctx)
  */
 static int64_t sys_spu_image_open_handler(ppu_context* ctx)
 {
-    extern uint8_t* vm_base;
     uint32_t img_ea  = (uint32_t)ctx->gpr[3];
     uint32_t path_ea = (uint32_t)ctx->gpr[4];
 
@@ -1501,8 +1132,6 @@ static int64_t sys_spu_image_open_handler(ppu_context* ctx)
     }
 
     if (!path_ea || !vm_base) {
-        fprintf(stderr, "[SPU] image_open img=0x%08X path=NULL — empty image\n", img_ea);
-        fflush(stderr);
         ctx->gpr[3] = 0;
         return 0;
     }
@@ -1513,11 +1142,10 @@ static int64_t sys_spu_image_open_handler(ppu_context* ctx)
 
     FILE* f = fopen(host_path, "rb");
     if (!f) {
-        fprintf(stderr, "[SPU] image_open img=0x%08X path='%s' (host: %s) — open failed\n",
+        fprintf(stderr, "[SPU] image_open img=0x%08X path='%s' (host: %s): open failed\n",
                 img_ea, ps3_path, host_path);
         fflush(stderr);
-        /* Sony returns CELL_ENOENT for missing SPU images. Games often
-         * pre-check, so a soft success keeps them moving. */
+        /* A missing image is reported as success with an empty image. */
         ctx->gpr[3] = 0;
         return 0;
     }
@@ -1532,9 +1160,7 @@ static int64_t sys_spu_image_open_handler(ppu_context* ctx)
     fclose(f);
 
     uint32_t entry = 0;
-    int valid_elf = 0;
     if (got >= 52 && hdr[0] == 0x7F && hdr[1] == 'E' && hdr[2] == 'L' && hdr[3] == 'F') {
-        valid_elf = 1;
         /* Big-endian on PS3 */
         entry = ((uint32_t)hdr[24] << 24) |
                 ((uint32_t)hdr[25] << 16) |
@@ -1546,9 +1172,6 @@ static int64_t sys_spu_image_open_handler(ppu_context* ctx)
         vm_write_be32(img_ea + 4, entry);
     }
 
-    fprintf(stderr, "[SPU] image_open img=0x%08X path='%s' entry=0x%08X%s\n",
-            img_ea, ps3_path, entry, valid_elf ? "" : " (header invalid — entry left 0)");
-    fflush(stderr);
     ctx->gpr[3] = 0;
     return 0;
 }
@@ -1557,13 +1180,10 @@ static int64_t sys_spu_image_open_handler(ppu_context* ctx)
 static int64_t sys_spu_thread_stub(ppu_context* ctx)
 {
     (void)ctx;
-    ctx->gpr[3] = 0;
     return 0;
 }
 
-/* sys_process_getpid (1) — lv2 returns 1 for the game process (RPCS3
- * sys_process.cpp: "sys_process_getpid() -> 1"; the real-HW trace shows
- * libsre calling get_sdk_version with pid=0x1). */
+/* sys_process_getpid (1): lv2 returns 1 for the game process. */
 static int64_t sys_process_getpid_handler(ppu_context* ctx)
 {
     ctx->gpr[3] = 1;
@@ -1571,8 +1191,8 @@ static int64_t sys_process_getpid_handler(ppu_context* ctx)
 }
 
 /* sys_process_get_sdk_version (25): (pid, u32* version). Writes the
- * process's toolchain version from PROC_PARAM (offset 0xC); the loader sets
- * g_ps3_sdk_version. Yakuza: Dead Souls = 0x350001 (RPCS3 ppu_loader). */
+ * process's toolchain version from PROC_PARAM (offset 0xC). Default used
+ * until the loader sets g_ps3_sdk_version from PROC_PARAM. */
 uint32_t g_ps3_sdk_version = 0x00350001;
 
 static int64_t sys_process_get_sdk_version_handler(ppu_context* ctx)
@@ -1594,8 +1214,7 @@ static int64_t sys_process_get_sdk_version_handler(ppu_context* ctx)
  * on the given effective address. SPURS calls this while validating its
  * management areas during initialization; a failure aborts SPURS init.
  *
- * Contract from RPCS3 sys_process.cpp process_is_spu_lock_line_reservation
- * _address(), mapped onto OUR guest layout: flags must be non-zero and
+ * Contract, mapped onto our guest layout: flags must be non-zero and
  * contain only the two SPU bits (else EINVAL); main memory, the sys_memory
  * window and RSX local memory are reservation-capable (OK); PPU stacks and
  * sys_vm regions are not (EPERM); anything unmapped is EINVAL. */
@@ -1626,34 +1245,31 @@ static int64_t sys_process_is_spu_lock_line_reservation_address(ppu_context* ctx
 }
 
 /* ---------------------------------------------------------------------------
- * lwmutex / lwcond KERNEL SLOW-PATH syscalls (sc 95-99, 111-117)
+ * lwmutex / lwcond kernel slow-path syscalls (sc 95-99, 111-117)
  *
- * Audit sec.6 (2026-07-03, user-confirmed): these numbers were defined in
- * lv2_syscall_table.h but never registered -- a lw primitive that needs to
- * fall through to the kernel (contended lock beyond the userspace fast
- * path, or a lwcond wait) would have hit the unimplemented-syscall handler.
- * MEASURED latent: 0 hits so far, because the actual guest entry point for
- * this game is sysPrxForUser::sys_lwmutex_* / sys_lwcond_* (a library
- * function bridge, import_bridges_gen.cpp), which is HLE'd in full in
+ * A lw primitive that needs to fall through to the kernel (contended lock
+ * beyond the userspace fast path, or a lwcond wait) issues these syscalls.
+ * They are currently not reached: the guest entry point for this game is
+ * sysPrxForUser::sys_lwmutex_* / sys_lwcond_* (the sysPrxForUser library
+ * bridge), which is HLE'd in full in
  * libs/system/sysPrxForUser.c and does its own userspace fast-path +
  * blocking without ever executing the raw `sc N` instructions below. These
- * exist for completeness/robustness (any code path that DOES issue the raw
+ * exist for completeness/robustness (any code path that does issue the raw
  * syscall, e.g. a differently-linked toolchain routine) and are independent
  * kernel objects distinct from that HLE's tables.
  *
- * Faithful subset of the RPCS3 contract (sys_lwmutex.cpp / sys_lwcond.cpp):
- * create validates protocol; destroy refuses EBUSY while held; lock/trylock/
- * unlock implement ordinary (non-fast-path) mutex semantics; lwcond wait
- * atomically releases the associated lwmutex and reacquires it on wake,
- * mirroring sys_cond_wait's now-corrected recursive-release handling
- * (audit item 1c) since a lwmutex can equally be SYS_SYNC_RECURSIVE
- * (has no separate "unlock2"/targeted-signal fast paths -- those are
+ * Contract subset: create validates protocol; destroy refuses EBUSY while
+ * held; lock/trylock/unlock implement ordinary (non-fast-path) mutex
+ * semantics; lwcond wait atomically releases the associated lwmutex and
+ * reacquires it on wake, releasing every recursion level the way
+ * sys_cond_wait does, since a lwmutex can equally be SYS_SYNC_RECURSIVE
+ * (there are no separate "unlock2"/targeted-signal fast paths; those are
  * userspace-only optimizations with no guest-visible kernel-object state
- * here). Signal/signal_all simply wake waiters; RPCS3's targeted
- * ppu_thread_id signal (_sys_lwcond_signal's 3rd arg) is honored on a
- * best-effort basis by ID equality since we don't have RPCS3's PPU sleep
- * queue -- broadcasting a superset of the intended wake target is safe
- * (spurious wakes retry their condition, same as sys_cond).
+ * here). Signal/signal_all simply wake waiters; the targeted
+ * ppu_thread_id signal (_sys_lwcond_signal's 3rd arg) is not honored
+ * because there is no PPU sleep queue, and broadcasting a superset of the
+ * intended wake target is safe (spurious wakes retry their condition, same
+ * as sys_cond).
  * -----------------------------------------------------------------------*/
 
 #define MAX_LW_KERNEL_MUTEX  256
@@ -1661,8 +1277,6 @@ static int64_t sys_process_is_spu_lock_line_reservation_address(ppu_context* ctx
 
 typedef struct {
     int      in_use;
-    uint32_t protocol;
-    int      recursive;      /* SYS_SYNC_RECURSIVE control->attribute bit (best-effort: caller-tracked) */
     uint64_t owner_tid;
     int      lock_count;
 #ifdef _WIN32
@@ -1674,7 +1288,6 @@ typedef struct {
 
 typedef struct {
     int      in_use;
-    uint32_t lwmutex_id;     /* 1-based index into s_lw_mutexes */
 #ifdef _WIN32
     CONDITION_VARIABLE cv;
 #else
@@ -1719,7 +1332,7 @@ static int64_t sys_lwmutex_create_syscall(ppu_context* ctx)
 {
     uint32_t id_out_ea = (uint32_t)ctx->gpr[3];
     uint32_t protocol  = (uint32_t)ctx->gpr[4];
-    /* control_ptr (gpr[5]), has_name (gpr[6]), name (gpr[7]) -- unused: the
+    /* control_ptr (gpr[5]), has_name (gpr[6]), name (gpr[7]) are unused: the
      * kernel object doesn't touch the guest control struct (userspace owns
      * the fast-path fields; see file header). */
 
@@ -1741,7 +1354,6 @@ static int64_t sys_lwmutex_create_syscall(ppu_context* ctx)
     lw_kernel_mutex_t* m = &s_lw_mutexes[slot];
     memset(m, 0, sizeof(*m));
     m->in_use   = 1;
-    m->protocol = protocol;
 #ifdef _WIN32
     InitializeCriticalSection(&m->cs);
 #else
@@ -1772,7 +1384,7 @@ static int64_t sys_lwmutex_destroy_syscall(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_ESRCH;
     }
     if (m->lock_count != 0) {
-        /* RPCS3 sys_lwmutex.cpp: refuses to destroy a held lwmutex. */
+        /* A held lwmutex cannot be destroyed. */
         ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)CELL_EBUSY;
         return (int64_t)(int32_t)CELL_EBUSY;
     }
@@ -1791,8 +1403,8 @@ static int64_t sys_lwmutex_lock_syscall(ppu_context* ctx)
 {
     uint32_t id      = (uint32_t)ctx->gpr[3];
     uint64_t timeout = ctx->gpr[4];
-    /* Batch fixes item 8: clamp the guest timeout to 48 bits so the QPC
-     * deadline multiply below can't overflow. */
+    /* Clamp the guest timeout to 48 bits so the QPC deadline multiply
+     * below can't overflow. */
     if (timeout > ((1ull << 48) - 1)) timeout = (1ull << 48) - 1;
     if (id == 0 || id > MAX_LW_KERNEL_MUTEX) {
         ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)CELL_ESRCH;
@@ -1808,9 +1420,8 @@ static int64_t sys_lwmutex_lock_syscall(ppu_context* ctx)
     if (timeout == 0) {
         EnterCriticalSection(&m->cs);
     } else {
-        /* Timed lock to a QPC deadline (same fix as sys_mutex_lock: the old
-         * GetTickCount/Sleep(1) loop overshot sub-ms timeouts by the ~15.6 ms
-         * timer tick). */
+        /* Timed lock to a QPC deadline (as in sys_mutex_lock), so sub-ms
+         * timeouts are not rounded up to the ~15.6 ms timer tick. */
         int64_t deadline = lv2_usec_deadline(timeout);
         while (!TryEnterCriticalSection(&m->cs)) {
             if (lv2_deadline_passed(deadline)) {
@@ -1924,7 +1535,6 @@ static int64_t sys_lwcond_create_syscall(ppu_context* ctx)
     lw_kernel_cond_t* c = &s_lw_conds[slot];
     memset(c, 0, sizeof(*c));
     c->in_use     = 1;
-    c->lwmutex_id = lwmutex_id;
 #ifdef _WIN32
     InitializeConditionVariable(&c->cv);
 #else
@@ -1953,18 +1563,18 @@ static int64_t sys_lwcond_destroy_syscall(ppu_context* ctx)
     return 0;
 }
 
-/* _sys_lwcond_queue_wait(lwcond_id, lwmutex_id, timeout_usec) -- syscall 113.
- * Mirrors sys_cond_wait's corrected recursive-release handling (audit item
- * 1c): release ALL of the caller's recursion levels on the associated
- * lwmutex before parking, restore the saved count on wake. */
+/* _sys_lwcond_queue_wait(lwcond_id, lwmutex_id, timeout_usec), syscall 113.
+ * Mirrors sys_cond_wait's recursive-release handling: release all of the
+ * caller's recursion levels on the associated lwmutex before parking,
+ * restore the saved count on wake. */
 static int64_t sys_lwcond_wait_syscall(ppu_context* ctx)
 {
     uint32_t cond_id    = (uint32_t)ctx->gpr[3];
     uint32_t lwmutex_id = (uint32_t)ctx->gpr[4];
     uint64_t timeout    = ctx->gpr[5];
 
-    /* Batch fixes item 8: clamp the guest timeout to 48 bits so the
-     * ms-DWORD conversion below can't overflow. */
+    /* Clamp the guest timeout to 48 bits so the ms-DWORD conversion
+     * below can't overflow. */
     if (timeout > ((1ull << 48) - 1)) timeout = (1ull << 48) - 1;
 
     if (cond_id == 0 || cond_id > MAX_LW_KERNEL_COND || !s_lw_conds[cond_id - 1].in_use) {
@@ -1989,8 +1599,8 @@ static int64_t sys_lwcond_wait_syscall(ppu_context* ctx)
     m->lock_count = 0;
 
 #ifdef _WIN32
-    /* Batch fixes item 8: never let a converted ms value land on 0xFFFFFFFF
-     * (INFINITE) -- cap at 0xFFFFFFFE. */
+    /* Never let a converted ms value land on 0xFFFFFFFF (INFINITE); cap at
+     * 0xFFFFFFFE. */
     DWORD ms;
     if (timeout == 0) {
         ms = INFINITE;
@@ -2041,9 +1651,9 @@ static int64_t sys_lwcond_wait_syscall(ppu_context* ctx)
     return 0;
 }
 
-/* _sys_lwcond_signal(lwcond_id, lwmutex_id, ppu_thread_id, mode) -- syscall
- * 115. We don't have RPCS3's PPU sleep queue to target one specific thread
- * id, so this broadcasts like signal_all; every waiter re-checks its own
+/* _sys_lwcond_signal(lwcond_id, lwmutex_id, ppu_thread_id, mode), syscall
+ * 115. There is no PPU sleep queue to target one specific thread id, so
+ * this broadcasts like signal_all; every waiter re-checks its own
  * condition on wake (same tolerance as a spurious wakeup), which is safe. */
 static int64_t sys_lwcond_signal_syscall(ppu_context* ctx)
 {
@@ -2061,7 +1671,7 @@ static int64_t sys_lwcond_signal_syscall(ppu_context* ctx)
     return 0;
 }
 
-/* _sys_lwcond_signal_all(lwcond_id, lwmutex_id, mode) -- syscall 116 */
+/* _sys_lwcond_signal_all(lwcond_id, lwmutex_id, mode), syscall 116 */
 static int64_t sys_lwcond_signal_all_syscall(ppu_context* ctx)
 {
     uint32_t cond_id = (uint32_t)ctx->gpr[3];
@@ -2092,11 +1702,10 @@ void lv2_register_all_syscalls(lv2_syscall_table* tbl)
     sys_semaphore_init(tbl);
     sys_rwlock_init(tbl);
 
-    /* lwmutex/lwcond KERNEL SLOW-PATH (audit sec.6, 2026-07-03,
-     * user-confirmed): previously defined in lv2_syscall_table.h but never
-     * registered -- see the handler block above for why they're latent
-     * (the game's actual entry point is the sysPrxForUser HLE library,
-     * not these raw syscalls) and the faithful-subset contract notes. */
+    /* lwmutex/lwcond kernel slow-path: see the handler block above for why
+     * these are currently not reached (the game's entry point is the
+     * sysPrxForUser HLE library, not these raw syscalls) and the contract
+     * notes. */
     lv2_syscall_register(tbl, SYS_LWMUTEX_CREATE,   sys_lwmutex_create_syscall);
     lv2_syscall_register(tbl, SYS_LWMUTEX_DESTROY,  sys_lwmutex_destroy_syscall);
     lv2_syscall_register(tbl, SYS_LWMUTEX_LOCK,     sys_lwmutex_lock_syscall);
@@ -2108,8 +1717,7 @@ void lv2_register_all_syscalls(lv2_syscall_table* tbl)
     lv2_syscall_register(tbl, SYS_LWCOND_SIGNAL,     sys_lwcond_signal_syscall);
     lv2_syscall_register(tbl, SYS_LWCOND_SIGNAL_ALL, sys_lwcond_signal_all_syscall);
 
-    /* Timer and time (registered before events so event handlers
-     * override the conflicting syscall numbers 141, 142, 145) */
+    /* Timer and time */
     sys_timer_init(tbl);
 
     /* Event queues, ports, and flags */
@@ -2127,13 +1735,12 @@ void lv2_register_all_syscalls(lv2_syscall_table* tbl)
     lv2_syscall_register(tbl, 25, sys_process_get_sdk_version_handler);
     lv2_syscall_register(tbl, 14, sys_process_is_spu_lock_line_reservation_address);
 
-    /* TTY (debug console I/O — used by CRT startup) */
+    /* TTY (debug console I/O, used by CRT startup) */
     lv2_syscall_register(tbl, SYS_TTY_READ,  sys_tty_read);
     lv2_syscall_register(tbl, SYS_TTY_WRITE, sys_tty_write);
 
-    /* SPU syscalls — we don't execute SPU code but the PPU-side wrappers
-     * need consistent IDs and out-params. See the stateful group tracker
-     * above for contract notes. */
+    /* SPU syscalls: see the stateful group tracker above for contract
+     * notes. */
     lv2_syscall_register(tbl, SYS_SPU_INITIALIZE,             sys_spu_initialize_handler);
     lv2_syscall_register(tbl, SYS_SPU_IMAGE_OPEN,             sys_spu_image_open_handler);
     lv2_syscall_register(tbl, SYS_SPU_IMAGE_CLOSE,            sys_spu_thread_stub);

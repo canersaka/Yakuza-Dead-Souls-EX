@@ -29,8 +29,6 @@ extern "C" {
 #define SYS_VM_INVALIDATE            308
 #define SYS_VM_STORE                 309
 #define SYS_VM_SYNC                  310
-#define SYS_VM_TEST                  311  /* not registered: out-struct layout unverified */
-#define SYS_VM_GET_STATISTICS        312  /* not registered: out-struct layout unverified */
 #define SYS_VM_MEMORY_MAP_DIFFERENT  313
 
 /* Guest address window handed out by sys_vm_memory_map. A process may hold

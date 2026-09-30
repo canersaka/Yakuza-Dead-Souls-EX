@@ -1,10 +1,10 @@
 /*
- * spu_fallback.c — registry implementation for PPU-side SPU job fallbacks.
+ * spu_fallback.c: registry implementation for PPU-side SPU job fallbacks.
  *
  * See ps3emu/spu_fallback.h for usage. The lookup is consulted by
  * sys_spu_thread_group_start_handler in lv2_register.c when starting a
- * group; matching threads spawn a host thread running the registered
- * handler instead of the default no-op completion.
+ * group, after the lifted-code lookup; matching threads spawn a host thread
+ * running the registered handler instead of completing immediately.
  */
 
 #include "ps3emu/spu_fallback.h"

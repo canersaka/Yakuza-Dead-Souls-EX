@@ -30,11 +30,9 @@ extern "C" {
 typedef struct sys_semaphore_info {
     int      active;
     uint32_t references; /* table-locked lifetime references held by syscalls */
-    char     name[8];
-    uint32_t protocol;
-    int32_t  value;      /* current count — THE single source of truth (s47) */
+    int32_t  value;      /* current count, the single source of truth */
     int32_t  max_value;
-    int32_t  waiters;    /* s47 lost-wake fix: threads parked in wait(); the
+    int32_t  waiters;    /* threads parked in wait(); the
                           * kernel sem is a pure wake channel, posts release
                           * min(count, waiters) tokens (spurious wakes benign,
                           * waiters re-check value under the lock) */

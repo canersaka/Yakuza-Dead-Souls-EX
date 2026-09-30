@@ -57,7 +57,7 @@ void cellSysutilQueueEvent(int slot, uint32_t status, uint32_t param)
 {
     int next = (s_event_tail + 1) % SYSUTIL_EVENT_QUEUE_SIZE;
     if (next == s_event_head) {
-        printf("[cellSysutil] event queue full — dropping status=0x%X\n", status);
+        printf("[cellSysutil] event queue full; dropping status=0x%X\n", status);
         return;
     }
     s_event_queue[s_event_tail].slot   = slot;
@@ -66,13 +66,8 @@ void cellSysutilQueueEvent(int slot, uint32_t status, uint32_t param)
     s_event_tail = next;
 }
 
-static s32 s_bgm_enabled = 1;
 static s32 s_bgm_status = CELL_SYSUTIL_BGMPLAYBACK_STATUS_STOP;
 static char s_cache_path[CELL_SYSCACHE_PATH_MAX];
-static int s_cache_mounted = 0;
-
-static void (*s_disc_change_cb)(void*) = NULL;
-static void* s_disc_change_arg = NULL;
 
 /* ---------------------------------------------------------------------------
  * Core callbacks & params
@@ -81,8 +76,8 @@ static void* s_disc_change_arg = NULL;
 s32 cellSysutilRegisterCallback(s32 slot, CellSysutilCallback func, void* userdata)
 {
     /* `func` and `userdata` are guest VM addresses; reinterpret without
-     * touching them. NULL func means "unregister this slot" — some games
-     * (notably flOw) call Register with func=NULL as a clear-on-poll. */
+     * touching them. NULL func means "unregister this slot"; some games call
+     * Register with func=NULL to clear the slot. */
     uint32_t func_addr     = (uint32_t)(uintptr_t)func;
     uint32_t userdata_addr = (uint32_t)(uintptr_t)userdata;
 
@@ -93,7 +88,7 @@ s32 cellSysutilRegisterCallback(s32 slot, CellSysutilCallback func, void* userda
         return CELL_SYSUTIL_ERROR_NUM;
 
     if (func_addr == 0) {
-        /* Treat as Unregister — matches observed game behaviour. */
+        /* Treat as Unregister, matching observed game behaviour. */
         s_callbacks[slot].guest_opd  = 0;
         s_callbacks[slot].userdata   = 0;
         s_callbacks[slot].registered = 0;
@@ -129,7 +124,7 @@ s32 cellSysutilCheckCallback(void)
      *   void cb(uint64_t status, uint64_t param, void* userdata)
      * which maps to PPC r3=status, r4=param, r5=userdata; r6 is unused.
      *
-     * Stops when the queue empties OR when no guest caller is installed
+     * Stops when the queue empties or when no guest caller is installed
      * (in which case we drop pending events to avoid stalling).
      */
     while (s_event_head != s_event_tail) {
@@ -235,14 +230,12 @@ s32 cellSysutilGetSystemParamString(s32 id, char* buf, u32 bufsize)
 s32 cellSysutilEnableBgmPlayback(void)
 {
     printf("[cellSysutil] EnableBgmPlayback()\n");
-    s_bgm_enabled = 1;
     return CELL_OK;
 }
 
 s32 cellSysutilDisableBgmPlayback(void)
 {
     printf("[cellSysutil] DisableBgmPlayback()\n");
-    s_bgm_enabled = 0;
     s_bgm_status = CELL_SYSUTIL_BGMPLAYBACK_STATUS_STOP;
     return CELL_OK;
 }
@@ -267,14 +260,12 @@ s32 cellSysutilEnableBgmPlaybackEx(s32 param)
 {
     (void)param;
     printf("[cellSysutil] EnableBgmPlaybackEx(%d)\n", param);
-    s_bgm_enabled = 1;
     return CELL_OK;
 }
 
 s32 cellSysutilDisableBgmPlaybackEx(void)
 {
     printf("[cellSysutil] DisableBgmPlaybackEx()\n");
-    s_bgm_enabled = 0;
     s_bgm_status = CELL_SYSUTIL_BGMPLAYBACK_STATUS_STOP;
     return CELL_OK;
 }
@@ -285,13 +276,10 @@ s32 cellSysutilDisableBgmPlaybackEx(void)
 
 s32 cellSysCacheMount(char* param)
 {
-    /* s23 conformance fix: the argument is a CellSysCacheParam STRUCT
-     * (RPCS3 cellSysutil.h: char cacheId[32]; char getCachePath[1055+1];
-     * void* reserved), not a flat string buffer. The old code overwrote the
-     * game's cacheId INPUT field (offset 0) with our mount path and never
-     * wrote getCachePath (offset 32) -- guest memory corruption on a path
-     * reached every boot (s23boot1.err:7821). Read cacheId, write the
-     * mount path into getCachePath, leave cacheId untouched. */
+    /* The argument is a CellSysCacheParam struct (char cacheId[32];
+     * char getCachePath[1055+1]; void* reserved), not a flat string buffer.
+     * Read cacheId (input, offset 0), write the mount path into
+     * getCachePath (offset 32), and leave cacheId untouched. */
     char* cache_id      = param;            /* in: caller's cache name  */
     char* get_cache_path = param + 32;      /* out: mounted path, 1055B */
 
@@ -304,7 +292,6 @@ s32 cellSysCacheMount(char* param)
     s_cache_path[CELL_SYSCACHE_PATH_MAX - 1] = '\0';
     strncpy(get_cache_path, s_cache_path, CELL_SYSCACHE_PATH_MAX - 1);
     get_cache_path[CELL_SYSCACHE_PATH_MAX - 1] = '\0';
-    s_cache_mounted = 1;
 
     return CELL_OK;
 }
@@ -312,7 +299,6 @@ s32 cellSysCacheMount(char* param)
 s32 cellSysCacheClear(void)
 {
     printf("[cellSysutil] SysCacheClear()\n");
-    s_cache_mounted = 0;
     s_cache_path[0] = '\0';
     return CELL_OK;
 }
@@ -342,16 +328,14 @@ s32 cellDiscGameGetBootDiscInfo(u32* type, char* titleId, u32 titleIdSize)
 s32 cellDiscGameRegisterDiscChangeCallback(void (*callback)(void*), void* arg)
 {
     printf("[cellSysutil] DiscGameRegisterDiscChangeCallback()\n");
-    s_disc_change_cb = callback;
-    s_disc_change_arg = arg;
+    (void)callback;
+    (void)arg;
     return CELL_OK;
 }
 
 s32 cellDiscGameUnregisterDiscChangeCallback(void)
 {
     printf("[cellSysutil] DiscGameUnregisterDiscChangeCallback()\n");
-    s_disc_change_cb = NULL;
-    s_disc_change_arg = NULL;
     return CELL_OK;
 }
 

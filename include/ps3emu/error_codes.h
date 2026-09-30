@@ -1,9 +1,9 @@
 /*
  * ps3recomp - PS3 / CellOS error codes
  *
- * Based on the Cell OS Lv-2 specification.  All codes are negative 32-bit
- * integers except CELL_OK (0).  Module-specific error bases are defined at
- * the bottom of this file.
+ * Values match the codes the firmware returns.  All codes are negative 32-bit
+ * integers except CELL_OK (0).  Module-specific error bases follow the
+ * generic codes.
  */
 
 #ifndef PS3EMU_ERROR_CODES_H
@@ -40,45 +40,19 @@
 #define CELL_EAUTHFAIL                  0x80010017  /* Authentication failed */
 #define CELL_ENOTMSELF                  0x80010018  /* Not a valid MSELF */
 #define CELL_ESYSVER                    0x80010019  /* System version error */
-#define CELL_EAUTHDENIED                0x80010020  /* Authorization denied */
-#define CELL_EOPNOTSUPP                 0x80010021  /* Operation not supported */
-#define CELL_ENOTDIR                    0x80010022  /* Not a directory */
-#define CELL_ERANGE                     0x80010023  /* Result out of range */
-#define CELL_ENAMETOOLONG               0x80010024  /* Name too long */
 #define CELL_EBADF                      0x8001002A  /* Bad file descriptor */
-#define CELL_EFSSPECIFIC                0x80010025  /* FS-specific error (alias) */
-#define CELL_EOVERFLOW                  0x80010026  /* Overflow */
-#define CELL_ENOTMOUNTED                0x80010027  /* Not mounted */
-#define CELL_ENOTSUP                    0x80010028  /* Not supported */
-#define CELL_ENOTSDATA                  0x80010029  /* Not SDATA */
-#define CELL_ESDKVER                    0x80010030  /* SDK version error */
-#define CELL_ENOLICDISC                 0x80010031  /* No license disc */
-#define CELL_ENOLICENT                  0x80010032  /* No license entitlement */
-
-/* ---------------------------------------------------------------------------
- * Mutex / synchronization errors  (0x80010100-range)
- * -----------------------------------------------------------------------*/
-#define CELL_EMUTEX_NOT_OWNED           0x80010120
-#define CELL_EMUTEX_LOCK_NOT_ALLOWED    0x80010121
-#define CELL_EMUTEX_UNLOCK_NOT_OWNED    0x80010122
-#define CELL_EMUTEX_DEADLK              0x80010123
-
-#define CELL_ECOND_NOT_OWNED            0x80010130
-#define CELL_ECOND_DEADLK               0x80010131
 
 /* ---------------------------------------------------------------------------
  * Module-specific error bases
  *
- * Each module defines errors as (base | local_code).
- * Convention:  0x8002_XXYY  where XX = module index.
+ * Each module error is (base | local_code).
  * -----------------------------------------------------------------------*/
 #define CELL_ERROR_BASE_SYSMODULE       0x80012000
 #define CELL_ERROR_BASE_FS              0x80010700
 #define CELL_ERROR_BASE_AUDIO           0x80310700
 #define CELL_ERROR_BASE_VIDEO           0x8002B100
-/* Real libgcm base is 0x80210000 (SDK cell/gcm/gcm_error.h: facility GFX
- * 0x021, range 0x8021_0001 - 0x8021_00ff). The old 0x80210700 was fabricated
- * (2026-08-04 audit: every GCM error off by 0x700). */
+/* Real libgcm base is 0x80210000 (facility GFX 0x021, range
+ * 0x8021_0001 - 0x8021_00ff). */
 #define CELL_ERROR_BASE_GCM             0x80210000
 #define CELL_ERROR_BASE_NET             0x80130100
 #define CELL_ERROR_BASE_PAD             0x80121100
@@ -86,9 +60,8 @@
 #define CELL_ERROR_BASE_MOUSE           0x80121300
 #define CELL_ERROR_BASE_SYSUTIL         0x8002B000
 #define CELL_ERROR_BASE_SYSUTIL_SAVE    0x8002B400
-/* Real cellGame base is 0x8002cb00 (SDK sysutil_game_common.h), not the
- * fabricated 0x8002B600. Offsets are sparse (04-09, 20-28, 50), so
- * cellGame.h defines each CELL_GAME_ERROR_* value verbatim instead of
+/* Real cellGame base is 0x8002cb00. Offsets are sparse (04-09, 20-28, 50),
+ * so cellGame.h defines each CELL_GAME_ERROR_* value verbatim instead of
  * OR-ing this base. Kept only as documentation of the range. */
 #define CELL_ERROR_BASE_SYSUTIL_GAME    0x8002CB00
 #define CELL_ERROR_BASE_PNG             0x80611200
@@ -109,10 +82,8 @@
 #define CELL_SYSMODULE_ERROR_UNLOADED       (CELL_ERROR_BASE_SYSMODULE | 0x03)
 #define CELL_SYSMODULE_ERROR_FATAL          (CELL_ERROR_BASE_SYSMODULE | 0xFF)
 
-/* sysutil errors. Real SDK values (sysutil_common.h: common block at
- * 0x8002b1xx, not the 0x8002b0xx internal block our old |0x0n numbering
- * landed on -- same fabricated-namespace class as the 2026-08-04 sweep's
- * videoout/msgdialog findings; corrected 2026-08-05). */
+/* sysutil errors: the common block is at 0x8002b1xx, not the 0x8002b0xx
+ * internal block. */
 #define CELL_SYSUTIL_ERROR_TYPE             0x8002b101
 #define CELL_SYSUTIL_ERROR_VALUE            0x8002b102
 #define CELL_SYSUTIL_ERROR_SIZE             0x8002b103
@@ -126,8 +97,7 @@
 #define CELL_PAD_ERROR_INVALID_PARAMETER    (CELL_ERROR_BASE_PAD | 0x02)
 #define CELL_PAD_ERROR_ALREADY_OPENED       (CELL_ERROR_BASE_PAD | 0x03)
 #define CELL_PAD_ERROR_NOT_OPENED           (CELL_ERROR_BASE_PAD | 0x04)
-/* Real SDK value (cell/pad/error.h): NO_DEVICE is 0x80121107; |0x05 is
- * RESOURCE_ALLOCATION_FAILED's slot (2026-08-05, audit item K). */
+/* NO_DEVICE is 0x80121107; |0x05 is RESOURCE_ALLOCATION_FAILED's slot. */
 #define CELL_PAD_ERROR_NO_DEVICE            (CELL_ERROR_BASE_PAD | 0x07)
 
 /* audio errors */
@@ -139,7 +109,7 @@
 #define CELL_AUDIO_ERROR_PORT_ALREADY_RUN   (CELL_ERROR_BASE_AUDIO | 0x06)
 #define CELL_AUDIO_ERROR_PORT_NOT_OPEN      (CELL_ERROR_BASE_AUDIO | 0x07)
 #define CELL_AUDIO_ERROR_PORT_NOT_RUN       (CELL_ERROR_BASE_AUDIO | 0x08)
-/* RPCS3 cellAudio.h:25-31 (0x80310709 - 0x8031070F, sequential) */
+/* 0x80310709 - 0x8031070F, sequential */
 #define CELL_AUDIO_ERROR_TRANS_EVENT             (CELL_ERROR_BASE_AUDIO | 0x09)
 #define CELL_AUDIO_ERROR_PORT_OPEN               (CELL_ERROR_BASE_AUDIO | 0x0A)
 #define CELL_AUDIO_ERROR_SHAREDMEMORY            (CELL_ERROR_BASE_AUDIO | 0x0B)
@@ -148,7 +118,7 @@
 #define CELL_AUDIO_ERROR_AUDIOSYSTEM_NOT_FOUND   (CELL_ERROR_BASE_AUDIO | 0x0E)
 #define CELL_AUDIO_ERROR_TAG_NOT_FOUND           (CELL_ERROR_BASE_AUDIO | 0x0F)
 
-/* GCM errors -- values verbatim from SDK cell/gcm/gcm_error.h:
+/* GCM errors:
  *   FAILURE          0x802100ff
  *   NO_IO_PAGE_TABLE 0x80210001
  *   INVALID_ENUM     0x80210002
@@ -161,51 +131,5 @@
 #define CELL_GCM_ERROR_INVALID_VALUE        (CELL_ERROR_BASE_GCM | 0x03)
 #define CELL_GCM_ERROR_INVALID_ALIGNMENT    (CELL_ERROR_BASE_GCM | 0x04)
 #define CELL_GCM_ERROR_ADDRESS_OVERWRAP     (CELL_ERROR_BASE_GCM | 0x05)
-
-/* ---------------------------------------------------------------------------
- * Helper macros
- * -----------------------------------------------------------------------*/
-
-/* True if value represents an error (high bit set). */
-#define CELL_IS_ERROR(code)   (((uint32_t)(code) & 0x80000000u) != 0)
-
-/* Return from HLE function on error. */
-#define CELL_RETURN_IF_ERROR(expr) \
-    do {                                            \
-        int32_t _rc = (int32_t)(expr);              \
-        if (CELL_IS_ERROR(_rc)) return _rc;         \
-    } while (0)
-
-/* Build a module-specific error code. */
-#define CELL_MODULE_ERROR(base, code)  ((int32_t)((base) | (code)))
-
-#ifdef __cplusplus
-#include <cstdio>
-
-/* Pretty-print an error code for debug logging. */
-static inline const char* cell_error_name(int32_t code)
-{
-    static thread_local char buf[32];
-    switch ((uint32_t)code)
-    {
-    case CELL_OK:          return "CELL_OK";
-    case CELL_EAGAIN:      return "CELL_EAGAIN";
-    case CELL_EINVAL:      return "CELL_EINVAL";
-    case CELL_ENOSYS:      return "CELL_ENOSYS";
-    case CELL_ENOMEM:      return "CELL_ENOMEM";
-    case CELL_ESRCH:       return "CELL_ESRCH";
-    case CELL_ENOENT:      return "CELL_ENOENT";
-    case CELL_EPERM:       return "CELL_EPERM";
-    case CELL_EBUSY:       return "CELL_EBUSY";
-    case CELL_ETIMEDOUT:   return "CELL_ETIMEDOUT";
-    case CELL_EABORT:      return "CELL_EABORT";
-    case CELL_EFAULT:      return "CELL_EFAULT";
-    case CELL_EEXIST:      return "CELL_EEXIST";
-    default:
-        snprintf(buf, sizeof(buf), "0x%08X", (unsigned)code);
-        return buf;
-    }
-}
-#endif /* __cplusplus */
 
 #endif /* PS3EMU_ERROR_CODES_H */

@@ -1,9 +1,9 @@
 /*
- * ps3recomp - cellSysmodule HLE stub
+ * ps3recomp - cellSysmodule HLE
  *
  * Module loading / unloading system.  On real PS3 hardware these calls
- * load PRX modules from flash or disc.  In the recompiler we track
- * load state and wire up HLE function tables.
+ * load PRX modules from flash or disc.  Here we only track per-module
+ * load state.
  */
 
 #ifndef PS3RECOMP_CELL_SYSMODULE_H
@@ -19,11 +19,6 @@ extern "C" {
 /* ---------------------------------------------------------------------------
  * Module ID constants
  * -----------------------------------------------------------------------*/
-/* Regenerated 2026-08-04 from the SDK 4.75 module-ID table (doc-conformance
- * audit: 48 of the 71 hand-written values were wrong -- a +1 shift from FS
- * through FONT and -14/-16/-17 shifts above 0x30 -- which mislabeled every
- * boot log and returned UNKNOWN for documented high-range codec ids). Do
- * not hand-edit individual values; regenerate against cell/sysmodule.h. */
 #define CELL_SYSMODULE_INVALID                     0xFFFF
 #define CELL_SYSMODULE_NET                         0x0000
 #define CELL_SYSMODULE_HTTP                        0x0001

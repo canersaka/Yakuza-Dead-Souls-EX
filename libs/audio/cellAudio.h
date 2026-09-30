@@ -2,7 +2,7 @@
  * ps3recomp - cellAudio HLE
  *
  * Audio output: port management, mixing thread, event notification.
- * Backend: WASAPI on Windows, SDL2 audio elsewhere.
+ * Output backend: WASAPI.
  */
 
 #ifndef PS3RECOMP_CELL_AUDIO_H
@@ -36,19 +36,14 @@ extern "C" {
 #define CELL_AUDIO_MAX_NOTIFY_EVENT_QUEUES  8
 
 /* Port-open attribute bit: when set, honor CellAudioPortParam::level as the
- * port's initial level instead of forcing 1.0f (RPCS3 cellAudio.h:63,
- * cellAudio.cpp:1340-1346). */
+ * port's initial level instead of forcing 1.0f. */
 #define CELL_AUDIO_PORTATTR_INITLEVEL       0x1000ULL
 
-/* Audio port status (RPCS3 cellAudio.h:72 -- CLOSE was wrongly 0, which
- * collided with a legitimate zero-initialized/never-set status value; a
- * closed port must be distinguishable from an unstarted one). */
+/* Audio port status. CLOSE is 0x1010 rather than 0 so a closed port is
+ * distinguishable from a zero-initialized/never-set status value. */
 #define CELL_AUDIO_STATUS_CLOSE             0x1010
 #define CELL_AUDIO_STATUS_READY             1
 #define CELL_AUDIO_STATUS_RUN               2
-
-/* Audio period in microseconds (~5.333ms for 256 samples @ 48kHz) */
-#define CELL_AUDIO_PERIOD_US                5333
 
 /* ---------------------------------------------------------------------------
  * Structures
@@ -106,10 +101,10 @@ s32 cellAudioGetPortConfig(u32 portNum, CellAudioPortConfig* config);
 /* NID: 0x7EECFF1D */
 s32 cellAudioPortGetStatus(u32 portNum, u32* status);
 
-/* NID: 0xE4046AFE — block tag of slot blockNo (libmixer pacing) */
+/* NID: 0xE4046AFE, block tag of slot blockNo (libmixer pacing) */
 s32 cellAudioGetPortBlockTag(u32 portNum, u64 blockNo, u64* tag);
 
-/* NID: 0xFF3626FD(?) — us timestamp of block `tag` (libmixer pacing) */
+/* NID: 0xFF3626FD(?), us timestamp of block `tag` (libmixer pacing) */
 s32 cellAudioGetPortTimestamp(u32 portNum, u64 tag, u64* stamp);
 
 /* NID: 0x3EEFAF96 */
@@ -118,7 +113,7 @@ s32 cellAudioSetPersonalDevice(s32 iPersonalStream, s32 iDevice);
 /* NID: 0x96A7B2F4 */
 s32 cellAudioUnsetPersonalDevice(s32 iPersonalStream);
 
-/* Host-native media injection used by the static-recomp movie backend.
+/* Host PCM stream used by the movie player.
  * PCM is interleaved signed 16-bit stereo at 48 kHz. The caller owns the
  * buffer and must keep it alive until cellAudioHostStreamStop(). */
 int  cellAudioHostStreamStart(const int16_t* pcm, uint64_t frames,

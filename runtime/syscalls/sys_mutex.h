@@ -32,44 +32,28 @@ extern "C" {
 /* Protocol types */
 #define SYS_SYNC_FIFO            0x1
 #define SYS_SYNC_PRIORITY        0x2
-#define SYS_SYNC_RETRY            0x4  /* lwmutex-only protocol (RPCS3 sys_sync.h:18); audit sec.6 lwmutex slow path */
+#define SYS_SYNC_RETRY            0x4  /* lwmutex-only protocol (lwmutex slow path) */
 #define SYS_SYNC_PRIORITY_INHERIT 0x3
 
 /* Mutex flags */
 #define SYS_SYNC_RECURSIVE       0x10
 #define SYS_SYNC_NOT_RECURSIVE   0x20
 
-/* PS3 mutex attribute struct (as seen in guest memory) */
-typedef struct sys_mutex_attribute_t {
-    uint32_t protocol;
-    uint32_t recursive;
-    uint32_t pshared;
-    uint32_t adaptive;
-    uint64_t key;
-    int32_t  flags;
-    uint32_t pad;
-    char     name[8];
-} sys_mutex_attribute_t;
-
 /* Internal mutex descriptor */
 typedef struct sys_mutex_info {
     int      active;
-    char     name[8];
-    uint32_t protocol;
     int      recursive;
     uint64_t owner_tid;   /* thread_id of current owner (for recursive/error checking) */
     int      lock_count;  /* recursive lock count */
     /* Number of live condition variables associated with this mutex.
      * Maintained by sys_cond_create/sys_cond_destroy (under the cond table
      * lock); read by sys_mutex_destroy, which must refuse with EPERM while
-     * any associated cond exists (Lv2 Reference p.173: "Prior to this system
-     * call, all condition variables that are associated with the mutex must
-     * be destroyed. Otherwise, EPERM will be returned."). */
+     * any associated cond exists (all conds must be destroyed before the
+     * mutex). */
     int      cond_count;
 
 #ifdef _WIN32
     CRITICAL_SECTION cs;
-    HANDLE           wait_handle;  /* for timed waits */
 #else
     pthread_mutex_t  mtx;
 #endif

@@ -50,11 +50,9 @@ typedef struct ppu_thread_info {
     uint32_t     stack_addr;   /* guest stack base */
     uint32_t     stack_size;
     uint64_t     entry_addr;   /* guest entry point */
-    uint64_t     tls_addr;
 
 #ifdef _WIN32
     HANDLE       host_thread;
-    DWORD        host_tid;
 #else
     pthread_t    host_thread;
 #endif

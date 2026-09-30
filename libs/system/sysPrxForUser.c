@@ -1,9 +1,9 @@
 /*
  * ps3recomp - sysPrxForUser HLE implementation
  *
- * Real host-backed implementation: lwmutex uses CRITICAL_SECTION/pthread_mutex,
- * lwcond uses CONDITION_VARIABLE/pthread_cond, threads use CreateThread/pthread.
- * Heap uses standard malloc with tracking.
+ * lwmutex is backed by a host CRITICAL_SECTION (pthread mutex on POSIX) and
+ * lwcond by a CONDITION_VARIABLE (pthread cond on POSIX); the process, string
+ * and heap helpers are thin wrappers over the C runtime.
  */
 
 #include "sysPrxForUser.h"
@@ -31,21 +31,18 @@
 typedef struct {
     int in_use;
     int recursive;
-    char name[8];
-    /* Destroy/recreate churn safety (2026-07-02, the ~1/5 boot-stall root):
-     * the game destroys+recreates some lwmutexes PER FILE during the asset
-     * sweep (guest 0x01655C98), concurrently with other threads locking them.
-     * cs_init: the host CS is initialized ONCE per slot and NEVER deleted or
+    /* Destroy/recreate churn safety: titles may destroy and recreate an
+     * lwmutex while other threads are locking it.
+     * cs_init: the host CS is initialized once per slot and never deleted or
      * re-initialized (Delete/re-Init while another thread sits in Enter is
-     * UB that corrupts the CS -- the measured random forever-blocks).
-     * gen: bumped on destroy; lockers revalidate {in_use, gen} AFTER Enter
+     * UB that corrupts the CS and causes random forever-blocks).
+     * gen: bumped on destroy; lockers revalidate {in_use, gen} after Enter
      * and back out with ESRCH if the lwmutex died/recycled under them.
      * owner_tid: lets destroy refuse (EBUSY) whenever the lwmutex is held,
      * including held by the destroyer itself. */
     int cs_init;
     u32 gen;
     unsigned long owner_tid;
-    u32 guest_ea;   /* guest address of the lwmutex (holder-dump diagnostics) */
 #ifdef _WIN32
     CRITICAL_SECTION cs;
 #else
@@ -69,7 +66,7 @@ static void slot_lock(void)   { pthread_mutex_lock(&s_slot_lock); }
 static void slot_unlock(void) { pthread_mutex_unlock(&s_slot_lock); }
 #endif
 
-/* Reset all lwmutex/lwcond state — call before CRT redirect to game main */
+/* Destroy all lwmutex slots and clear the table (lwcond slots are untouched). */
 void sys_lwmutex_reset_all(void)
 {
     for (u32 i = 0; i < MAX_LWMUTEX; i++) {
@@ -85,23 +82,6 @@ void sys_lwmutex_reset_all(void)
     s_lwmutex_next = 0;
 }
 
-/* Watchdog diagnostic: list every lwmutex currently HELD (owner_tid != 0)
- * so a frozen boot names its lock holders without a debugger (2026-08-04,
- * the CriSr_ProcessServer livelock hunt). Reads race the lock paths but are
- * point-in-time diagnostics on a wedged process; no locking on purpose. */
-void sys_lwmutex_dump_holders(const char* tag)
-{
-    for (u32 i = 0; i < MAX_LWMUTEX; i++) {
-        const LwMutexSlot* m = &s_lwmutex[i];
-        if (!m->in_use || !m->owner_tid) continue;
-        fprintf(stderr,
-                "[lwm-held] %s slot=%u guest=0x%08X name='%.8s' "
-                "owner_host_tid=%lu recursive=%d\n",
-                tag ? tag : "dump", i, m->guest_ea, m->name,
-                m->owner_tid, m->recursive);
-    }
-    fflush(stderr);
-}
 
 /* ---------------------------------------------------------------------------
  * Internal: Lightweight cond table
@@ -110,20 +90,17 @@ void sys_lwmutex_dump_holders(const char* tag)
 
 typedef struct {
     int in_use;
-    int cv_init;    /* CV initialized ONCE per slot, never re-init/destroyed
+    int cv_init;    /* CV initialized once per slot, never re-init/destroyed
                      * (re-init or destroy with a stale waiter parked is UB;
-                     * same churn-safety scheme as LwMutexSlot, 2026-07-02) */
+                     * same churn-safety scheme as LwMutexSlot) */
     u32 lwmutex_id; /* index into s_lwmutex */
-    /* Rendezvous state (2026-07-03 s8, the E5 lost-wake root): real lv2's
-     * waiter COMMITS (under the lwmutex) before releasing it, and a signal
-     * aimed at a committed waiter is held by the kernel even if the waiter
-     * hasn't parked yet. A bare Win32 CV drops that signal (edge-triggered)
-     * — measured: the CRI stream pump's completion signal (guest 0xE54B78 →
-     * sys_lwcond_signal) fired into the commit window and the E5 pipeline
-     * slept forever = the SEGA-logo boot freeze. `committed`/`pending` under
-     * the internal sig lock reproduce lv2's semantics exactly: held signal
-     * for committed waiters, faithful discard when none. The signaler NEVER
-     * touches the guest lwmutex (the 3f1377c hold-and-wait lesson). */
+    /* Rendezvous state: real lv2's waiter commits (under the lwmutex) before
+     * releasing it, and a signal aimed at a committed waiter is held by the
+     * kernel even if the waiter hasn't parked yet. A bare Win32 CV drops that
+     * signal (edge-triggered), which can leave the waiter asleep forever.
+     * `committed`/`pending` under the internal sig lock reproduce lv2's
+     * semantics: held signal for committed waiters, discard when none. The
+     * signaler never touches the guest lwmutex, to avoid hold-and-wait. */
     int committed;  /* waiters that entered wait, not yet returned */
     int pending;    /* signals held for committed waiters */
 #ifdef _WIN32
@@ -141,45 +118,6 @@ static LwCondSlot s_lwcond[MAX_LWCOND];
 static u32 s_lwcond_next = 0;
 
 /* ---------------------------------------------------------------------------
- * Internal: Thread table
- * -----------------------------------------------------------------------*/
-#define MAX_PRX_THREADS 64
-
-typedef struct {
-    int in_use;
-    u64 thread_id;
-    sys_ppu_thread_entry_t entry;
-    u64 arg;
-    u64 exitcode;
-    int joined;
-    int detached;
-#ifdef _WIN32
-    HANDLE handle;
-#else
-    pthread_t pt;
-#endif
-} PrxThreadSlot;
-
-static PrxThreadSlot s_threads[MAX_PRX_THREADS];
-static u64 s_next_thread_id = 0x10000; /* start high to avoid collision with sys_ppu_thread */
-
-#ifdef _WIN32
-static DWORD WINAPI prx_thread_entry(LPVOID param)
-{
-    PrxThreadSlot* t = (PrxThreadSlot*)param;
-    t->entry(t->arg);
-    return 0;
-}
-#else
-static void* prx_thread_entry(void* param)
-{
-    PrxThreadSlot* t = (PrxThreadSlot*)param;
-    t->entry(t->arg);
-    return NULL;
-}
-#endif
-
-/* ---------------------------------------------------------------------------
  * Internal: Heap table
  * -----------------------------------------------------------------------*/
 #define MAX_HEAPS 16
@@ -191,15 +129,6 @@ typedef struct {
 
 static HeapSlot s_heaps[MAX_HEAPS];
 static u32 s_next_heap_id = 1;
-
-/* ---------------------------------------------------------------------------
- * Thread management
- *
- * Thread functions (sys_ppu_thread_create, _exit, _join, _detach, _get_id,
- * _yield) are implemented in runtime/syscalls/sys_ppu_thread.c to avoid
- * duplication. They are declared in sysPrxForUser.h and linked from the
- * syscall implementation.
- * -----------------------------------------------------------------------*/
 
 /* ---------------------------------------------------------------------------
  * Process management
@@ -269,16 +198,15 @@ s32 _sys_strlen(const char* str)
 
 char* _sys_strncpy(char* dst, const char* src, u32 size)
 {
-    /* returns dst, like libc (RPCS3 sys_libc_.cpp: vm::ptr<char> return).
-     * Sony's firmware code chains these returns. */
+    /* returns dst, like libc; callers chain these returns. */
     if (!dst || !src) return dst;
     return strncpy(dst, src, size);
 }
 
 char* _sys_strcat(char* dst, const char* src)
 {
-    /* returns dst (RPCS3 sys_libc_.cpp) — observed live: libsre passes the
-     * return of strcat straight into the next string call. */
+    /* returns dst; callers pass the return of strcat straight into the
+     * next string call. */
     if (!dst || !src) return dst;
     return strcat(dst, src);
 }
@@ -291,7 +219,7 @@ s32 _sys_strcmp(const char* s1, const char* s2)
 
 s32 _sys_strncmp(const char* s1, const char* s2, u32 max)
 {
-    /* RPCS3 sys_libc_.cpp returns exactly -1/0/1 */
+    /* returns exactly -1/0/1 */
     if (!s1 || !s2) return -1;
     int r = strncmp(s1, s2, max);
     return (r > 0) - (r < 0);
@@ -299,7 +227,7 @@ s32 _sys_strncmp(const char* s1, const char* s2, u32 max)
 
 char* _sys_strcpy(char* dst, const char* src)
 {
-    /* returns dst (RPCS3 sys_libc_.cpp: vm::ptr<char> return) */
+    /* returns dst */
     if (!dst || !src) return dst;
     return strcpy(dst, src);
 }
@@ -311,9 +239,8 @@ char* _sys_strncat(char* dst, const char* src, u32 max)
     return strncat(dst, src, max);
 }
 
-/* RPCS3 implements both as CELL_OK no-ops (sys_libc_.cpp todo stubs) and
- * boots SPURS-heavy titles with that; guest va_list is not interpretable
- * by a host vararg call anyway. */
+/* Both are CELL_OK no-ops (SPURS-heavy titles boot with that); a guest
+ * va_list is not interpretable by a host vararg call anyway. */
 s32 _sys_vprintf(const char* fmt, u32 va_guest)
 {
     (void)fmt; (void)va_guest;
@@ -330,16 +257,8 @@ s32 _sys_vsnprintf(char* buf, u32 size, const char* fmt, u32 va_guest)
 void* _sys_memset(void* dst, s32 val, u32 size)
 {
     extern u8* vm_base;
-    extern volatile long g_yz_a010_release_scene_active;
-    extern void yz_a010_reltrace_ppu_bulk(
-        u32 dst, const u8* src, u32 size,
-        u32 guest_pc, u32 op, u8 fill);
     const uintptr_t host = (uintptr_t)dst;
     const uintptr_t base = (uintptr_t)vm_base;
-    if (g_yz_a010_release_scene_active && dst && vm_base &&
-        host >= base && host - base <= UINT32_MAX)
-        yz_a010_reltrace_ppu_bulk(
-            (u32)(host - base), NULL, size, 0u, 2u, (u8)val);
     void* result = memset(dst, val, size);
     if (dst && vm_base && host >= base && host - base <= UINT32_MAX &&
         (uint64_t)(host - base) + size <= 0x100000000ull)
@@ -350,24 +269,8 @@ void* _sys_memset(void* dst, s32 val, u32 size)
 void* _sys_memcpy(void* dst, const void* src, u32 size)
 {
     extern u8* vm_base;
-    extern volatile long g_yz_a010_release_scene_active;
-    extern void yz_a010_reltrace_ppu_bulk(
-        u32 dst, const u8* src, u32 size,
-        u32 guest_pc, u32 op, u8 fill);
     const uintptr_t host = (uintptr_t)dst;
     const uintptr_t base = (uintptr_t)vm_base;
-    if (g_yz_a010_release_scene_active && dst && src && vm_base &&
-        host >= base && host - base <= UINT32_MAX)
-        yz_a010_reltrace_ppu_bulk(
-            (u32)(host - base), (const u8*)src, size, 0u, 1u, 0u);
-    /* frontier writer attribution (YZ_EA_TRAP): the guest's own memcpy is a
-     * bulk write path neither the lifted-store trap nor a page guard sees. */
-    {
-        extern void yz_ea_trap_c(u32, unsigned, unsigned long long, void*);
-        if (dst && src && vm_base && host >= base && host - base <= UINT32_MAX && size)
-            yz_ea_trap_c((u32)(host - base), size,
-                         size >= 4 ? *(const u32*)src : 0, _ReturnAddress());
-    }
     void* result = memcpy(dst, src, size);
     if (dst && vm_base && host >= base && host - base <= UINT32_MAX &&
         (uint64_t)(host - base) + size <= 0x100000000ull)
@@ -400,17 +303,14 @@ static inline u32 guest_be32(u32 v)
 
 /* lv2 lwmutex owner-word sentinels. On real lv2 the lock state lives in the
  * guest struct itself: lock_var = {owner, waiter} (SDK sys/synchronization.h),
- * owner = FREE when unlocked, a thread id when held, and DEAD once destroyed —
+ * owner = FREE when unlocked, a thread id when held, and DEAD once destroyed;
  * userland lock classifies lock-after-destroy via the DEAD sentinel instead of
- * silently re-registering. ORACLE(Emu/Cell/lv2/sys_lwmutex.h:21-23 free/dead/
- * reserved; Emu/Cell/Modules/sys_lwmutex_.cpp:51 create stores FREE, :89
- * destroy releases DEAD into owner, :146-149 lock on DEAD -> CELL_EINVAL).
- * Boot-13 measured failure without this (scratch/motblk_trace_20260805_boot13,
- * STATUS frontier): the game cycles destroy->create on 0x01659658 per archive
- * read during the dialogue-scene motion-bank reload; a concurrent locker
- * landing in the gap hit lwmutex_lazy_register (sleep_queue==0 after our old
- * memset-zero destroy) and SILENTLY acquired a fresh phantom slot while create
- * then allocated a different one — mutual exclusion lost with zero banners.
+ * silently re-registering. Create stores FREE, destroy stores DEAD into
+ * owner, and lock on DEAD returns CELL_EINVAL.
+ * Titles may cycle destroy->create on one lwmutex; a concurrent locker landing
+ * in the gap must not reach lwmutex_lazy_register (sleep_queue==0 after a
+ * plain zeroing destroy), which would silently acquire a fresh phantom slot
+ * while create then allocated a different one, losing mutual exclusion.
  * The owner word is stored guest-BE (guest_be32 is its own inverse). */
 #define YZ_LWMUTEX_FREE 0xFFFFFFFFu
 #define YZ_LWMUTEX_DEAD 0xFFFFFFFEu
@@ -428,18 +328,6 @@ static inline void lwmutex_owner_set(sys_lwmutex_t_hle* m, u32 owner)
     memcpy((void*)&m->lock_var, &raw, 4);
 }
 
-/* Kill-switch YZ_LWM_RESURRECT_OK=1 restores the pre-fix behavior (destroyed
- * lwmutex silently resurrected by the next lock) for single-variable A/B. */
-static inline int lwmutex_resurrect_ok(void)
-{
-    static int ok = -1;
-    if (ok < 0) {
-        const char* e = getenv("YZ_LWM_RESURRECT_OK");
-        ok = (e && *e == '1') ? 1 : 0;
-    }
-    return ok;
-}
-
 /* Shared guard for lock/trylock: a destroyed lwmutex (owner sentinel DEAD)
  * must fail loudly, never lazily re-register. Returns nonzero when the call
  * must bail with CELL_EINVAL. */
@@ -447,10 +335,8 @@ static int lwmutex_dead_check(sys_lwmutex_t_hle* m, const char* who)
 {
     if (m->sleep_queue != 0 || lwmutex_owner_get(m) != YZ_LWMUTEX_DEAD)
         return 0;
-    if (lwmutex_resurrect_ok())
-        return 0;
     {
-        static long n = 0;               /* benign log-cap race */
+        static long n = 0;               /* log cap only; a race just skews log volume */
         long k = ++n;
         if (k <= 24 || (k & (k - 1)) == 0) {
             fprintf(stderr, "[lwm] %s on DESTROYED lwmutex guest=0x%08X -> EINVAL "
@@ -462,7 +348,7 @@ static int lwmutex_dead_check(sys_lwmutex_t_hle* m, const char* who)
     return 1;
 }
 
-/* Slot-allocation core: caller MUST hold slot_lock. Inits a host lock for the
+/* Slot-allocation core: caller must hold slot_lock. Inits a host lock for the
  * lwmutex and writes its 1-based slot id into sleep_queue. */
 static s32 lwmutex_register_locked(sys_lwmutex_t_hle* lwmutex, const sys_lwmutex_attribute_t* attr)
 {
@@ -474,12 +360,10 @@ static s32 lwmutex_register_locked(sys_lwmutex_t_hle* lwmutex, const sys_lwmutex
             m->in_use = 1;
             m->owner_tid = 0;
             /* attr lives in guest memory: decode the BE flags word (a raw host
-             * read of BE 0x10 sees 0x10000000, so the old check never matched). */
+             * read of BE 0x10 sees 0x10000000). */
             m->recursive = (attr && (guest_be32(attr->recursive) & SYS_SYNC_RECURSIVE)) ? 1 : 0;
-            if (attr)
-                memcpy(m->name, attr->name, 8);
 
-            /* Init the host lock ONCE per slot lifetime; recycled slots reuse
+            /* Init the host lock once per slot lifetime; recycled slots reuse
              * the live CS (re-Init over a CS another thread may still be
              * blocked on is UB -- see the struct comment). */
 #ifdef _WIN32
@@ -497,9 +381,7 @@ static s32 lwmutex_register_locked(sys_lwmutex_t_hle* lwmutex, const sys_lwmutex
 
             memset(lwmutex, 0, sizeof(*lwmutex));
             lwmutex->sleep_queue = slot + 1; /* 1-based ID */
-            lwmutex_owner_set(lwmutex, YZ_LWMUTEX_FREE); /* lv2 create stores FREE
-                                          (ORACLE sys_lwmutex_.cpp:51) */
-            m->guest_ea = YZ_GUEST_ADDR(lwmutex);
+            lwmutex_owner_set(lwmutex, YZ_LWMUTEX_FREE); /* lv2 create stores FREE */
             s_lwmutex_next = (slot + 1) % MAX_LWMUTEX;
             return CELL_OK;
         }
@@ -509,9 +391,6 @@ static s32 lwmutex_register_locked(sys_lwmutex_t_hle* lwmutex, const sys_lwmutex
 
 s32 sys_lwmutex_create(sys_lwmutex_t_hle* lwmutex, const sys_lwmutex_attribute_t* attr)
 {
-    printf("[sysPrxForUser] sys_lwmutex_create(name='%.8s', guest=0x%08X)\n",
-           attr ? attr->name : "???", YZ_GUEST_ADDR(lwmutex));
-
     if (!lwmutex)
         return CELL_EFAULT;
 
@@ -522,16 +401,16 @@ s32 sys_lwmutex_create(sys_lwmutex_t_hle* lwmutex, const sys_lwmutex_attribute_t
 }
 
 /* Lazily register a statically/inline-initialized lwmutex (sleep_queue==0) that
- * never went through create. DOUBLE-CHECKED under slot_lock: the failing EAs live
- * in MAIN RAM (e.g. 0x0D0004xx), not the thread stack, so they may be SHARED — two
- * threads racing the first lock must not allocate two slots or stomp each other. */
+ * never went through create. Double-checked under slot_lock: such lwmutexes live
+ * in main RAM, not the thread stack, so they may be shared; two threads racing
+ * the first lock must not allocate two slots or stomp each other. */
 static s32 lwmutex_lazy_register(sys_lwmutex_t_hle* lwmutex)
 {
     slot_lock();
     s32 rc = CELL_OK;
     if (lwmutex->sleep_queue == 0) {        /* re-check under lock (TOCTOU-safe) */
         /* The static initializer stored the SYS_SYNC_* flags in the guest struct's
-         * attribute word; capture it BEFORE register_locked memsets the struct,
+         * attribute word; capture it before register_locked memsets the struct,
          * or a SYS_SYNC_RECURSIVE lwmutex silently registers non-recursive. Kept
          * raw (guest-BE) -- register_locked decodes it like a create-path attr. */
         sys_lwmutex_attribute_t a;
@@ -548,15 +427,15 @@ s32 sys_lwmutex_lock(sys_lwmutex_t_hle* lwmutex, u64 timeout)
 {
     if (!lwmutex) return CELL_EFAULT;
 
-    /* DESTROYED lwmutex (owner sentinel DEAD, boot-13 resurrection fix): real
-     * lv2 fails this lock; lazy-register must never resurrect it. */
+    /* Destroyed lwmutex (owner sentinel DEAD): real lv2 fails this lock;
+     * lazy-register must never resurrect it. */
     if (lwmutex_dead_check(lwmutex, "lock"))
         return CELL_EINVAL;
 
     /* Statically/inline-initialized lwmutex that never passed through create
-     * (PS3 lwmutexes are user-space; the kernel sleep queue is allocated lazily).
-     * Seen on lwmutex arrays at guest 0x0D0004xx that our model otherwise fails
-     * forever with ESRCH. lwmutex_lazy_register is TOCTOU-safe under slot_lock. */
+     * (PS3 lwmutexes are user-space; the kernel sleep queue is allocated lazily),
+     * which would otherwise fail forever with ESRCH. lwmutex_lazy_register is
+     * TOCTOU-safe under slot_lock. */
     if (lwmutex->sleep_queue == 0) {
         s32 rc = lwmutex_lazy_register(lwmutex);
         if (rc != CELL_OK) return rc;
@@ -580,25 +459,17 @@ s32 sys_lwmutex_lock(sys_lwmutex_t_hle* lwmutex, u64 timeout)
     }
     u32 gen_snap = s_lwmutex[slot].gen;
 
-    /* Lv2 Reference p.200: a NOT_RECURSIVE lwmutex relocked by its owner
-     * returns CELL_EDEADLK. The host lock is recursive, so without this the
-     * relock silently succeeded and recursion depth grew unbounded (the
-     * [lwdepth] diag below; 2026-08-04 doc-conformance audit). Safe before
-     * the acquire: owner_tid can only equal this thread if WE hold it.
-     * Kill-switch YZ_LWM_RELOCK_OK=1 restores the old always-succeed
-     * behavior for A/B isolation. */
+    /* A NOT_RECURSIVE lwmutex relocked by its owner returns CELL_EDEADLK.
+     * The host lock is recursive, so without this check the relock would
+     * succeed and recursion depth would grow unbounded. Safe before
+     * the acquire: owner_tid can only equal this thread if WE hold it. */
     {
-        static int relock_ok = -1;
-        if (relock_ok < 0) {
-            const char* e = getenv("YZ_LWM_RELOCK_OK");
-            relock_ok = (e && *e == '1') ? 1 : 0;
-        }
 #ifdef _WIN32
         unsigned long self_tid = (unsigned long)GetCurrentThreadId();
 #else
         unsigned long self_tid = (unsigned long)(uintptr_t)pthread_self();
 #endif
-        if (!relock_ok && !s_lwmutex[slot].recursive &&
+        if (!s_lwmutex[slot].recursive &&
             s_lwmutex[slot].owner_tid == self_tid) {
             static int n = 0; if (n < 8) { n++;
                 fprintf(stderr, "[lwm] non-recursive self-relock guest=0x%08X -> EDEADLK\n",
@@ -611,8 +482,7 @@ s32 sys_lwmutex_lock(sys_lwmutex_t_hle* lwmutex, u64 timeout)
     if (timeout == 0) {
         EnterCriticalSection(&s_lwmutex[slot].cs);
     } else {
-        /* Lv2 Reference p.200: finite timeout (microseconds) -> ETIMEDOUT.
-         * The argument used to be discarded (unbounded block). CS has no
+        /* A finite timeout (microseconds) returns ETIMEDOUT. A CS has no
          * timed acquire; poll the try form against a tick deadline. */
         ULONGLONG t0 = GetTickCount64();
         u64 ms = timeout / 1000; if (ms == 0) ms = 1;
@@ -636,7 +506,7 @@ s32 sys_lwmutex_lock(sys_lwmutex_t_hle* lwmutex, u64 timeout)
     }
 #endif
 
-    /* Revalidate AFTER acquiring: the lwmutex may have been destroyed (and
+    /* Revalidate after acquiring: the lwmutex may have been destroyed (and
      * the slot even recycled for a different lwmutex) while we were blocked
      * in Enter. Real lv2 returns ESRCH to a locker of a destroyed lwmutex. */
     if (!s_lwmutex[slot].in_use || s_lwmutex[slot].gen != gen_snap) {
@@ -658,21 +528,6 @@ s32 sys_lwmutex_lock(sys_lwmutex_t_hle* lwmutex, u64 timeout)
 #endif
     lwmutex->lock_var = 1;
     lwmutex->recursive_count++;
-    /* DIAG (pt47 LAYER-1 hypothesis): the Win32 CS is RECURSIVE, so the same
-     * thread re-acquiring this lwmutex succeeds instead of blocking. If one
-     * thread's recursive_count climbs unbounded on one lwmutex, that is the gcm
-     * flip-handler recursion -> guest stack overflow (lv2's non-recursive lwmutex
-     * would BLOCK the re-acquire here, capping depth at 1). */
-    if (lwmutex->recursive_count >= 8) {
-        static int lwd = 0;
-        if (lwd < 24) { lwd++;
-            fprintf(stderr, "[lwdepth] guest=0x%08X tid=%lu recursive_count=%d "
-                    "(same-thread re-acquire; lv2 non-recursive would block)\n",
-                    YZ_GUEST_ADDR(lwmutex), (unsigned long)GetCurrentThreadId(),
-                    lwmutex->recursive_count);
-            fflush(stderr);
-        }
-    }
     return CELL_OK;
 }
 
@@ -680,7 +535,7 @@ s32 sys_lwmutex_trylock(sys_lwmutex_t_hle* lwmutex)
 {
     if (!lwmutex) return CELL_EFAULT;
 
-    if (lwmutex_dead_check(lwmutex, "trylock"))   /* boot-13 resurrection fix */
+    if (lwmutex_dead_check(lwmutex, "trylock"))
         return CELL_EINVAL;
 
     if (lwmutex->sleep_queue == 0) {   /* lazily register static-init lwmutex (see lock) */
@@ -694,20 +549,8 @@ s32 sys_lwmutex_trylock(sys_lwmutex_t_hle* lwmutex)
     u32 gen_snap = s_lwmutex[slot].gen;
 
 #ifdef _WIN32
-    if (!TryEnterCriticalSection(&s_lwmutex[slot].cs)) {
-        /* DIAG (2026-07-03 late, the EBUSY-record hunt — REMOVE with the
-         * frontier): this is the only SILENT CELL_EBUSY in the runtime; if
-         * CRI's submit path eats one of these as a hard failure, this print
-         * names the moment (capped: contention EBUSY is normal elsewhere). */
-        { extern uint32_t yz_thread_current_id(void);
-          static long n = 0;
-          if (n < 200) { n++;
-              fprintf(stderr, "[lwm-trylock-EBUSY] t%u guest=0x%08X slot=%u holder=%lu\n",
-                      yz_thread_current_id(), YZ_GUEST_ADDR(lwmutex), slot,
-                      s_lwmutex[slot].owner_tid);
-              fflush(stderr); } }
+    if (!TryEnterCriticalSection(&s_lwmutex[slot].cs))
         return CELL_EBUSY;
-    }
 #else
     if (pthread_mutex_trylock(&s_lwmutex[slot].mtx) != 0)
         return CELL_EBUSY;
@@ -741,11 +584,10 @@ s32 sys_lwmutex_unlock(sys_lwmutex_t_hle* lwmutex)
     if (slot >= MAX_LWMUTEX || !s_lwmutex[slot].in_use)
         return CELL_ESRCH;
 
-    /* Lv2 Reference p.203: only the owning thread may unlock (EPERM). This
-     * also guards the recursive_count 0 -> 0xFFFFFFFF underflow that
-     * permanently pinned owner_tid (making destroy return EBUSY forever) and
-     * the Win32 UB of LeaveCriticalSection from a non-owner (2026-08-04
-     * doc-conformance audit). */
+    /* Only the owning thread may unlock (EPERM). This also guards the
+     * recursive_count 0 -> 0xFFFFFFFF underflow that would permanently pin
+     * owner_tid (making destroy return EBUSY forever) and the Win32 UB of
+     * LeaveCriticalSection from a non-owner. */
     {
 #ifdef _WIN32
         unsigned long self_tid = (unsigned long)GetCurrentThreadId();
@@ -779,14 +621,6 @@ s32 sys_lwmutex_unlock(sys_lwmutex_t_hle* lwmutex)
 
 s32 sys_lwmutex_destroy(sys_lwmutex_t_hle* lwmutex)
 {
-#ifdef _WIN32
-    printf("[sysPrxForUser] sys_lwmutex_destroy(guest=0x%08X) [host tid %lu]\n",
-           lwmutex ? YZ_GUEST_ADDR(lwmutex) : 0, GetCurrentThreadId());
-#else
-    printf("[sysPrxForUser] sys_lwmutex_destroy(guest=0x%08X)\n",
-           lwmutex ? YZ_GUEST_ADDR(lwmutex) : 0);
-#endif
-
     if (!lwmutex) return CELL_EFAULT;
 
     slot_lock();   /* serialize vs create's slot recycling */
@@ -800,8 +634,8 @@ s32 sys_lwmutex_destroy(sys_lwmutex_t_hle* lwmutex)
     /* lv2 refuses to destroy a held lwmutex (CELL_EBUSY) - games rely on
      * this when tearing down a heap another thread is still allocating
      * from: the EBUSY keeps the lock (and the heap) alive. owner_tid covers
-     * ALL holders including the destroyer itself (the old TryEnter check
-     * passed for a self-held recursive CS and then DELETED a held lock). */
+     * all holders including the destroyer itself (a TryEnter check passes
+     * for a self-held recursive CS). */
     if (s_lwmutex[slot].owner_tid != 0) {
         slot_unlock();
         printf("[sysPrxForUser] sys_lwmutex_destroy -> EBUSY\n");
@@ -814,12 +648,12 @@ s32 sys_lwmutex_destroy(sys_lwmutex_t_hle* lwmutex)
         printf("[sysPrxForUser] sys_lwmutex_destroy -> EBUSY\n");
         return CELL_EBUSY;
     }
-    /* Mark dead WHILE holding the CS, so any locker blocked in Enter wakes
+    /* Mark dead while holding the CS, so any locker blocked in Enter wakes
      * into the revalidation path and backs out with ESRCH. The CS itself is
-     * NEVER deleted: a concurrent locker may still be sitting in Enter, and
-     * DeleteCriticalSection under it is UB (the 2026-07-02 ~1/5 boot-stall
-     * root -- random forever-blocks at whatever lock next contended). The
-     * slot's CS stays initialized and is reused by the next create. */
+     * never deleted: a concurrent locker may still be sitting in Enter, and
+     * DeleteCriticalSection under it is UB (random forever-blocks at
+     * whatever lock next contended). The slot's CS stays initialized and is
+     * reused by the next create. */
     s_lwmutex[slot].in_use = 0;
     s_lwmutex[slot].gen++;
     LeaveCriticalSection(&s_lwmutex[slot].cs);
@@ -836,12 +670,10 @@ s32 sys_lwmutex_destroy(sys_lwmutex_t_hle* lwmutex)
 
     /* Publish the lv2 DEAD sentinel instead of a bare zero struct: a lock()
      * racing this destroy (or landing before the next create) must classify
-     * the mutex as deleted (CELL_EINVAL, oracle sys_lwmutex_.cpp:89,146-149),
-     * NOT fall into lwmutex_lazy_register and silently resurrect it on a
-     * phantom slot (the boot-13 mutual-exclusion loss). */
+     * the mutex as deleted (CELL_EINVAL), not fall into
+     * lwmutex_lazy_register and silently resurrect it on a phantom slot. */
     memset(lwmutex, 0, sizeof(*lwmutex));
     lwmutex_owner_set(lwmutex, YZ_LWMUTEX_DEAD);
-    printf("[sysPrxForUser] sys_lwmutex_destroy -> OK\n");
     return CELL_OK;
 }
 
@@ -852,8 +684,7 @@ s32 sys_lwmutex_destroy(sys_lwmutex_t_hle* lwmutex)
 s32 sys_lwcond_create(sys_lwcond_t_hle* lwcond, sys_lwmutex_t_hle* lwmutex,
                       const sys_lwcond_attribute_t* attr)
 {
-    printf("[sysPrxForUser] sys_lwcond_create(name='%.8s')\n",
-           attr ? attr->name : "???");
+    (void)attr;
 
     if (!lwcond || !lwmutex)
         return CELL_EFAULT;
@@ -895,9 +726,9 @@ s32 sys_lwcond_signal(sys_lwcond_t_hle* lwcond)
     if (slot >= MAX_LWCOND || !s_lwcond[slot].in_use)
         return CELL_ESRCH;
 
-    /* Rendezvous semantics (see LwCondSlot): a signal is HELD for a committed
+    /* Rendezvous semantics (see LwCondSlot): a signal is held for a committed
      * waiter (even one not yet parked in the CV) and discarded when no
-     * committed waiter remains unserved — exactly lv2's behavior. */
+     * committed waiter remains unserved, as on lv2. */
 #ifdef _WIN32
     EnterCriticalSection(&s_lwcond[slot].sig_cs);
     if (s_lwcond[slot].committed > s_lwcond[slot].pending) {
@@ -949,15 +780,14 @@ s32 sys_lwcond_wait(sys_lwcond_t_hle* lwcond, u64 timeout)
     u32 mslot = s_lwcond[cslot].lwmutex_id;
     if (mslot >= MAX_LWMUTEX || !s_lwmutex[mslot].in_use)
         return CELL_ESRCH;
-    /* 2026-08-04 doc-conformance audit: the wake-side re-acquire was the ONLY
-     * lock path with no destroy/recycle revalidation -- a waiter parked here
-     * across a destroy+create cycle re-entered the recycled slot's CS and
-     * stamped owner_tid over an unrelated live lwmutex. Snapshot the
-     * generation now; revalidate after re-acquiring. */
+    /* Snapshot the generation now and revalidate after the wake-side
+     * re-acquire: a waiter parked here across a destroy+create cycle would
+     * otherwise re-enter the recycled slot's CS and stamp owner_tid over an
+     * unrelated live lwmutex. */
     u32 mgen_snap = s_lwmutex[mslot].gen;
 
-    /* Rendezvous protocol (see LwCondSlot): COMMIT under the internal sig
-     * lock BEFORE releasing the guest lwmutex — after this instant a signal
+    /* Rendezvous protocol (see LwCondSlot): commit under the internal sig
+     * lock before releasing the guest lwmutex; after this instant a signal
      * cannot be lost (it lands in `pending`). Then release the guest mutex,
      * park on the CV against the sig lock, and on wake consume one pending.
      * The guest mutex is re-acquired before returning (lwcond_wait's
@@ -972,8 +802,8 @@ s32 sys_lwcond_wait(sys_lwcond_t_hle* lwcond, u64 timeout)
     LeaveCriticalSection(&s_lwmutex[mslot].cs);
 
     DWORD deadline_ms = (timeout == 0) ? INFINITE : (DWORD)(timeout / 1000);
-    /* Sub-ms timeouts floored to 0 returned ETIMEDOUT without ever waiting;
-     * a huge timeout could also collide with INFINITE (2026-08-04 audit). */
+    /* A sub-ms timeout floored to 0 would return ETIMEDOUT without ever
+     * waiting, and a huge timeout could collide with INFINITE. */
     if (timeout != 0 && deadline_ms == 0) deadline_ms = 1;
     if (timeout != 0 && deadline_ms == INFINITE) deadline_ms = INFINITE - 1;
     ULONGLONG t0 = GetTickCount64();
@@ -998,7 +828,7 @@ s32 sys_lwcond_wait(sys_lwcond_t_hle* lwcond, u64 timeout)
     s_lwcond[cslot].committed--;
     /* Timeout exit consumed no pending: keep the invariant pending <=
      * committed so a signal that landed in the exit window cannot strand and
-     * suppress the next legitimate signal (2026-08-04 audit). */
+     * suppress the next legitimate signal. */
     if (s_lwcond[cslot].pending > s_lwcond[cslot].committed)
         s_lwcond[cslot].pending = s_lwcond[cslot].committed;
     LeaveCriticalSection(&s_lwcond[cslot].sig_cs);
@@ -1060,15 +890,13 @@ s32 sys_lwcond_wait(sys_lwcond_t_hle* lwcond, u64 timeout)
 
 s32 sys_lwcond_destroy(sys_lwcond_t_hle* lwcond)
 {
-    printf("[sysPrxForUser] sys_lwcond_destroy()\n");
-
     if (!lwcond) return CELL_EFAULT;
 
     slot_lock();
     u32 slot = lwcond->lwcond_queue - 1;
     if (slot < MAX_LWCOND && s_lwcond[slot].in_use) {
         /* The CV object itself is kept initialized for slot reuse: destroying
-         * it with a stale waiter parked is UB (churn-safety, 2026-07-02). */
+         * it with a stale waiter parked is UB (churn-safety). */
         s_lwcond[slot].in_use = 0;
     }
     slot_unlock();
@@ -1087,8 +915,6 @@ s32 sys_heap_create_heap(sys_heap_t* heap, u32 start_addr, u32 size,
     (void)start_addr; (void)size; (void)flags;
     (void)alloc_func; (void)free_func;
 
-    printf("[sysPrxForUser] sys_heap_create_heap(size=%u)\n", size);
-
     if (!heap) return CELL_EFAULT;
 
     for (int i = 0; i < MAX_HEAPS; i++) {
@@ -1104,8 +930,6 @@ s32 sys_heap_create_heap(sys_heap_t* heap, u32 start_addr, u32 size,
 
 s32 sys_heap_destroy_heap(sys_heap_t heap)
 {
-    printf("[sysPrxForUser] sys_heap_destroy_heap(id=%u)\n", heap);
-
     for (int i = 0; i < MAX_HEAPS; i++) {
         if (s_heaps[i].in_use && s_heaps[i].id == heap) {
             s_heaps[i].in_use = 0;
@@ -1147,18 +971,14 @@ void* sys_heap_memalign(sys_heap_t heap, u32 align, u32 size)
 
 s32 sys_prx_exitspawn_with_level(void)
 {
-    printf("[sysPrxForUser] sys_prx_exitspawn_with_level() - no-op\n");
     return CELL_OK;
 }
 
 s32 sys_prx_get_module_id_by_name(const char* name, u64 flags, u32* id)
 {
-    /* Batch fixes item 11: real ABI is (name, flags, pOpt) -- the 3rd arg is
-     * an optional attribute struct, legally NULL and ignored here, NOT an
-     * out-param; the module id comes back in the RETURN VALUE (positive) or
-     * a negative error (RPCS3 Emu/Cell/Modules/sys_prx_.cpp:227-238
-     * sys_prx_get_module_id_by_name, Emu/Cell/lv2/sys_prx.cpp:1086-1114
-     * _sys_prx_get_module_id_by_name: not_an_error(id) / EBUSY on unknown). */
+    /* The ABI is (name, flags, pOpt): the 3rd arg is an optional attribute
+     * struct, legally NULL and ignored here, not an out-param; the module id
+     * comes back in the return value (positive) or a negative error. */
     (void)flags;
     (void)id;
     printf("[sysPrxForUser] sys_prx_get_module_id_by_name('%s')\n",
@@ -1238,11 +1058,11 @@ s32 console_write(const void* buf, u32 len)
 
 s32 sys_process_get_paramsfo(void* buf)
 {
-    /* _sys_process_get_paramsfo fills a FIXED 0x40-byte buffer (the firmware
+    /* _sys_process_get_paramsfo fills a fixed 0x40-byte buffer (the firmware
      * ABI; callers allocate exactly 0x40 on the stack -- e.g. libgcm's
      * _cellGcmInitBody zeroes 0x40 then calls this, with its saved non-volatile
-     * registers immediately after the buffer). Writing more (was 256) overruns
-     * the caller's frame and smashes its saved r26-r31 -> the caller restores 0
+     * registers immediately after the buffer). Writing more would overrun
+     * the caller's frame and smash its saved r26-r31 -> the caller restores 0
      * and faults. Zeroing 0x40 yields a minimal/empty param.sfo (callers
      * strncmp the title id and fall through to the default path). */
     if (!buf) return CELL_EFAULT;

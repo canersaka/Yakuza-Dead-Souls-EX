@@ -69,7 +69,7 @@ extern "C" {
  * Structures
  * -----------------------------------------------------------------------*/
 
-/* UTF-16LE character (PS3 uses big-endian u16, but for HLE we use host) */
+/* UTF-16 code unit; guest memory holds these big-endian. */
 typedef u16 CellOskDialogChar;
 
 typedef struct CellOskDialogInputFieldInfo {

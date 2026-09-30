@@ -2,11 +2,8 @@
  * ps3recomp - cellVpost HLE
  *
  * Video post-processing: YUV420-planar -> RGBA/YUV conversion with window
- * cut/paste scaling. Rewritten 2026-08-05 against the SDK contract
- * (ORACLE cell/vpost.h): the previous stub exported invented names
- * (Init/End/Query -- 3 of the game's 4 imported NIDs fell to ENOSYS),
- * transposed Exec's ctrlParam/picInfo, never wrote outputs, and carried
- * fabricated struct layouts and error codes.
+ * cut/paste scaling. Exports and struct layouts follow the SDK contract
+ * (QueryAttr, Open, Close, Exec).
  *
  * ABI note: the generic bridge passes pointer params as HOST pointers into
  * guest memory; every multi-byte struct field is guest big-endian and is
@@ -26,7 +23,7 @@
 extern "C" {
 #endif
 
-/* Error codes -- real SDK values (cell/vpost.h, PPM module). */
+/* Error codes -- real SDK values (PPM module). */
 #define CELL_VPOST_ERROR_Q_ARG_CFG_NULL          (s32)0x80610410
 #define CELL_VPOST_ERROR_Q_ARG_CFG_INVALID       (s32)0x80610411
 #define CELL_VPOST_ERROR_Q_ARG_ATTR_NULL         (s32)0x80610412
@@ -44,14 +41,12 @@ extern "C" {
 #define CELL_VPOST_ERROR_E_ARG_HDL_NULL          (s32)0x806104a0
 #define CELL_VPOST_ERROR_E_ARG_HDL_INVALID       (s32)0x806104a1
 #define CELL_VPOST_ERROR_E_ARG_INPICBUF_NULL     (s32)0x806104a2
-#define CELL_VPOST_ERROR_E_ARG_INPICBUF_INVALID  (s32)0x806104a3
 #define CELL_VPOST_ERROR_E_ARG_CTRL_NULL         (s32)0x806104a4
 #define CELL_VPOST_ERROR_E_ARG_CTRL_INVALID      (s32)0x806104a5
 #define CELL_VPOST_ERROR_E_ARG_OUTPICBUF_NULL    (s32)0x806104a6
-#define CELL_VPOST_ERROR_E_ARG_OUTPICBUF_INVALID (s32)0x806104a7
 #define CELL_VPOST_ERROR_E_ARG_PICINFO_NULL      (s32)0x806104a8
 
-/* Enum values (cell/vpost.h; each enum is a 4-byte guest word) */
+/* Enum values (each enum is a 4-byte guest word) */
 #define CELL_VPOST_PIC_DEPTH_8               0
 
 #define CELL_VPOST_PIC_FMT_IN_YUV420_PLANAR  0
@@ -156,8 +151,8 @@ typedef struct CellVpostPictureInfo {   /* 88 bytes */
     u32 reserved2;
 } CellVpostPictureInfo;
 
-/* Functions -- real export names (the game's 4 imported NIDs hash exactly
- * these; gen_imports.py resolves them by name). */
+/* Functions -- real export names (the imported NIDs hash exactly these;
+ * gen_imports.py resolves them by name). */
 s32 cellVpostQueryAttr(const CellVpostCfgParam* cfgParam, CellVpostAttr* attr);
 s32 cellVpostOpen(const CellVpostCfgParam* cfgParam,
                   const CellVpostResource* resource, CellVpostHandle* handle);

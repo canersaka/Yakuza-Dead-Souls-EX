@@ -1,9 +1,8 @@
 /*
  * ps3recomp - sysPrxForUser HLE
  *
- * Core PRX runtime: threads, process management, printf, lightweight
- * mutexes/condvars (backed by real host primitives), heap allocation,
- * and TLS support.
+ * Core PRX runtime: process management, string/memory helpers, lightweight
+ * mutexes/condvars (backed by real host primitives), and heap wrappers.
  */
 
 #ifndef PS3RECOMP_SYS_PRX_FOR_USER_H
@@ -22,12 +21,6 @@ extern "C" {
 
 /* Thread entry point */
 typedef void (*sys_ppu_thread_entry_t)(u64 arg);
-
-/* Thread attributes */
-typedef struct sys_ppu_thread_attr {
-    u32 entry;        /* guest entry address */
-    u32 tls_addr;
-} sys_ppu_thread_attr_t;
 
 /* Lightweight mutex attribute */
 typedef struct sys_lwmutex_attribute {
@@ -62,10 +55,6 @@ typedef struct sys_lwcond {
 #define SYS_SYNC_PRIORITY_INHERIT  0x00000003
 #define SYS_SYNC_RECURSIVE         0x00000010
 #define SYS_SYNC_NOT_RECURSIVE     0x00000020
-
-/* Thread priority range */
-#define SYS_PPU_THREAD_PRIORITY_MAX  0
-#define SYS_PPU_THREAD_PRIORITY_MIN  3071
 
 /* ---------------------------------------------------------------------------
  * Thread management
@@ -125,7 +114,7 @@ s32 sys_lwmutex_trylock(sys_lwmutex_t_hle* lwmutex);
 s32 sys_lwmutex_unlock(sys_lwmutex_t_hle* lwmutex);
 s32 sys_lwmutex_destroy(sys_lwmutex_t_hle* lwmutex);
 
-/* Reset all lwmutex/lwcond state ??? call before CRT redirect to game main */
+/* Destroy all lwmutex slots and clear the table (lwcond slots are untouched). */
 void sys_lwmutex_reset_all(void);
 
 /* ---------------------------------------------------------------------------

@@ -73,15 +73,11 @@ static void* ppu_host_thread_proc(void* param)
 {
     ppu_thread_info* info = (ppu_thread_info*)param;
 
-    fprintf(stderr, "[THREAD %llu] host thread started, entry=0x%08llX\n",
-            (unsigned long long)info->ctx.thread_id,
-            (unsigned long long)info->entry_addr);
-
     /* Invoke the recompiled entry point */
     if (g_ppu_thread_entry_trampoline) {
         g_ppu_thread_entry_trampoline(&info->ctx);
     } else {
-        fprintf(stderr, "[THREAD %llu] g_ppu_thread_entry_trampoline is NULL — thread is a no-op!\n",
+        fprintf(stderr, "[THREAD %llu] g_ppu_thread_entry_trampoline is NULL; thread is a no-op\n",
                 (unsigned long long)info->ctx.thread_id);
     }
 
@@ -131,7 +127,7 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
     uint64_t flags        = LV2_ARG_U64(ctx, 5);
     uint32_t name_addr    = LV2_ARG_PTR(ctx, 6);
 
-    /* Priority/flags validation (RPCS3 sys_ppu_thread.cpp:336,487,492-495). */
+    /* Priority must be 0..3071; both low flag bits set is EPERM. */
     if (priority < 0 || priority > 3071) {
         return (int64_t)(int32_t)CELL_EINVAL;
     }
@@ -212,13 +208,9 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
         *out = be_id;
     }
 
-    fprintf(stderr, "[SYS] sys_ppu_thread_create name=\"%s\" entry=0x%08llX arg=0x%llX stack=0x%X prio=%d\n",
-            t->name, (unsigned long long)entry, (unsigned long long)arg,
-            stack_size, priority);
-
     /* Create the host thread */
 #ifdef _WIN32
-    t->host_thread = CreateThread(NULL, 0, ppu_host_thread_proc, t, 0, &t->host_tid);
+    t->host_thread = CreateThread(NULL, 0, ppu_host_thread_proc, t, 0, NULL);
     if (t->host_thread == NULL) {
         t->state = PPU_THREAD_STATE_FREE;
         CloseHandle(t->finish_event);
@@ -271,8 +263,8 @@ int64_t sys_ppu_thread_exit(ppu_context* ctx)
     }
     table_unlock();
 
-    /* In a real implementation this would terminate the calling thread.
-     * The thread proc wrapper handles this after return. */
+    /* Only the table entry is updated here; the host thread ends when the
+     * thread proc returns. */
     return CELL_OK;
 }
 
@@ -287,8 +279,8 @@ int64_t sys_ppu_thread_join(ppu_context* ctx)
     uint64_t tid          = LV2_ARG_U64(ctx, 0);
     uint32_t status_addr  = LV2_ARG_PTR(ctx, 1);
 
-    /* Self-join guard (RPCS3 sys_ppu_thread.cpp:188-191): a thread joining
-     * itself can never complete -- EDEADLK before touching the table. */
+    /* Self-join guard: a thread joining itself can never complete, so
+     * EDEADLK before touching the table. */
     if (tid == ctx->thread_id) {
         return (int64_t)(int32_t)CELL_EDEADLK;
     }
@@ -370,8 +362,8 @@ int64_t sys_ppu_thread_detach(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_ESRCH;
     }
 
-    /* Re-detach guard (RPCS3 sys_ppu_thread.cpp:286-287): a thread already
-     * detached must not be detached again. */
+    /* Re-detach guard: a thread already detached must not be detached
+     * again. */
     if (t->state == PPU_THREAD_STATE_DETACHED) {
         table_unlock();
         return (int64_t)(int32_t)CELL_EINVAL;

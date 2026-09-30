@@ -10,7 +10,7 @@
 
 #ifdef _WIN32
 #include <timeapi.h>
-#pragma comment(lib, "winmm.lib")   /* timeBeginPeriod (audit item 6) */
+#pragma comment(lib, "winmm.lib")   /* timeBeginPeriod */
 #endif
 
 /* ---------------------------------------------------------------------------
@@ -18,11 +18,10 @@
  * -----------------------------------------------------------------------*/
 sys_timer_info g_sys_timers[SYS_TIMER_MAX];
 
-/* Batch fixes item 6 (one-shot timers): per-slot state parallel to
- * g_sys_timers, kept here rather than in sys_timer_info (sys_timer.h is out
- * of scope for this batch) -- base_time (absolute, timer_now_usec() clock)
- * and whether sys_timer_start armed this slot as one-shot (period == 0,
- * RPCS3 sys_timer.cpp:271-319). Reset when a slot is (re)created. */
+/* Per-slot state parallel to g_sys_timers, kept here rather than in
+ * sys_timer_info: base_time (absolute, timer_now_usec() clock) and whether
+ * sys_timer_start armed this slot as one-shot (period == 0). Reset when a
+ * slot is (re)created. */
 static uint64_t s_timer_base_time[SYS_TIMER_MAX];
 static int      s_timer_one_shot[SYS_TIMER_MAX];
 
@@ -38,14 +37,13 @@ static void ensure_qpc_init(void)
     }
 }
 
-/* Audit item 6 (2026-07-03, user-confirmed): pin the system timer resolution
- * to 1ms the first time this module actually uses a waitable timer, so
- * sys_timer_usleep's precision doesn't depend on yakuza/main.cpp having
- * already called timeBeginPeriod(1) (main.cpp:1659 does this too, for
- * scheduler-wide effect, but this module should be correct standalone --
- * e.g. for a non-yakuza runtime consumer of ps3recomp_runtime). Idempotent
+/* Pin the system timer resolution to 1ms the first time this module actually
+ * uses a waitable timer, so sys_timer_usleep's precision doesn't depend on
+ * the runner having already called timeBeginPeriod(1) (the runner does this
+ * too, for scheduler-wide effect, but this module should be correct
+ * standalone, e.g. for another consumer of ps3recomp_runtime). Idempotent
  * one-shot; timeBeginPeriod is a process-wide, refcounted request so a
- * second call from main.cpp is harmless. */
+ * second call from the runner is harmless. */
 static int s_time_period_init = 0;
 static void ensure_time_period_init(void)
 {
@@ -58,15 +56,12 @@ static void ensure_time_period_init(void)
 #endif
 
 /* ---------------------------------------------------------------------------
- * PPU timebase (mftb/mftbu) -- THE guest clock.
+ * PPU timebase (mftb/mftbu) -- the guest clock.
  *
  * One global monotonic counter scaled to the PS3 timebase (79.8 MHz),
- * anchored at first use. The old lifter emission was a per-call-site
- * static that advanced 16667 ticks PER READ -- not a clock at all: every
- * guest timing loop (the CRI ADXM VV pacer that schedules the whole media
- * stack, throttles, profilers) computed garbage from it. Found 2026-07-03:
- * the pacer's period stretched ~108x, starving the async-FS pump and
- * wedging the shader build. Overflow-safe split multiply (rem < qpf, so
+ * anchored at first use. Every guest timing loop (pacers, throttles,
+ * profilers) reads it, so it must be a real clock rather than a per-read
+ * increment. Overflow-safe split multiply (rem < qpf, so
  * rem * 79.8e6 < ~8e14 << 2^63).
  * -----------------------------------------------------------------------*/
 uint64_t ppu_timebase_now(void)
@@ -114,56 +109,25 @@ static void write_be64(uint32_t addr, uint64_t val)
     *p = val;
 }
 
-/* Set by the yakuza glue (import_overrides.cpp) only when YZ_RSX_INLINE is on:
- * pumps the RSX FIFO drain inside the reserve's sub-ms usleep spin, so GET
- * advances on the producer's thread while it waits for the RSX (the inline /
- * synchronous RSX experiment). NULL by default -> behaviour unchanged. */
-extern void (*g_yz_usleep_pump)(void);
-
 /* ---------------------------------------------------------------------------
  * sys_timer_usleep
  *
  * r3 = microseconds
  * -----------------------------------------------------------------------*/
-extern uint32_t yz_thread_current_id(void);
-
-int64_t sys_timer_usleep(ppu_context* ctx)
+static int64_t sys_timer_usleep_impl(ppu_context* ctx)
 {
     uint64_t usec = LV2_ARG_U64(ctx, 0);
-
-    /* s36 root-hunt: at the preload stall, t1's master loop wedges spinning on
-     * usleep(250). Log the CALLER (lr) of each distinct t1 usleep(250) site so we
-     * can decode the poll predicate it's stuck on (LESSONS #3: name the stuck
-     * flag). Env-gated YZ_USLEEP_LR, dedup per distinct lr, low volume. */
-    {
-        static int on = -1;
-        if (on < 0) on = getenv("YZ_USLEEP_LR") ? 1 : 0;
-        if (on && usec == 250 && yz_thread_current_id() == 1) {
-            static uint32_t seen[24]; static int sn = 0;
-            uint32_t lr = (uint32_t)ctx->lr;
-            int dup = 0;
-            for (int k = 0; k < sn; k++) if (seen[k] == lr) { dup = 1; break; }
-            if (!dup && sn < 24) {
-                seen[sn++] = lr;
-                fprintf(stderr, "[usleep-lr] t1 usleep(250) lr=0x%08X r1=0x%08X ctr=0x%08X r3in=0x%08X\n",
-                        lr, (uint32_t)ctx->gpr[1], (uint32_t)ctx->ctr, (uint32_t)ctx->gpr[3]);
-                fflush(stderr);
-            }
-        }
-    }
 
 #ifdef _WIN32
     ensure_time_period_init();
 
     /* Use high-resolution sleep via waitable timer for better precision.
-     * Audit item 6 (2026-07-03, user-confirmed): prefer
-     * CreateWaitableTimerExW with CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
-     * (Win10 1803+) -- it gives sub-millisecond timer resolution without
-     * needing the process-wide timeBeginPeriod(1) hack for THIS wait.
-     * Falls back to the plain CreateWaitableTimerW path (what this file
-     * used before) on older systems where the HIGH_RESOLUTION flag is
-     * rejected (CreateWaitableTimerExW returns NULL -- pre-1803 Windows 10,
-     * or Windows 7/8.x). */
+     * Prefer CreateWaitableTimerExW with CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+     * (Win10 1803+): it gives sub-millisecond timer resolution without
+     * needing the process-wide timeBeginPeriod(1) for this wait. Falls back
+     * to the plain CreateWaitableTimerW path on older systems where the
+     * HIGH_RESOLUTION flag is rejected (CreateWaitableTimerExW returns NULL:
+     * pre-1803 Windows 10, or Windows 7/8.x). */
     if (usec >= 1000) {
         HANDLE timer = CreateWaitableTimerExW(NULL, NULL,
             CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
@@ -181,22 +145,14 @@ int64_t sys_timer_usleep(ppu_context* ctx)
         }
     } else if (usec > 0) {
         /* Sub-millisecond sleep. A waitable timer / Sleep rounds up to the
-         * ~0.5-1 ms scheduler quantum, which is far too coarse: the guest relies
-         * on accurate microsecond pacing (e.g. Sony's libgcm segment-recycle
-         * reserve spins on sys_timer_usleep(30) waiting for the RSX GET to advance
-         * -- collapsing that 30us to a single yield lets the producer outrun and
-         * LAP the FIFO consumer -> deadlock). Busy-wait to the precise QPC
-         * deadline, mirroring RPCS3's TSC busy-tail (lv2.cpp wait_timeout,
-         * "Usleep Only"). Give a sibling host thread one scheduling opportunity
+         * ~0.5-1 ms scheduler quantum, which is too coarse: guest code polls
+         * with 30/250 us sleeps waiting for the RSX GET pointer to advance,
+         * and these must not collapse to a single yield. Busy-wait to the
+         * precise QPC deadline. Give a sibling host thread one scheduling opportunity
          * before the precision tail, then use processor pauses while checking the
          * deadline. Repeating SwitchToThread on every QPC check can reschedule the
          * caller for milliseconds under SPURS contention, multiplying a 30/250 us
          * guest poll far beyond its requested duration. */
-        /* Inline RSX drain ONCE per usleep call (YZ_RSX_INLINE) -- the reserve
-         * loops usleep(30), so this advances GET once per reserve iteration.
-         * Pumping inside the busy-wait spin (thousands of iters/30us) was
-         * catastrophically slow. */
-        if (g_yz_usleep_pump) g_yz_usleep_pump();
         ensure_qpc_init();
         LARGE_INTEGER qpc_start, qpc_now;
         QueryPerformanceCounter(&qpc_start);
@@ -218,6 +174,11 @@ int64_t sys_timer_usleep(ppu_context* ctx)
 #endif
 
     return CELL_OK;
+}
+
+int64_t sys_timer_usleep(ppu_context* ctx)
+{
+    return sys_timer_usleep_impl(ctx);
 }
 
 /* ---------------------------------------------------------------------------
@@ -252,44 +213,26 @@ int64_t sys_time_get_current_time(ppu_context* ctx)
     uint64_t sec, nsec;
 
 #ifdef _WIN32
-    /* U1/U2 fix (2026-07-09): the old code reported time since the QPC
-     * counter's own epoch (host uptime) as if it were calendar time -- a
-     * guest reading this as a real timestamp would see garbage (e.g. hours
-     * since this PC booted, not seconds since 1970). Anchor once to the real
-     * wall clock instead, mirroring RPCS3 sys_time.cpp:30-52
-     * (s_time_aux_info's GetSystemTimeAsFileTime + QPC anchor pair) and
-     * :352-367 (sys_time_get_current_time: anchor + QPC delta). Kill-switch
-     * YZ_NO_TIMEANCHOR restores the old host-uptime behaviour for A/B --
-     * system_time DELTAS (used for pacing everywhere) are identical either
-     * way; only the absolute epoch moves. */
-    static int           s_no_anchor = -1;
+    /* Report calendar time: anchor once to the real wall clock
+     * (GetSystemTimeAsFileTime + a QPC anchor pair) and add the QPC delta,
+     * rather than exposing time since the QPC epoch (host uptime), which a
+     * guest reading a real timestamp would see as hours since this PC
+     * booted, not seconds since 1970. */
     static int           s_anchor_init = 0;
     static uint64_t      s_anchor_epoch_ns = 0;  /* Unix epoch ns at anchor */
     static LARGE_INTEGER s_anchor_qpc;
-
-    if (s_no_anchor < 0) {
-        s_no_anchor = getenv("YZ_NO_TIMEANCHOR") ? 1 : 0;
-        fprintf(stderr, "[sys_time] timeanchor armed (wall-clock epoch %s)\n",
-                s_no_anchor ? "DISABLED by YZ_NO_TIMEANCHOR" : "on");
-        fflush(stderr);
-    }
 
     ensure_qpc_init();
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
 
-    if (s_no_anchor) {
-        /* Convert QPC to seconds + nanoseconds (old behaviour) */
-        sec  = (uint64_t)(now.QuadPart / s_qpc_freq.QuadPart);
-        uint64_t remainder = (uint64_t)(now.QuadPart % s_qpc_freq.QuadPart);
-        nsec = (remainder * 1000000000ULL) / (uint64_t)s_qpc_freq.QuadPart;
-    } else {
+    {
         if (!s_anchor_init) {
             FILETIME ft;
             GetSystemTimeAsFileTime(&ft);
             uint64_t ft100ns = ((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
-            /* 100ns units since 1601-01-01 -> since 1970-01-01 (RPCS3
-             * sys_time.cpp:49's constant), then to nanoseconds. */
+            /* 100ns units since 1601-01-01 -> since 1970-01-01, then to
+             * nanoseconds. */
             s_anchor_epoch_ns = (ft100ns - 116444736000000000ULL) * 100ULL;
             s_anchor_qpc = now;
             s_anchor_init = 1;
@@ -337,16 +280,14 @@ int64_t sys_time_get_timebase_frequency(ppu_context* ctx)
 /* Forward declaration */
 static void timer_send_event(sys_timer_info* t);
 
-/* 2026-08-04 doc-conformance audit (supersedes batch item 6): sys_timer
- * base/expiry times and the event data3 stamp are defined in SYSTEM time --
- * microseconds since boot, the clock the guest reads through
- * sys_time_get_system_time (Lv2 Reference p.27, p.255, p.257, p.259, p.262)
- * -- NOT Unix-epoch wall time. The previous wall-epoch clock (~1.75e15 us)
- * made every guest-supplied absolute base compare as "already past", firing
- * one-shots and periodic-absolute timers immediately. The runner registers
- * its boot-anchored guest clock here at startup (yakuza/import_overrides.cpp
- * yz_guest_system_time_us); standalone runtime builds fall back to a local
- * first-call anchor in the same domain. */
+/* sys_timer base/expiry times and the event data3 stamp are defined in system
+ * time: microseconds since boot, the clock the guest reads through
+ * sys_time_get_system_time, not Unix-epoch wall time. A wall-epoch clock
+ * (~1.75e15 us) would make every guest-supplied absolute base compare as
+ * "already past", firing one-shots and periodic-absolute timers immediately.
+ * The runner registers its boot-anchored guest clock here at startup;
+ * standalone runtime builds fall back to a local first-call anchor in the
+ * same domain. */
 uint64_t (*g_lv2_system_time_us)(void) = 0;
 
 #ifdef _WIN32
@@ -395,9 +336,9 @@ static DWORD WINAPI timer_thread_proc(LPVOID param)
     uint64_t base = s_timer_base_time[slot];
     int one_shot  = s_timer_one_shot[slot];
 
-    /* One-shot / first-periodic-fire base_time wait (RPCS3
-     * sys_timer.cpp:271-319): wait until base_time is reached, or fire
-     * immediately if it's already past. stop_event still cancels the wait. */
+    /* One-shot / first-periodic-fire base_time wait: wait until base_time is
+     * reached, or fire immediately if it's already past. stop_event still
+     * cancels the wait. */
     if (base != 0) {
         uint64_t now = timer_now_usec();
         if (base > now) {
@@ -505,11 +446,8 @@ static void timer_send_event(sys_timer_info* t)
     if (!q->active)
         return;
 
-    /* s33 conformance fix: data2 was hardcoded 0 (dropping the connect-time
-     * arg) and data3 was hardcoded 0 where the contract delivers the system
-     * time at expiry (RPCS3 sys_timer.cpp:90 emits current time as data3).
-     * timer_now_usec() is the same wall-clock-anchored microsecond clock
-     * sys_time_get_current_time uses (RPCS3 sys_time.cpp:30-52 anchor pair),
+    /* data2 is the connect-time argument and data3 is the system time at
+     * expiry (timer_now_usec(), the system-time clock described above),
      * i.e. system_time_t at the moment of firing. */
     sys_event_t evt;
     evt.source = t->source;
@@ -569,7 +507,6 @@ int64_t sys_timer_create(ppu_context* ctx)
 #ifdef _WIN32
     t->stop_event    = NULL;
     t->thread_handle = NULL;
-    t->timer_handle  = NULL;
 #else
     pthread_mutex_init(&t->mtx, NULL);
     pthread_cond_init(&t->cv, NULL);
@@ -600,10 +537,9 @@ int64_t sys_timer_destroy(ppu_context* ctx)
     if (!t->active)
         return (int64_t)(int32_t)CELL_ESRCH;
 
-    /* U7 fix (2026-07-09): a timer still connected to an event queue must be
-     * disconnected first (RPCS3 sys_timer.cpp:206-209: destroy checks
-     * `lv2_obj::check(timer.port)` under the timer's lock and returns
-     * CELL_EISCONN rather than silently tearing down the connection). */
+    /* A timer still connected to an event queue must be disconnected first;
+     * destroy returns CELL_EISCONN rather than silently tearing down the
+     * connection. */
     if (t->event_queue_id != 0)
         return (int64_t)(int32_t)CELL_EISCONN;
 
@@ -642,12 +578,9 @@ int64_t sys_timer_destroy(ppu_context* ctx)
  * r6 = data1
  * r7 = data2
  *
- * s33 conformance fix (fs-async/timers-clock sweep): the 5th argument (data2,
- * r7) was never read or stored, and the delivered event always hardcoded
- * data2=0; the connect-time data2 is delivered verbatim in every fired event
- * (RPCS3 sys_timer.cpp:363 connect + :90 send). NO_NAME source substitution
- * remains a separate, not-yet-fixed gap (t->source is still stored/emitted
- * raw); out of scope for this fix.
+ * The connect-time data2 (r7) is delivered verbatim in every fired event.
+ * NO_NAME source substitution is not implemented: t->source is stored and
+ * emitted raw.
  * -----------------------------------------------------------------------*/
 int64_t sys_timer_connect_event_queue(ppu_context* ctx)
 {
@@ -721,32 +654,13 @@ int64_t sys_timer_start(ppu_context* ctx)
     if (period != 0 && period < 100)
         return (int64_t)(int32_t)CELL_EINVAL;
 
-    /* Batch fixes item 6 (2026-07-09): period == 0 is a lv2 ONE-SHOT timer
-     * (RPCS3 sys_timer.cpp:271-319), not an error -- it fires exactly once
-     * when base_time is reached (immediately if base_time is already past)
-     * and does not re-arm. This was previously EINVAL'd unconditionally, so
-     * kill-switch YZ_NO_TIMER1SHOT restores that behavior for A/B. */
-    static int no_1shot = -1;
-    if (no_1shot < 0) {
-        no_1shot = getenv("YZ_NO_TIMER1SHOT") ? 1 : 0;
-        fprintf(stderr, "[timer1shot] armed (%s)\n",
-                no_1shot ? "DISABLED by YZ_NO_TIMER1SHOT" : "on");
-    }
-    if (period == 0 && no_1shot)
-        return (int64_t)(int32_t)CELL_EINVAL;
+    /* period == 0 is a one-shot timer, not an error: it fires exactly once
+     * when base_time is reached (immediately if base_time is already past;
+     * no error is returned in that case) and does not re-arm. */
 
     int slot = (int)(timer_id - 1);
     s_timer_base_time[slot] = base_time;
     s_timer_one_shot[slot]  = (period == 0) ? 1 : 0;
-
-    if (period == 0) {
-        static long n1s = 0;
-        if (n1s < 4) {
-            n1s++;
-            fprintf(stderr, "[timer] ONE-SHOT armed base=%llu\n",
-                    (unsigned long long)base_time);
-        }
-    }
 
     t->period_usec = period;
     t->running     = 1;
@@ -808,9 +722,8 @@ int64_t sys_timer_stop(ppu_context* ctx)
 /* ---------------------------------------------------------------------------
  * Registration
  *
- * The syscall numbers below are the real, non-colliding lv2 values -- see
- * lv2_syscall_table.h:91-94 for the history (the old 139-146 block collided
- * with the event-flag syscalls; fixed).
+ * The syscall numbers below are the real, non-colliding lv2 values (see
+ * lv2_syscall_table.h).
  * -----------------------------------------------------------------------*/
 void sys_timer_init(lv2_syscall_table* tbl)
 {

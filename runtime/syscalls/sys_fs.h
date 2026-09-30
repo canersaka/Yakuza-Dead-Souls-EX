@@ -31,28 +31,8 @@ extern "C" {
 #define SYS_FS_FD_MAX   256
 #define SYS_FS_DIR_MAX  64
 
-/* CellFsStat structure layout (as written to guest memory, all big-endian):
- *   u32 mode        @ 0
- *   s32 uid         @ 4
- *   s32 gid         @ 8
- *   u64 atime       @ 12  (actually at 16 with padding)
- *   u64 mtime       @ 20  (at 24)
- *   u64 ctime       @ 28  (at 32)
- *   u64 size        @ 36  (at 40)
- *   u64 blksize     @ 44  (at 48)
- * Total: 52 bytes (but padded to 56 for alignment)
- *
- * We use a simpler layout matching RPCS3:
- *   u32 mode        @ 0
- *   s32 uid         @ 4
- *   s32 gid         @ 8
- *   u32 pad         @ 12
- *   u64 atime       @ 16
- *   u64 mtime       @ 24
- *   u64 ctime       @ 32
- *   u64 size        @ 40
- *   u64 blksize     @ 48
- * Total: 56 bytes
+/* CellFsStat: 52 bytes, 4-byte packed, big-endian in guest memory:
+ * mode@0 uid@4 gid@8 atime@12 mtime@20 ctime@28 size@36 blksize@44.
  */
 
 /* CellFsMode flags */
@@ -84,14 +64,11 @@ extern "C" {
 typedef struct sys_fs_fd_info {
     int    active;
     FILE*  fp;
-    char   path[512];  /* host path */
-    int    flags;
 } sys_fs_fd_info;
 
 /* Directory descriptor entry */
 typedef struct sys_fs_dir_info {
     int    active;
-    char   path[512];
 
 #ifdef _WIN32
     HANDLE           find_handle;
@@ -106,7 +83,7 @@ typedef struct sys_fs_dir_info {
 extern sys_fs_fd_info  g_sys_fs_fds[SYS_FS_FD_MAX];
 extern sys_fs_dir_info g_sys_fs_dirs[SYS_FS_DIR_MAX];
 
-/* Configurable root directory for path mapping */
+/* Host root for guest paths (always ".") */
 extern char g_sys_fs_root[512];
 
 /* Path translation: convert PS3 path to host path */
