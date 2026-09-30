@@ -7,7 +7,9 @@ integer arithmetic, logical, shift/rotate, load/store, branch, compare,
 condition register, system, and common VMX/AltiVec operations.
 
 Usage:
-    python ppu_disasm.py <input_file> [--base ADDR] [--raw] [--functions]
+    py -3 tools/ppu_disasm.py <input_file> [--base ADDR] [--raw] [--functions]
+                              [--json] [--offset N] [--length N]
+                              [--little-endian]
 """
 
 import argparse
@@ -27,7 +29,7 @@ SPR_NAMES = {
     19: "DAR",
     22: "DEC",
     25: "SDR1",
-    256: "VRSAVE",   # audit 2b: was printed as bare spr256
+    256: "VRSAVE",
     26: "SRR0",
     27: "SRR1",
     268: "TBL",
@@ -70,38 +72,18 @@ def bit(insn: int, pos: int) -> int:
 class Instruction:
     """A single decoded PPU instruction."""
 
-    __slots__ = ("addr", "raw", "mnemonic", "operands", "comment")
+    __slots__ = ("addr", "raw", "mnemonic", "operands")
 
     def __init__(self, addr: int = 0, raw: int = 0, mnemonic: str = "???",
-                 operands: str = "", comment: str = ""):
+                 operands: str = ""):
         self.addr = addr
         self.raw = raw
         self.mnemonic = mnemonic
         self.operands = operands
-        self.comment = comment
 
     def __str__(self) -> str:
         hexb = f"{self.raw:08X}"
-        line = f"{self.addr:08X}:  {hexb}  {self.mnemonic:<10s} {self.operands}"
-        if self.comment:
-            line += f"  ; {self.comment}"
-        return line
-
-
-def _cr_bit_name(bi: int) -> str:
-    """Human-readable CR bit."""
-    cr = bi >> 2
-    sub = bi & 3
-    subnames = ["lt", "gt", "eq", "so"]
-    prefix = f"cr{cr}" if cr != 0 else ""
-    return prefix + subnames[sub] if prefix else subnames[sub]
-
-
-def _bo_hint(bo: int) -> str:
-    """Simplified BO mnemonic component."""
-    if bo & 0x14 == 0x14:
-        return ""  # unconditional
-    return ""
+        return f"{self.addr:08X}:  {hexb}  {self.mnemonic:<10s} {self.operands}"
 
 
 def _branch_cond_mnemonic(bo: int, bi: int) -> tuple[str, str]:
@@ -366,21 +348,21 @@ def decode(insn: int, addr: int = 0) -> Instruction:
 
     # Load/store instructions
     load_store = {
-        32: ("lwz", True), 33: ("lwzu", True),
-        34: ("lbz", True), 35: ("lbzu", True),
-        36: ("stw", False), 37: ("stwu", False),
-        38: ("stb", False), 39: ("stbu", False),
-        40: ("lhz", True), 41: ("lhzu", True),
-        42: ("lha", True), 43: ("lhau", True),
-        44: ("sth", False), 45: ("sthu", False),
-        46: ("lmw", True), 47: ("stmw", False),
-        48: ("lfs", True), 49: ("lfsu", True),
-        50: ("lfd", True), 51: ("lfdu", True),
-        52: ("stfs", False), 53: ("stfsu", False),
-        54: ("stfd", False), 55: ("stfdu", False),
+        32: "lwz", 33: "lwzu",
+        34: "lbz", 35: "lbzu",
+        36: "stw", 37: "stwu",
+        38: "stb", 39: "stbu",
+        40: "lhz", 41: "lhzu",
+        42: "lha", 43: "lhau",
+        44: "sth", 45: "sthu",
+        46: "lmw", 47: "stmw",
+        48: "lfs", 49: "lfsu",
+        50: "lfd", 51: "lfdu",
+        52: "stfs", 53: "stfsu",
+        54: "stfd", 55: "stfdu",
     }
     if opcd in load_store:
-        mne, is_load = load_store[opcd]
+        mne = load_store[opcd]
         d = sign_extend(bits(insn, 16, 31), 16)
         if d < 0:
             disp = f"-0x{-d:X}"
@@ -484,7 +466,7 @@ def decode(insn: int, addr: int = 0) -> Instruction:
         oe = bit(insn, 21)
 
         # --- XO-form integer arithmetic (xo_9) ---
-        # Instructions with only 2 register operands (rD, rA — no rB)
+        # Instructions with only 2 register operands (rD, rA, no rB)
         xo_arith_2op = {
             202: "addze", 234: "addme",
             200: "subfze", 232: "subfme",
@@ -573,26 +555,25 @@ def decode(insn: int, addr: int = 0) -> Instruction:
 
         # --- Load/store indexed ---
         x_ldst = {
-            23: ("lwzx", False), 55: ("lwzux", False),
-            87: ("lbzx", False), 119: ("lbzux", False),
-            151: ("stwx", False), 183: ("stwux", False),
-            215: ("stbx", False), 247: ("stbux", False),
-            279: ("lhzx", False), 311: ("lhzux", False),
-            343: ("lhax", False), 375: ("lhaux", False),
-            407: ("sthx", False), 439: ("sthux", False),
-            21: ("ldx", False), 53: ("ldux", False),
-            149: ("stdx", False), 181: ("stdux", False),
-            20: ("lwarx", False), 150: ("stwcx.", True),
-            84: ("ldarx", False), 214: ("stdcx.", True),
-            535: ("lfsx", False), 567: ("lfsux", False),
-            599: ("lfdx", False), 631: ("lfdux", False),
-            663: ("stfsx", False), 695: ("stfsux", False),
-            727: ("stfdx", False), 759: ("stfdux", False),
-            983: ("stfiwx", False),
+            23: "lwzx", 55: "lwzux",
+            87: "lbzx", 119: "lbzux",
+            151: "stwx", 183: "stwux",
+            215: "stbx", 247: "stbux",
+            279: "lhzx", 311: "lhzux",
+            343: "lhax", 375: "lhaux",
+            407: "sthx", 439: "sthux",
+            21: "ldx", 53: "ldux",
+            149: "stdx", 181: "stdux",
+            20: "lwarx", 150: "stwcx.",
+            84: "ldarx", 214: "stdcx.",
+            535: "lfsx", 567: "lfsux",
+            599: "lfdx", 631: "lfdux",
+            663: "stfsx", 695: "stfsux",
+            727: "stfdx", 759: "stfdux",
+            983: "stfiwx",
         }
         if xo_full in x_ldst:
-            mne, has_dot = x_ldst[xo_full]
-            result.mnemonic = mne
+            result.mnemonic = x_ldst[xo_full]
             result.operands = f"r{rd}, r{ra}, r{rb}"
             return result
 
@@ -654,7 +635,7 @@ def decode(insn: int, addr: int = 0) -> Instruction:
                 result.operands = f"r{ra}, r{rb}"
             return result
 
-        # twi trap
+        # tw (trap word)
         if xo_full == 4:
             result.mnemonic = "tw"
             result.operands = f"{rd}, r{ra}, r{rb}"
@@ -677,7 +658,7 @@ def decode(insn: int, addr: int = 0) -> Instruction:
             result.mnemonic = "sthbrx"
             result.operands = f"r{rd}, r{ra}, r{rb}"
             return result
-        # NOTE: XO 827 is sradi with shift >= 32 (handled in the x_shift block
+        # XO 827 is sradi with shift >= 32 (handled in the x_shift block
         # above, which returns early). The real lhaux is XO 375, already
         # decoded in the x_ldst table.
 
@@ -767,14 +748,6 @@ def decode(insn: int, addr: int = 0) -> Instruction:
             result.mnemonic = "stvxl"
             result.operands = f"v{rd}, r{ra}, r{rb}"
             return result
-        if xo_full == 6:    # lvsl
-            result.mnemonic = "lvsl"
-            result.operands = f"v{rd}, r{ra}, r{rb}"
-            return result
-        if xo_full == 38:   # lvsr
-            result.mnemonic = "lvsr"
-            result.operands = f"v{rd}, r{ra}, r{rb}"
-            return result
         if xo_full == 519:  # lvlx (Cell ext: Load Vector Left Indexed)
             result.mnemonic = "lvlx"
             result.operands = f"v{rd}, r{ra}, r{rb}"
@@ -791,8 +764,8 @@ def decode(insn: int, addr: int = 0) -> Instruction:
             result.mnemonic = "ldbrx"
             result.operands = f"r{rd}, r{ra}, r{rb}"
             return result
-        # Cell unaligned vector STORES (audit 5d: were op31_x647/x679 -> lifted
-        # as TODO no-ops = silent memory non-writes in real vector routines).
+        # Cell unaligned vector stores; they must decode by name so the lifter
+        # does not treat them as no-ops (silent memory non-writes).
         if xo_full == 647:  # stvlx (Store Vector Left Indexed)
             result.mnemonic = "stvlx"
             result.operands = f"v{rd}, r{ra}, r{rb}"
@@ -810,7 +783,7 @@ def decode(insn: int, addr: int = 0) -> Instruction:
             result.operands = f"v{rd}, r{ra}, r{rb}"
             return result
 
-        # Fall through – unknown ext opcode 31
+        # Fall through: unknown ext opcode 31
         result.mnemonic = f"op31_x{xo_full}"
         result.operands = f"r{rd}, r{ra}, r{rb}"
         return result
@@ -854,8 +827,7 @@ def decode(insn: int, addr: int = 0) -> Instruction:
             40: "fneg", 72: "fmr", 264: "fabs", 136: "fnabs",
             64: "mcrfs",
             583: "mffs", 711: "mtfsf",
-            # audit S2-10: FPSCR bit ops previously fell through to `.word`
-            # (invisible). FPSCR is unmodeled; the lifter no-ops these visibly.
+            # FPSCR bit ops. FPSCR is unmodeled; the lifter no-ops these visibly.
             70: "mtfsb0", 38: "mtfsb1", 134: "mtfsfi",
         }
         if xo_full in fp_x:
@@ -911,12 +883,10 @@ def decode(insn: int, addr: int = 0) -> Instruction:
         vc = bits(insn, 21, 25)
         # AltiVec VX-form has an 11-bit XO at bits 21-31; extract the full 11 bits.
         # Bit 21 doubles as the Rc flag for compare (VC-form) instructions.
-        xo_full = bits(insn, 21, 31)   # was bits(21,30) — missed bit 31 (XO LSB)
+        xo_full = bits(insn, 21, 31)
         xo_6 = bits(insn, 26, 31)
 
-        # VA-form (6-bit xo at bits 26-31). XOs corrected per kakaroto/ps3ida
-        # PPCAltivec (VXA macro) — the 36-45 range was previously scrambled,
-        # mislabeling vperm/vsel/vsldoi and the whole vmsum* family.
+        # VA-form (6-bit xo at bits 26-31).
         vmx_va = {
             32: "vmhaddshs", 33: "vmhraddshs", 34: "vmladduhm",
             36: "vmsumubm", 37: "vmsummbm", 38: "vmsumuhm", 39: "vmsumuhs",
@@ -926,16 +896,15 @@ def decode(insn: int, addr: int = 0) -> Instruction:
         }
         if xo_6 in vmx_va:
             result.mnemonic = vmx_va[xo_6]
-            if xo_6 == 44:  # vsldoi — 4th operand is a shift count, not a vector reg
+            if xo_6 == 44:  # vsldoi: 4th operand is a shift count, not a vector reg
                 result.operands = f"v{vd}, v{va}, v{vb}, {vc}"
             else:
                 result.operands = f"v{vd}, v{va}, v{vb}, v{vc}"
             return result
 
         # VX-form: xo_full is now 11 bits (bits 21-31).
-        # For compare (VC-form) instructions, bit 21 is Rc; XO_10 is bits 22-31.
+        # For compare (VC-form) instructions, bit 21 is Rc.
         vmx_cmp_rc = bit(insn, 21)  # Rc bit for compare instructions
-        xo_10 = bits(insn, 22, 31)  # 10-bit XO (bits 22-31), no Rc
 
         vmx_cmp = {
             6: "vcmpequb", 70: "vcmpequh", 134: "vcmpequw",
@@ -961,9 +930,7 @@ def decode(insn: int, addr: int = 0) -> Instruction:
             266: "vrefp", 330: "vrsqrtefp",
             1034: "vmaxfp", 1098: "vminfp",
             714: "vrfim",  # round to FP integer toward -inf (floor)
-            # audit 5a/5b (were vmx_x394/458/522/586/650 TODOs): estimates +
-            # the other three round-to-FP-integer forms (PEM 6-42/6-43;
-            # RPCS3 PPUOpcodes.h:274,280)
+            # Estimates + the other three round-to-FP-integer forms
             394: "vexptefp",  # 2^x estimate
             458: "vlogefp",   # log2(x) estimate
             522: "vrfin",     # round to nearest
@@ -984,9 +951,8 @@ def decode(insn: int, addr: int = 0) -> Instruction:
             514: "vminub", 578: "vminuh", 642: "vminuw",
             770: "vminsb", 834: "vminsh", 898: "vminsw",
 
-            # Logical (XOs corrected per kakaroto/ps3ida PPCAltivec + NXP ALTIVECPEM:
-            # vor=1156, vxor=1220, vnor=1284 — were previously shifted +64, which
-            # mislabeled 327 vxor (mostly vxor vD,vX,vX register-clears) as vor)
+            # Logical (vor=1156, vxor=1220, vnor=1284; a +64 shift would
+            # mislabel vxor, mostly vxor vD,vX,vX register-clears, as vor)
             1028: "vand", 1092: "vandc", 1156: "vor", 1220: "vxor",
             1284: "vnor",
 
@@ -995,14 +961,14 @@ def decode(insn: int, addr: int = 0) -> Instruction:
             516: "vsrb", 580: "vsrh", 644: "vsrw",
             772: "vsrab", 836: "vsrah", 900: "vsraw",
 
-            # (vspltisb/h/w moved to the SIMM handler below the UIMM block — their
-            # vA field (bits 11-15) is a 5-bit SIGNED immediate, not a register.)
+            # (vspltisb/h/w are handled by the SIMM handler below the UIMM block;
+            # their vA field (bits 11-15) is a 5-bit signed immediate, not a register.)
 
             # Merge
             12: "vmrghb", 76: "vmrghh", 140: "vmrghw",
             268: "vmrglb", 332: "vmrglh", 396: "vmrglw",
 
-            # Convert (vcfux/vcfsx/vctuxs/vctsxs) — these carry a UIMM scale in
+            # Convert (vcfux/vcfsx/vctuxs/vctsxs): these carry a UIMM scale in
             # the vA field, so they are decoded below with the dedicated
             # "vD, vB, UIMM" operand form, not here.
 
@@ -1048,8 +1014,8 @@ def decode(insn: int, addr: int = 0) -> Instruction:
             result.operands = f"v{vd}, v{vb}, {va}"
             return result
 
-        # vspltis* : vD, SIMM — the vA field (bits 11-15) is a 5-bit SIGNED
-        # immediate (-16..15), NOT a register (unlike vspltb/h/w's UIMM index).
+        # vspltis* : vD, SIMM. The vA field (bits 11-15) is a 5-bit signed
+        # immediate (-16..15), not a register (unlike vspltb/h/w's UIMM index).
         vmx_simm = {780: "vspltisb", 844: "vspltish", 908: "vspltisw"}
         if xo_full in vmx_simm:
             result.mnemonic = vmx_simm[xo_full]
@@ -1057,13 +1023,10 @@ def decode(insn: int, addr: int = 0) -> Instruction:
             result.operands = f"v{vd}, {simm}"
             return result
 
-        # lvx / stvx (X-form under opcode 31 actually, but some are opcd 4)
-        # Fallback for opcode 4
+        # Unrecognised VX-form: keep the raw XO in the mnemonic
         result.mnemonic = f"vmx_x{xo_full}"
         result.operands = f"v{vd}, v{va}, v{vb}"
         return result
-
-    # lvx/stvx now handled inside the main opcode 31 block above
 
     # twi (3)
     if opcd == 3:
@@ -1080,7 +1043,7 @@ def decode(insn: int, addr: int = 0) -> Instruction:
         return result
 
     # Unknown
-    result.mnemonic = f".word"
+    result.mnemonic = ".word"
     result.operands = f"0x{insn:08X}"
     return result
 

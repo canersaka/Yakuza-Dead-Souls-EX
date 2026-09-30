@@ -16,11 +16,14 @@ Analyses a PPU ELF or raw binary for function entry/exit points by:
   - Building a call graph
 
 Usage:
-    python find_functions.py <input_elf_or_bin> [--raw] [--base ADDR] [--json]
-                             [--call-graph] [--min-size N] [--no-opd]
+    py -3 tools/find_functions.py <input_elf_or_bin> -o functions.json
+                                  [--raw] [--base ADDR] [--little-endian]
+                                  [--json] [--call-graph] [--min-size N]
+                                  [--no-opd] [--seed-json FILE]
 """
 
 import argparse
+import bisect
 import json
 import os
 import struct
@@ -31,8 +34,7 @@ from dataclasses import dataclass, field
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from ppu_disasm import (Instruction, disassemble_bytes, decode, sign_extend,
-                        bits, bit)
+from ppu_disasm import Instruction, disassemble_bytes
 
 # ---------------------------------------------------------------------------
 # Instruction classification helpers
@@ -53,15 +55,6 @@ def _is_blr(insn: Instruction) -> bool:
 def _is_store_lr(insn: Instruction) -> bool:
     """Check for stw r0, X(r1) or std r0, X(r1) -- saving LR to stack."""
     if insn.mnemonic in ("stw", "std"):
-        ops = insn.operands.replace(" ", "")
-        if ops.startswith("r0,") and "(r1)" in ops:
-            return True
-    return False
-
-
-def _is_load_lr(insn: Instruction) -> bool:
-    """Check for lwz r0, X(r1) or ld r0, X(r1) -- restoring LR from stack."""
-    if insn.mnemonic in ("lwz", "ld"):
         ops = insn.operands.replace(" ", "")
         if ops.startswith("r0,") and "(r1)" in ops:
             return True
@@ -138,12 +131,10 @@ class FunctionFinder:
     """Detect function boundaries in a PPU instruction stream."""
 
     def __init__(self, instructions: list[Instruction], min_size: int = 8,
-                 seeds: set[int] | None = None,
-                 exec_ranges: list[tuple[int, int]] | None = None):
+                 seeds: set[int] | None = None):
         self.instructions = instructions
         self.min_size = min_size  # minimum function size in bytes
         self.seeds = seeds or set()           # known-true starts (.opd, entry)
-        self.exec_ranges = exec_ranges or []  # [(lo, hi)] of executable text
 
         # Build addr -> index lookup
         self._addr_to_idx: dict[int, int] = {}
@@ -167,7 +158,6 @@ class FunctionFinder:
 
             # Check next 1-3 instructions for stw/std r0, X(r1)
             found_store = False
-            found_stack = False
             stack_size = 0
             scan_end = min(i + 5, n)
 
@@ -176,7 +166,6 @@ class FunctionFinder:
                 if _is_store_lr(nxt):
                     found_store = True
                 if _is_stack_alloc(nxt):
-                    found_stack = True
                     # Extract stack size from operands
                     ops = nxt.operands.replace(" ", "")
                     try:
@@ -194,7 +183,7 @@ class FunctionFinder:
             # The PPC64 ELFv1 prologue may allocate the frame *before* saving
             # LR, i.e. `stdu r1,-X(r1)` then `mflr r0`. In that case the true
             # function entry (and the address used as a bl target) is the stdu,
-            # one instruction earlier — anchoring on mflr registers the start
+            # one instruction earlier; anchoring on mflr registers the start
             # 4 bytes late, which later makes find_leaf_functions discard the
             # real entry as a sub-min_size sliver. Back up to the stdu so the
             # start matches the actual call target.
@@ -314,7 +303,6 @@ class FunctionFinder:
 
     def _coverage_fn(self):
         """Return a fast addr-inside-a-known-function predicate."""
-        import bisect
         starts_sorted = sorted(self.functions)
         ends = [self.functions[s].end for s in starts_sorted]
 
@@ -404,7 +392,6 @@ class FunctionFinder:
         by the lifter's discovery pass, never by blind range extension
         (extending ranges sweeps inter-function padding/data in as garbage
         instructions)."""
-        import bisect
         live_seeds = [a for a in self.seeds
                       if a in self._addr_to_idx and a not in self.functions]
         all_starts = sorted(set(self.functions.keys()) | set(live_seeds))
@@ -436,7 +423,6 @@ class FunctionFinder:
         if not self.seeds:
             return 0
         seed_sorted = sorted(self.seeds)
-        import bisect
         dropped = 0
         for start in list(self.functions.keys()):
             if start in self.seeds or start in bl_targets:
@@ -575,12 +561,11 @@ def collect_opd_seeds(elf, exec_ranges: list[tuple[int, int]],
 
 
 def load_external_seeds(paths, exec_ranges) -> set[int]:
-    """Load function-start addresses from external analyzer exports (Ghidra /
-    IDA functions.json). Accepts a list of dicts (any of addr/start/address/ea,
-    hex string or int) or a bare list of addresses. Import thunks are skipped;
-    only 4-aligned addresses inside an executable range are kept.
+    """Load extra function-start addresses from another tool's JSON export.
+    Accepts a list of dicts (any of addr/start/address/ea, hex string or int)
+    or a bare list of addresses. Import thunks are skipped; only 4-aligned
+    addresses inside an executable range are kept.
     """
-    import json as _json
 
     def in_exec(a):
         return any(lo <= a < hi for lo, hi in exec_ranges)
@@ -594,8 +579,8 @@ def load_external_seeds(paths, exec_ranges) -> set[int]:
     out: set[int] = set()
     for path in paths:
         try:
-            data = _json.loads(open(path, encoding="utf-8").read())
-        except (OSError, _json.JSONDecodeError) as exc:
+            data = json.loads(open(path, encoding="utf-8").read())
+        except (OSError, json.JSONDecodeError) as exc:
             _note(f"seed-json: cannot read {path}: {exc}")
             continue
         items = data if isinstance(data, list) else data.get("functions", [])
@@ -634,10 +619,8 @@ def main() -> None:
     parser.add_argument("--no-opd", action="store_true",
                         help="Skip .opd descriptor seeding (ELF inputs)")
     parser.add_argument("--seed-json", metavar="FILE", action="append", default=None,
-                        help="Ingest external function starts as extra seeds "
-                             "(Ghidra/IDA functions.json). Repeatable. Closes the "
-                             "recall gap by trusting an independent disassembler's "
-                             "call-graph-recovered starts that .opd/prologue miss.")
+                        help="Extra function-start addresses from another tool's "
+                             "JSON export, used as additional seeds. Repeatable.")
     parser.add_argument("--output", "-o", metavar="FILE",
                         help="Write function list to JSON file (for use with ppu_lifter)")
     args = parser.parse_args()
@@ -697,8 +680,7 @@ def main() -> None:
     _note(f"disassembled {len(all_insns)} instructions across "
           f"{len(exec_ranges)} executable segment(s)")
 
-    finder = FunctionFinder(all_insns, min_size=args.min_size, seeds=seeds,
-                            exec_ranges=exec_ranges)
+    finder = FunctionFinder(all_insns, min_size=args.min_size, seeds=seeds)
     functions = finder.run()
 
     if seeds:

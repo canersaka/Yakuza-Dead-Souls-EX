@@ -1,4 +1,4 @@
-name: Repository hygiene
+name: Checks
 
 on:
   push:
@@ -9,7 +9,7 @@ permissions:
   contents: read
 
 jobs:
-  derived-payload-guard:
+  tracked-files:
     name: Block derived and proprietary payloads
     runs-on: ubuntu-latest
     steps:
@@ -19,4 +19,4 @@ jobs:
           fetch-depth: 0
 
       - name: Check tracked files
-        run: python tools/check_repository_hygiene.py
+        run: python tools/check_tracked_files.py

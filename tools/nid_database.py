@@ -4,11 +4,11 @@ PS3 NID (Name ID) resolution database.
 
 NIDs are 32-bit identifiers used by the PS3 LV2 kernel to reference exported
 and imported functions/variables in PRX modules.  A NID is computed as the
-first 4 bytes (big-endian) of SHA-1(function_name + suffix).
+first 4 bytes of SHA-1(function_name + suffix), read little-endian.
 
 This module provides:
   - NID computation from a function name
-  - A built-in database of ~200 common function NIDs from major PS3 modules
+  - A built-in database of common function NIDs from major PS3 modules
   - Loading/saving of external NID databases (JSON)
   - CLI for lookup by NID or name, and batch resolution
 
@@ -28,14 +28,14 @@ import re
 import struct
 import sys
 
+from source_parts import read_source
+
 # ---------------------------------------------------------------------------
 # NID computation
 # ---------------------------------------------------------------------------
 
-# The suffix that Sony appends before hashing.
-# This is the well-known 16-byte suffix used for PS3 NID generation
-# (verified against a real EBOOT import table and RPCS3's ppu_generate_id;
-# matches PS3_NID_SUFFIX in include/ps3emu/nid.h).
+# The 16-byte salt appended to the name before hashing; matches
+# verified against a real EBOOT import table.
 NID_SUFFIX = bytes([
     0x67, 0x59, 0x65, 0x99, 0x04, 0x25, 0x04, 0x90,
     0x56, 0x64, 0x27, 0x49, 0x94, 0x89, 0x74, 0x1A,
@@ -49,8 +49,8 @@ def compute_nid(name: str, suffix: bytes = NID_SUFFIX) -> int:
     """
     h = hashlib.sha1(name.encode("utf-8") + suffix)
     digest = h.digest()
-    # NID = first 4 bytes, LITTLE-endian (matches RPCS3 ppu_generate_id and
-    # the NIDs found in real import tables).
+    # NID = first 4 bytes, little-endian (matches the NIDs found in real
+    # import tables).
     return struct.unpack("<I", digest[:4])[0]
 
 # ---------------------------------------------------------------------------
@@ -447,12 +447,12 @@ class NIDDatabase:
             pass
 
     def load_implemented(self, repo_root: str | None = None) -> int:
-        """Add every exported-looking (cell*/sys*/sce*) function DEFINED in the
+        """Add every exported-looking (cell*/sys*/sce*) function defined in the
         repo's libs/ and runtime/ C sources, with its NID computed from the name.
         This keeps the resolver aligned with what the toolkit actually
         implements (mirrors the candidate-name scan gen_imports.py already runs
         for import binding; this is the equivalent for direct NIDDatabase
-        lookups, e.g. show_func.py / disasm annotation).
+        lookups).
 
         Returns the number of definitions scanned. Best-effort: silently does
         nothing if the source tree isn't found.
@@ -474,7 +474,7 @@ class NIDDatabase:
             for path in glob.glob(os.path.join(top, "**", "*.c"), recursive=True) + \
                         glob.glob(os.path.join(top, "**", "*.cpp"), recursive=True):
                 try:
-                    txt = open(path, encoding="utf-8", errors="replace").read()
+                    txt = read_source(path)
                 except OSError:
                     continue
                 module = os.path.splitext(os.path.basename(path))[0]

@@ -5,28 +5,31 @@ Find SPU function boundaries inside an embedded SPU ELF.
 Emits a JSON list of {"start": addr, "end": addr} ready for
 `spu_lifter.py --functions`.
 
-Seeds the function set from three sources:
+Seeds the function set from:
   1. ELF entry point (e_entry).
   2. Symbol table -- STT_FUNC entries (with their st_value/st_size if size
      is non-zero, which gives us *exact* boundaries when present).
-  3. All brsl/brasl targets the disassembler can resolve in the code.
+  3. All direct branch targets the disassembler can resolve in the code.
+  4. Return points of indirect calls (bisl-family).
+  5. Code addresses stored as 32-bit words (jump tables) and addresses loaded
+     with `ila`, or with `il` when the value feeds a bi-family branch.
+  6. The straight-line block after a computed `bi` (unrolled-loop entries).
 
 For each function start without a symbol-provided size, the end is
 determined by scanning forward until we hit one of:
    - `stop` / `stopd`,
-   - `bi $r0` (the SPU ABI return — link reg is $r0),
+   - `bi $r0` (the SPU ABI return; link reg is $r0),
+   - an unconditional `br` / `bra` / `iret`,
    - the next function start in the ordered seed set,
    - the end of the executable section.
 
-The output also reports a "data tail" if the executable PT_LOAD segment
-extends past the last detected function -- a hint that .rodata is linked
-into .text, and that the `.word` count from `spu_lifter.py` should drop
-once function boundaries are honoured.
+Verbose mode prints the seed counts and the share of the text segment that
+the detected functions cover.
 
 Usage:
-    python find_spu_functions.py <spu.elf> [--out functions.json]
-                                           [--code-out code.bin]
-                                           [--base ADDR]
+    py -3 tools/find_spu_functions.py <spu.elf> [--out functions.json]
+                                                [--code-out code.bin]
+                                                [--base ADDR]
 """
 
 import argparse
@@ -36,16 +39,14 @@ import struct
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from spu_disasm import disassemble_spu, spu_decode  # noqa: E402
+from spu_disasm import disassemble_spu  # noqa: E402
 from spu_lifter import _NO_RT_WRITE, _dest_reg  # noqa: E402  (shared write-tracking table)
 
 # ELF constants
 ELF_MAGIC          = b"\x7FELF"
 EM_SPU             = 23
 SHT_SYMTAB         = 2
-SHT_STRTAB         = 3
-SHF_EXECINSTR      = 4
-STT_FUNC           = 2
+STT_FUNC          = 2
 
 
 def be_u32(buf, off): return struct.unpack_from(">I", buf, off)[0]
@@ -147,8 +148,8 @@ _BRANCH_MNEMONICS = {
 def collect_branch_targets(insns):
     """All branch targets the disassembler resolved within `insns`.
 
-    Includes calls (brsl/brasl) AND non-call branches (br/bra/brz/brnz/...).
-    Conditional / unconditional cross-function branches are common — without
+    Includes calls (brsl/brasl) and non-call branches (br/bra/brz/brnz/...).
+    Conditional / unconditional cross-function branches are common; without
     seeding them, the lifter sees calls to functions the detector never
     promoted, producing linker-unresolved spu_func_X symbols.
     """
@@ -166,7 +167,7 @@ def collect_branch_targets(insns):
     return targets
 
 
-# Kept for backwards compatibility / call-only counting.
+# Targets of direct calls (brsl/brasl) only; the lifter splits regions at these.
 def collect_brsl_targets(insns):
     return {t for ins in insns if ins.mnemonic in ("brsl", "brasl")
             for t in [int(tok.strip(), 16) for tok in ins.operands.split(",")
@@ -202,9 +203,9 @@ def _il_dest_reg(token):
 
 def _bi_family_target_reg(ins):
     """The target register of a bi/bisl/bisled/biz/binz/bihz/bihnz, or None.
-    Mirrors spu_lifter.py's _bi_target_reg but also covers the indirect-CALL
-    forms (bisl/bisled put the target in the LAST operand, RT being the link
-    register) -- needed here because an `il`-loaded address can legally reach
+    Mirrors spu_lifter.py's _bi_target_reg but also covers the indirect-call
+    forms (bisl/bisled put the target in the last operand, RT being the link
+    register), needed here because an `il`-loaded address can legally reach
     either a plain jump or an indirect call."""
     ops = [t.strip() for t in ins.operands.split(",") if t.strip()]
     if ins.mnemonic == "bi" and ops:
@@ -271,7 +272,7 @@ def detect_functions(buf, base_override=None, verbose=True):
     seed_starts = set()
     sized_funcs = []   # (start, end) from symbols with non-zero size
 
-    # ELF entry point — 0 is a valid LS address, so don't treat falsy as unset.
+    # ELF entry point; 0 is a valid LS address, so don't treat falsy as unset.
     if code_start <= elf["entry"] < code_end:
         seed_starts.add(elf["entry"])
     for s in syms:
@@ -288,10 +289,9 @@ def detect_functions(buf, base_override=None, verbose=True):
     # callee returns there, so addr+4 is a real function boundary the branch-
     # target scan misses (the target is a register, not an immediate). Without
     # seeding it, the callee's return lands mid-function and the runtime
-    # dispatcher halts "unknown branch" (e.g. the SPURS kernel's service dispatch
-    # `bisl $r11` at 0x834 returns to 0x838 inside func_00000820). brsl/brasl
-    # (direct calls) already have their targets seeded above; their return
-    # points are normally followed by the lifter's inline continuation, but the
+    # dispatcher halts on an unknown branch target. brsl/brasl (direct calls)
+    # already have their targets seeded above; their return points are
+    # normally followed by the lifter's inline continuation, but the
     # indirect-call return is the one that must split.
     for ins in insns:
         if ins.mnemonic in ("bisl", "bisld", "bisle"):
@@ -299,16 +299,15 @@ def detect_functions(buf, base_override=None, verbose=True):
             if code_start <= ret < code_end:
                 seed_starts.add(ret)
 
-    # INDIRECT-DISPATCH TARGETS the brsl/branch scan can't resolve. SPU code
+    # Indirect-dispatch targets the brsl/branch scan can't resolve. SPU code
     # reaches many functions only through *computed* branches (bi/bisl on a
     # register), so their entry addresses never appear as a branch operand.
     # Two idioms cover almost all of them:
-    #   (a) JUMP TABLES -- the function address is stored as a 32-bit word in the
+    #   (a) jump tables: the function address is stored as a 32-bit word in the
     #       image (a dispatch table, usually .rodata embedded in .text). Scan
     #       every 4-aligned word for a value that is itself a 4-aligned address
-    #       inside the code range. (This is what finds e.g. the SPURS taskset
-    #       policy's 0x10F8, stored at word 0xFBC.)
-    #   (b) IMMEDIATE function pointers -- `ila $rX, addr` then `bisl $rX`.
+    #       inside the code range.
+    #   (b) immediate function pointers: `ila $rX, addr` then `bisl $rX`.
     # Over-seeding is safe: the lifter splits a function at any boundary and
     # chains the fall-through with a tail call, and every 4-aligned address in
     # the code range is a valid SPU instruction boundary, so a spurious seed at
@@ -332,23 +331,19 @@ def detect_functions(buf, base_override=None, verbose=True):
                     seed_starts.add(v)
                     n_imm += 1
 
-    #   (b2) `il $rX, addr` -- unlike ila (an 18-bit field that is ALWAYS an
+    #   (b2) `il $rX, addr`. Unlike ila (an 18-bit field that is always an
     #        address by construction), a bare `il` is a generic 16-bit signed
     #        immediate load; SPU code uses it constantly for ordinary size/
-    #        count/mask constants (added 2026-07-17, fork 3badf65 / cellmark
-    #        audit finding #3, then MEASURED here: a first cut that seeded
-    #        every in-range 4-aligned `il` value unconditionally, mirroring
-    #        ila's rule verbatim, changed the detected function set on 10/20
-    #        SPU images -- every spurious hit was a round-number SIZE
-    #        constant like 0x4000/0x2000 that happened to fall inside the
-    #        code range, not an address; see scratch/spu_funcset_diff diffs
-    #        in the 2026-07-17 batch report). So `il` is only trusted as an
-    #        address source when it demonstrably FEEDS a `bi`/`bisl`-family
-    #        branch on the same register with no intervening rewrite -- the
-    #        one shape where the SPU ISA has no other legal reading (the
-    #        genuine 'il $rX,addr ... bi/bisl $rX' immediate-function-
-    #        pointer idiom, same idea as (b)'s ila+bisl pairing, just typed
-    #        out for the smaller-immediate compiler path).
+    #        count/mask constants. Seeding every in-range 4-aligned `il`
+    #        value unconditionally would pick up round-number size constants
+    #        like 0x4000/0x2000 that happen to fall inside the code range,
+    #        not addresses. So `il` is only trusted as an address source
+    #        when it demonstrably feeds a `bi`/`bisl`-family branch on the
+    #        same register with no intervening rewrite, the one shape where
+    #        the SPU ISA has no other legal reading (the genuine
+    #        'il $rX,addr ... bi/bisl $rX' immediate-function-pointer
+    #        idiom, same idea as (b)'s ila+bisl pairing, just typed out for
+    #        the smaller-immediate compiler path).
     n_imm_il = 0
     for idx, ins in enumerate(insns):
         if ins.mnemonic != "il":
@@ -369,17 +364,16 @@ def detect_functions(buf, base_override=None, verbose=True):
         n_imm_il += 1
     n_imm += n_imm_il
 
-    #   (c) COMPUTED-BRANCH (Duff's-device) targets. SPU compilers emit a
+    #   (c) Computed-branch (Duff's-device) targets. SPU compilers emit a
     #       `bi $rX` (rX != $r0, i.e. not a return) that jumps to base+offset
-    #       INTO a nearby unrolled load/store run to handle a partial head/tail.
+    #       into a nearby unrolled load/store run to handle a partial head/tail.
     #       The offset is data-dependent (derived from a size/count at runtime),
     #       so the target appears neither as a branch operand nor as a stored
-    #       table word -- e.g. the SPURS taskset policy's task-region memset:
-    #       `bi $r5` at 0x2234 lands on one of the eight unrolled stores at
-    #       0x223C..0x2258 depending on the size, and the dispatcher halts
-    #       "unknown branch" on the mid-function PC. Seed every instruction in
+    #       table word -- for example a memset whose `bi` lands on one of
+    #       several unrolled stores depending on the size, so the dispatcher
+    #       would halt on a mid-function PC. Seed every instruction in
     #       the straight-line block that follows a computed `bi`, up to (and
-    #       including) the first control-flow instruction -- that block IS the
+    #       including) the first control-flow instruction; that block is the
     #       unrolled run the branch lands in. Over-seeding is safe (see above).
     n_comp = 0
     _CF = ("br", "bra", "brsl", "brasl", "bi", "bisl", "bisld", "bisle",

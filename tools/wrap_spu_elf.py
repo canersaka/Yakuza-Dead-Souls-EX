@@ -5,10 +5,7 @@ Wrap raw SPU instruction bytes in a minimal valid SPU ELF.
 Produces a 32-bit big-endian ELF (EM_SPU=23) with a single PT_LOAD
 executable segment, plus a section table containing `.text` and the two
 string tables (`.shstrtab`, `.strtab`). If a symbol list is supplied,
-an `.symtab` is emitted with STT_FUNC entries — useful both as a
-meta-test for `find_spu_functions.py` (it can recover boundaries from
-either symbols *or* brsl-target scanning) and as an artifact loadable by
-RPCS3.
+an `.symtab` is emitted with STT_FUNC entries.
 
 Usage as a library:
     from wrap_spu_elf import wrap
@@ -29,7 +26,7 @@ import sys
 EM_SPU         = 23
 ET_EXEC        = 2
 PT_LOAD        = 1
-PF_X, PF_W, PF_R = 1, 2, 4
+PF_X, PF_R = 1, 4
 SHT_NULL       = 0
 SHT_PROGBITS   = 1
 SHT_SYMTAB     = 2
@@ -155,7 +152,6 @@ def wrap(code: bytes, *, base: int = 0, entry: int = 0,
                         0, shstrtab_off, len(shstrtab_buf))
     next_idx += 1
     if symbols:
-        symtab_idx = next_idx
         strtab_idx = next_idx + 1
         # [N] .symtab    sh_link -> strtab idx;  sh_info -> 1 + index of last
         #                local symbol (we emit only globals after STN_UNDEF,

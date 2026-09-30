@@ -1,27 +1,26 @@
 #!/usr/bin/env python3
-"""Relocate a decrypted PS3 PRX module for static lifting (firmware LLE).
+"""Relocate a decrypted PS3 PRX module for static lifting.
 
-Takes a decrypted .prx (ELF64 BE, type 0xFFA4), places its LOAD segments at a
-chosen guest base, applies the SCE_PPURELA relocations, and emits:
+Takes a decrypted PRX module (ELF64 big-endian, PPC64), places its LOAD
+segments at a chosen guest base, applies the SCE_PPURELA relocations, and emits:
 
   <name>_image.bin       relocated flat image (load at --base in the runner)
   <name>_functions.json  function seeds for ppu_lifter (--raw --base mode):
                          every exported function's code address, region-bounded;
                          the lifter's discovery pass finds interior functions
-  <name>_exports.json    {library: {fnid_hex: opd_ea_hex}} for import binding
-  <name>_imports.json    the module's own imports: {library: {fnid_hex:
-                         stub_slot_ea_hex}} — slots the runner patches to its
-                         HLE bridge descriptors
+  <name>_exports.json    module name, base and TOC, plus
+                         {library: {fnid_hex: opd_ea_hex}}
 
-Relocation semantics follow the PS3 PRX format as documented by RPCS3's
-ppu_loader (PPUModule.cpp): 24-byte entries {offset u64, pad u16,
+<name> is the input file's base name without its extension.
+
+Relocation semantics follow the PS3 PRX format: 24-byte entries {offset u64, pad u16,
 index_value u8, index_addr u8, type u32, ptr u64}; target =
 seg[index_addr].base + offset; value = (index_value == 0xFF ? 0 :
-seg[index_value].base) + ptr. Types: 1 = ADDR32, 4 = ADDR16_LO, 5 = ADDR16_HI,
-6 = ADDR16_HA, 10 = REL24, 44 = REL64, 57 = ADDR16_LO_DS.
+seg[index_value].base) + ptr. Types handled: 1 = ADDR32, 4 = ADDR16_LO,
+5 = ADDR16_HI, 6 = ADDR16_HA, 44 = REL64; any other type is an error.
 
 Usage:
-    py -3 tools/lift_prx.py libsre.prx --base 0x02000000 --output recomp_prx/
+    py -3 tools/lift_prx.py game/ogrez_shader_ps3.ppu.elf --base 0x02200000 --output recomp_prx/
 """
 
 import argparse
@@ -110,17 +109,16 @@ class Prx:
                 img[target:target + 8] = struct.pack(">Q", value & (2**64 - 1))
             else:
                 raise SystemExit(f"unhandled relocation type {rtype} "
-                                 f"(entry {i}) — extend lift_prx.py")
+                                 f"(entry {i}); extend lift_prx.py")
         return bytes(img), counts
 
     def parse_modinfo(self, img, base):
-        """Exports/imports from the RELOCATED image (tables hold real EAs)."""
+        """Module name, TOC and exports from the RELOCATED image (tables hold real EAs)."""
         d = self.data
         mi = self.modinfo_off
         name = d[mi + 4:mi + 32].split(b"\0")[0].decode("ascii", "replace")
         toc = be32(d, mi + 0x20)
         exp_start, exp_end = be32(d, mi + 0x24), be32(d, mi + 0x28)
-        imp_start, imp_end = be32(d, mi + 0x2C), be32(d, mi + 0x30)
 
         def img32(va):
             return be32(img, va)
@@ -143,29 +141,19 @@ class Prx:
                 exports[lib] = entries
             o += size if size else 0x1C
 
-        imports = {}
-        o = imp_start
-        while o < imp_end:
-            size = img[o]
-            nfunc = be16(img, o + 6)
-            libname_ptr = img32(o + 16)
-            nid_tbl = img32(o + 20)
-            stub_tbl = img32(o + 24)
-            lib = cstr(img, libname_ptr - base) if libname_ptr else "?"
-            entries = {}
-            for i in range(nfunc):
-                fnid = img32(nid_tbl - base + i * 4)
-                slot_ea = img32(stub_tbl - base + i * 4)
-                entries[f"0x{fnid:08X}"] = f"0x{slot_ea:08X}"
-            imports[lib] = entries
-            o += size if size else 0x2C
-
-        return name, toc, exports, imports
+        return name, toc, exports
 
     def text_extent(self):
         """(vaddr, size) of the first (text) LOAD segment."""
         off, vaddr, filesz, memsz = self.loads[0]
         return vaddr, filesz
+
+    def table_starts(self):
+        """Image offsets of the module info and the export and import tables,
+        which the text segment holds after the code."""
+        d, mi = self.data, self.modinfo_off
+        off, vaddr, filesz, memsz = self.loads[0]
+        return [vaddr + mi - off, be32(d, mi + 0x24), be32(d, mi + 0x2C)]
 
 
 def main():
@@ -177,7 +165,7 @@ def main():
 
     prx = Prx(args.input)
     img, counts = prx.build_image(args.base)
-    name, toc, exports, imports = prx.parse_modinfo(img, args.base)
+    name, toc, exports = prx.parse_modinfo(img, args.base)
     stem = os.path.splitext(os.path.basename(args.input))[0]
     os.makedirs(args.output, exist_ok=True)
 
@@ -187,20 +175,17 @@ def main():
     # entries); unreachable tail code inside a region lifts harmlessly.
     text_va, text_sz = prx.text_extent()
     code_addrs = set()
-    opd_map = {}
     for lib, entries in exports.items():
         for fnid, opd in entries.items():
             opd_ea = int(opd, 16)
             code = be32(img, opd_ea - args.base)
             code_addrs.add(code)
-            opd_map[opd] = f"0x{code:08X}"
 
-    # ALSO seed every internal OPD: scan the image for {code, toc} pairs
-    # with toc == the module TOC and code inside text. Functions referenced
-    # only through data OPDs (e.g. SPURS passes its PPU handler-thread
-    # entries to sys_ppu_thread_create) are invisible to the lifter's
-    # branch discovery — without these seeds they lift as nothing and the
-    # threads exit instantly (observed live with pxd::SpursHdlr0/1).
+    # Also seed every internal OPD: scan the image for {code, toc} pairs
+    # with toc == the module TOC and code inside text. Functions reached
+    # only through data descriptors (for example thread entry points passed
+    # to sys_ppu_thread_create) are invisible to the lifter's branch
+    # discovery and would lift as nothing.
     text_lo = args.base + text_va
     text_hi = args.base + text_va + text_sz
     toc_ea = toc + args.base
@@ -213,10 +198,17 @@ def main():
             code_addrs.add(code)
             n_opd_seeds += 1
     seeds = sorted(code_addrs)
-    text_end = args.base + text_va + text_sz
+    # The last region ends where the code does: at the first module table
+    # after it, less the zero words that pad the code up to that table.
+    code_end = args.base + text_va + text_sz
+    for table in prx.table_starts():
+        if seeds and seeds[-1] < args.base + table < code_end:
+            code_end = args.base + table
+    while seeds and code_end - 4 > seeds[-1] and be32(img, code_end - 4 - args.base) == 0:
+        code_end -= 4
     funcs = []
     for i, s in enumerate(seeds):
-        e = seeds[i + 1] if i + 1 < len(seeds) else text_end
+        e = seeds[i + 1] if i + 1 < len(seeds) else code_end
         funcs.append({"start": f"0x{s:08X}", "end": f"0x{e:08X}"})
 
     img_path = os.path.join(args.output, f"{stem}_image.bin")
@@ -224,18 +216,14 @@ def main():
     json.dump(funcs, open(os.path.join(args.output, f"{stem}_functions.json"), "w"),
               indent=1)
     json.dump({"module": name, "base": f"0x{args.base:08X}", "toc": f"0x{toc + args.base:08X}",
-               "exports": exports, "opd_to_code": opd_map},
+               "exports": exports},
               open(os.path.join(args.output, f"{stem}_exports.json"), "w"), indent=1)
-    json.dump(imports, open(os.path.join(args.output, f"{stem}_imports.json"), "w"),
-              indent=1)
 
     n_exp = sum(len(v) for v in exports.values())
-    n_imp = sum(len(v) for v in imports.values())
     print(f"module '{name}'  base 0x{args.base:08X}  TOC 0x{toc + args.base:08X}")
     print(f"image {len(img)} bytes -> {img_path}")
     print(f"relocations applied: " + ", ".join(f"type{k} x{v}" for k, v in sorted(counts.items())))
-    print(f"exports: {n_exp} funcs in {len(exports)} libs; imports: {n_imp} funcs "
-          f"in {len(imports)} libs")
+    print(f"exports: {n_exp} funcs in {len(exports)} libs")
     print(f"function seeds: {len(funcs)} ({n_opd_seeds} from internal OPD scan; "
           f"region-bounded; lifter discovery fills interiors)")
 

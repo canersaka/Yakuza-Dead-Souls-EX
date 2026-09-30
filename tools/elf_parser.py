@@ -1,21 +1,12 @@
-#!/usr/bin/env python3
 """
-PS3 ELF / SELF / PRX binary parser.
+PS3 ELF / PRX binary parser (library module).
 
-Parses standard ELF64 (PPU) and ELF32 headers, SELF (Signed ELF) wrappers,
-program headers, section headers, PRX module info, export/import tables,
-NID tables, and relocations.
-
-Usage:
-    python elf_parser.py <input_file> [--json] [--sections] [--segments]
-                         [--imports] [--exports] [--relocs] [--all]
+Parses ELF64 (PPU) and ELF32 headers, program headers, section headers,
+and the PRX module info with its export/import tables. Input files must
+already be decrypted ELFs.
 """
 
-import argparse
-import json
-import os
 import struct
-import sys
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -24,75 +15,17 @@ import sys
 # ELF magic
 ELF_MAGIC = b"\x7fELF"
 
-# SELF magic  "SCE\0"
-SELF_MAGIC = 0x53434500
-
-# ELF classes
-ELFCLASS32 = 1
+# ELF class
 ELFCLASS64 = 2
 
 # Endianness
 ELFDATA2MSB = 2  # big-endian  (PS3 native)
-ELFDATA2LSB = 1  # little-endian
-
-# OS/ABI
-ELFOSABI_CELL_LV2 = 0x66
 
 # ELF types
-ET_EXEC = 2
 ET_SCE_PPURELEXEC = 0xFFA4  # PRX
 
-# Machine
-EM_PPC64 = 21
-
 # Program header types
-PT_NULL = 0
 PT_LOAD = 1
-PT_NOTE = 4
-PT_SCE_PPURELA = 0x700000A4
-
-# Section header types
-SHT_NULL = 0
-SHT_PROGBITS = 1
-SHT_SYMTAB = 2
-SHT_STRTAB = 3
-SHT_RELA = 4
-SHT_NOBITS = 8
-SHT_REL = 9
-
-# Relocation types (R_PPC64_*)
-R_PPC64_NONE = 0
-R_PPC64_ADDR32 = 1
-R_PPC64_ADDR16_LO = 4
-R_PPC64_ADDR16_HI = 5
-R_PPC64_ADDR16_HA = 6
-R_PPC64_REL24 = 10
-R_PPC64_REL14 = 11
-R_PPC64_TOC16 = 47
-R_PPC64_TOC16_LO = 48
-R_PPC64_TOC16_HI = 49
-R_PPC64_TOC16_HA = 50
-
-RELA_TYPE_NAMES = {
-    R_PPC64_NONE: "R_PPC64_NONE",
-    R_PPC64_ADDR32: "R_PPC64_ADDR32",
-    R_PPC64_ADDR16_LO: "R_PPC64_ADDR16_LO",
-    R_PPC64_ADDR16_HI: "R_PPC64_ADDR16_HI",
-    R_PPC64_ADDR16_HA: "R_PPC64_ADDR16_HA",
-    R_PPC64_REL24: "R_PPC64_REL24",
-    R_PPC64_REL14: "R_PPC64_REL14",
-    R_PPC64_TOC16: "R_PPC64_TOC16",
-    R_PPC64_TOC16_LO: "R_PPC64_TOC16_LO",
-    R_PPC64_TOC16_HI: "R_PPC64_TOC16_HI",
-    R_PPC64_TOC16_HA: "R_PPC64_TOC16_HA",
-}
-
-PT_TYPE_NAMES = {
-    PT_NULL: "PT_NULL",
-    PT_LOAD: "PT_LOAD",
-    PT_NOTE: "PT_NOTE",
-    PT_SCE_PPURELA: "PT_SCE_PPURELA",
-}
 
 # ---------------------------------------------------------------------------
 # Helper: endian-aware unpacker
@@ -117,88 +50,11 @@ class BinaryReader:
     def u64(self, off: int) -> int:
         return struct.unpack_from(self.endian + "Q", self.data, off)[0]
 
-    def s32(self, off: int) -> int:
-        return struct.unpack_from(self.endian + "i", self.data, off)[0]
-
-    def s64(self, off: int) -> int:
-        return struct.unpack_from(self.endian + "q", self.data, off)[0]
-
-    def bytes_at(self, off: int, size: int) -> bytes:
-        return self.data[off:off + size]
-
     def cstring(self, off: int, max_len: int = 256) -> str:
         end = self.data.find(b"\x00", off, off + max_len)
         if end == -1:
             end = off + max_len
         return self.data[off:end].decode("utf-8", errors="replace")
-
-# ---------------------------------------------------------------------------
-# SELF header
-# ---------------------------------------------------------------------------
-
-class SELFHeader:
-    """SCE SELF header – wraps an encrypted/signed ELF."""
-
-    SIZE = 32  # minimum SCE header size
-
-    def __init__(self):
-        self.magic = 0
-        self.version = 0
-        self.key_type = 0
-        self.category = 0
-        self.metadata_offset = 0
-        self.header_size = 0
-        self.data_size = 0
-        self.is_self = False
-        self.elf_offset = 0  # offset to the embedded ELF
-
-    @classmethod
-    def parse(cls, data: bytes) -> "SELFHeader":
-        if len(data) < cls.SIZE:
-            raise ValueError("Data too small for SELF header")
-
-        hdr = cls()
-        # SELF header is always big-endian
-        rd = BinaryReader(data, big_endian=True)
-        hdr.magic = rd.u32(0)
-        if hdr.magic != SELF_MAGIC:
-            return hdr  # not a SELF
-
-        hdr.is_self = True
-        hdr.version = rd.u32(4)
-        hdr.key_type = rd.u16(8)
-        hdr.category = rd.u16(10)
-        hdr.metadata_offset = rd.u32(12)
-        hdr.header_size = rd.u64(16)
-        hdr.data_size = rd.u64(24)
-
-        # The embedded ELF starts at header_size in most SELF variants.
-        # For retail SELFs the ELF header is actually at a fixed offset
-        # after the extended header + section info entries.  We search
-        # for the ELF magic within the first 0x1000 bytes as a fallback.
-        candidate = int(hdr.header_size)
-        if candidate < len(data) and data[candidate:candidate + 4] == ELF_MAGIC:
-            hdr.elf_offset = candidate
-        else:
-            # brute search
-            idx = data.find(ELF_MAGIC, 0, min(len(data), 0x10000))
-            if idx != -1:
-                hdr.elf_offset = idx
-            else:
-                hdr.elf_offset = 0  # give up – caller should handle
-        return hdr
-
-    def to_dict(self) -> dict:
-        return {
-            "magic": f"0x{self.magic:08X}",
-            "version": self.version,
-            "key_type": self.key_type,
-            "category": self.category,
-            "metadata_offset": self.metadata_offset,
-            "header_size": self.header_size,
-            "data_size": self.data_size,
-            "elf_offset": self.elf_offset,
-        }
 
 # ---------------------------------------------------------------------------
 # ELF header
@@ -271,22 +127,6 @@ class ELFHeader:
 
         return hdr
 
-    def to_dict(self) -> dict:
-        return {
-            "class": "ELF64" if self.is64 else "ELF32",
-            "endian": "big" if self.big_endian else "little",
-            "osabi": f"0x{self.ei_osabi:02X}",
-            "type": f"0x{self.e_type:04X}",
-            "machine": f"0x{self.e_machine:04X}",
-            "entry": f"0x{self.e_entry:X}",
-            "phoff": self.e_phoff,
-            "shoff": self.e_shoff,
-            "flags": f"0x{self.e_flags:08X}",
-            "phnum": self.e_phnum,
-            "shnum": self.e_shnum,
-            "shstrndx": self.e_shstrndx,
-        }
-
 # ---------------------------------------------------------------------------
 # Program header
 # ---------------------------------------------------------------------------
@@ -328,21 +168,6 @@ class ProgramHeader:
             ph.p_flags = rd.u32(off + 24)
             ph.p_align = rd.u32(off + 28)
         return ph
-
-    def type_name(self) -> str:
-        return PT_TYPE_NAMES.get(self.p_type, f"0x{self.p_type:08X}")
-
-    def to_dict(self) -> dict:
-        return {
-            "type": self.type_name(),
-            "flags": f"0x{self.p_flags:X}",
-            "offset": f"0x{self.p_offset:X}",
-            "vaddr": f"0x{self.p_vaddr:X}",
-            "paddr": f"0x{self.p_paddr:X}",
-            "filesz": f"0x{self.p_filesz:X}",
-            "memsz": f"0x{self.p_memsz:X}",
-            "align": f"0x{self.p_align:X}",
-        }
 
 # ---------------------------------------------------------------------------
 # Section header
@@ -393,62 +218,6 @@ class SectionHeader:
             sh.sh_entsize = rd.u32(off + 36)
         return sh
 
-    def to_dict(self) -> dict:
-        return {
-            "name": self.name_str or f"(stridx {self.sh_name})",
-            "type": f"0x{self.sh_type:X}",
-            "flags": f"0x{self.sh_flags:X}",
-            "addr": f"0x{self.sh_addr:X}",
-            "offset": f"0x{self.sh_offset:X}",
-            "size": f"0x{self.sh_size:X}",
-            "link": self.sh_link,
-            "info": self.sh_info,
-            "entsize": f"0x{self.sh_entsize:X}",
-        }
-
-# ---------------------------------------------------------------------------
-# Relocation entry
-# ---------------------------------------------------------------------------
-
-class RelaEntry:
-    """ELF RELA relocation entry."""
-
-    def __init__(self):
-        self.r_offset = 0
-        self.r_info = 0
-        self.r_addend = 0
-        self.r_sym = 0
-        self.r_type = 0
-
-    @classmethod
-    def parse(cls, data: bytes, offset: int, is64: bool, big_endian: bool) -> "RelaEntry":
-        rd = BinaryReader(data, big_endian)
-        r = cls()
-        if is64:
-            r.r_offset = rd.u64(offset)
-            r.r_info = rd.u64(offset + 8)
-            r.r_addend = rd.s64(offset + 16)
-            r.r_sym = (r.r_info >> 32) & 0xFFFFFFFF
-            r.r_type = r.r_info & 0xFFFFFFFF
-        else:
-            r.r_offset = rd.u32(offset)
-            r.r_info = rd.u32(offset + 4)
-            r.r_addend = rd.s32(offset + 8)
-            r.r_sym = (r.r_info >> 8) & 0xFFFFFF
-            r.r_type = r.r_info & 0xFF
-        return r
-
-    def type_name(self) -> str:
-        return RELA_TYPE_NAMES.get(self.r_type, f"0x{self.r_type:X}")
-
-    def to_dict(self) -> dict:
-        return {
-            "offset": f"0x{self.r_offset:X}",
-            "sym": self.r_sym,
-            "type": self.type_name(),
-            "addend": f"0x{self.r_addend:X}" if self.r_addend >= 0 else f"-0x{-self.r_addend:X}",
-        }
-
 # ---------------------------------------------------------------------------
 # PRX module info
 # ---------------------------------------------------------------------------
@@ -496,18 +265,6 @@ class PRXModuleInfo:
         m.imports_end = rd.u64(offset + 60)
         return m
 
-    def to_dict(self) -> dict:
-        return {
-            "attributes": f"0x{self.attributes:04X}",
-            "version": f"{self.version[0]}.{self.version[1]}",
-            "name": self.name,
-            "toc": f"0x{self.toc:08X}",
-            "exports_start": f"0x{self.exports_start:X}",
-            "exports_end": f"0x{self.exports_end:X}",
-            "imports_start": f"0x{self.imports_start:X}",
-            "imports_end": f"0x{self.imports_end:X}",
-        }
-
 # ---------------------------------------------------------------------------
 # PRX export / import table entry helpers
 # ---------------------------------------------------------------------------
@@ -548,14 +305,6 @@ class PRXExportEntry:
         e.stub_table_ptr = rd.u32(offset + 24) if e.size >= 28 else 0
         return e
 
-    def to_dict(self) -> dict:
-        return {
-            "name": self.name_str or f"(ptr 0x{self.name_ptr:X})",
-            "num_funcs": self.num_funcs,
-            "num_vars": self.num_vars,
-            "nids": [f"0x{n:08X}" for n in self.nids],
-        }
-
 
 class PRXImportEntry:
     """PRX import table entry."""
@@ -591,14 +340,6 @@ class PRXImportEntry:
         i.stub_table_ptr = rd.u32(offset + 24) if i.size >= 28 else 0
         return i
 
-    def to_dict(self) -> dict:
-        return {
-            "name": self.name_str or f"(ptr 0x{self.name_ptr:X})",
-            "num_funcs": self.num_funcs,
-            "num_vars": self.num_vars,
-            "nids": [f"0x{n:08X}" for n in self.nids],
-        }
-
 # ---------------------------------------------------------------------------
 # Top-level ELF file
 # ---------------------------------------------------------------------------
@@ -613,12 +354,11 @@ def vaddr_to_offset(phdrs: list[ProgramHeader], vaddr: int) -> int | None:
 
 
 class ELFFile:
-    """Represents a parsed PS3 ELF / SELF / PRX file."""
+    """Represents a parsed (decrypted) PS3 ELF / PRX file."""
 
     def __init__(self, path: str):
         self.path = path
         self.raw_data: bytes = b""
-        self.self_header: SELFHeader | None = None
         self.elf_offset: int = 0
         self.elf_header: ELFHeader | None = None
         self.program_headers: list[ProgramHeader] = []
@@ -626,7 +366,6 @@ class ELFFile:
         self.module_info: PRXModuleInfo | None = None
         self.exports: list[PRXExportEntry] = []
         self.imports: list[PRXImportEntry] = []
-        self.relocations: list[RelaEntry] = []
 
     # ---- loading ----
 
@@ -634,13 +373,6 @@ class ELFFile:
         """Read the file and parse all structures."""
         with open(self.path, "rb") as f:
             self.raw_data = f.read()
-
-        # Detect SELF wrapper
-        if len(self.raw_data) >= 4:
-            maybe_self = SELFHeader.parse(self.raw_data)
-            if maybe_self.is_self:
-                self.self_header = maybe_self
-                self.elf_offset = maybe_self.elf_offset
 
         # Parse ELF header
         if self.raw_data[self.elf_offset:self.elf_offset + 4] != ELF_MAGIC:
@@ -654,8 +386,6 @@ class ELFFile:
         # If this is a PRX, parse module info
         if self.elf_header.e_type == ET_SCE_PPURELEXEC:
             self._parse_prx_module_info()
-
-        self._parse_relocations()
 
     # ---- internal parsing ----
 
@@ -763,119 +493,9 @@ class ELFFile:
                     self.imports.append(entry)
                     off += entry.size
 
-    def _parse_relocations(self) -> None:
-        """Parse RELA entries from PT_SCE_PPURELA segments and SHT_RELA sections."""
-        eh = self.elf_header
-
-        # From program headers (PT_SCE_PPURELA)
-        for ph in self.program_headers:
-            if ph.p_type == PT_SCE_PPURELA and ph.p_filesz > 0:
-                entry_size = 24 if eh.is64 else 12
-                off = int(ph.p_offset)
-                end = off + int(ph.p_filesz)
-                while off + entry_size <= end and off + entry_size <= len(self.raw_data):
-                    r = RelaEntry.parse(self.raw_data, off, eh.is64, eh.big_endian)
-                    self.relocations.append(r)
-                    off += entry_size
-
-        # From section headers (SHT_RELA)
-        for sh in self.section_headers:
-            if sh.sh_type == SHT_RELA and sh.sh_size > 0:
-                entry_size = int(sh.sh_entsize) if sh.sh_entsize else (24 if eh.is64 else 12)
-                if entry_size == 0:
-                    entry_size = 24 if eh.is64 else 12
-                off = self.elf_offset + int(sh.sh_offset)
-                end = off + int(sh.sh_size)
-                while off + entry_size <= end and off + entry_size <= len(self.raw_data):
-                    r = RelaEntry.parse(self.raw_data, off, eh.is64, eh.big_endian)
-                    self.relocations.append(r)
-                    off += entry_size
-
     # ---- public query helpers ----
 
     def get_segment_data(self, index: int) -> bytes:
         """Return the raw bytes of program header *index*."""
         ph = self.program_headers[index]
         return self.raw_data[ph.p_offset:ph.p_offset + ph.p_filesz]
-
-    def get_section_data(self, index: int) -> bytes:
-        """Return the raw bytes of section header *index*."""
-        sh = self.section_headers[index]
-        off = self.elf_offset + sh.sh_offset
-        return self.raw_data[off:off + sh.sh_size]
-
-    # ---- JSON report ----
-
-    def to_dict(self, sections=True, segments=True, imports=True,
-                exports=True, relocs=True) -> dict:
-        result: dict = {"file": os.path.basename(self.path)}
-
-        if self.self_header:
-            result["self_header"] = self.self_header.to_dict()
-
-        if self.elf_header:
-            result["elf_header"] = self.elf_header.to_dict()
-
-        if segments and self.program_headers:
-            result["program_headers"] = [ph.to_dict() for ph in self.program_headers]
-
-        if sections and self.section_headers:
-            result["section_headers"] = [sh.to_dict() for sh in self.section_headers]
-
-        if self.module_info:
-            result["module_info"] = self.module_info.to_dict()
-
-        if exports and self.exports:
-            result["exports"] = [e.to_dict() for e in self.exports]
-
-        if imports and self.imports:
-            result["imports"] = [i.to_dict() for i in self.imports]
-
-        if relocs and self.relocations:
-            result["relocations_count"] = len(self.relocations)
-            result["relocations_sample"] = [r.to_dict() for r in self.relocations[:50]]
-
-        return result
-
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
-
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="PS3 ELF / SELF / PRX binary parser"
-    )
-    parser.add_argument("input", help="Path to ELF, SELF, or PRX file")
-    parser.add_argument("--json", action="store_true", default=True,
-                        help="Output as JSON (default)")
-    parser.add_argument("--sections", action="store_true", help="Show section headers")
-    parser.add_argument("--segments", action="store_true", help="Show program headers")
-    parser.add_argument("--imports", action="store_true", help="Show PRX imports")
-    parser.add_argument("--exports", action="store_true", help="Show PRX exports")
-    parser.add_argument("--relocs", action="store_true", help="Show relocations")
-    parser.add_argument("--all", action="store_true", help="Show everything")
-    args = parser.parse_args()
-
-    show_all = args.all or not any([args.sections, args.segments, args.imports,
-                                     args.exports, args.relocs])
-
-    elf = ELFFile(args.input)
-    try:
-        elf.load()
-    except Exception as exc:
-        print(f"Error: {exc}", file=sys.stderr)
-        sys.exit(1)
-
-    report = elf.to_dict(
-        sections=show_all or args.sections,
-        segments=show_all or args.segments,
-        imports=show_all or args.imports,
-        exports=show_all or args.exports,
-        relocs=show_all or args.relocs,
-    )
-
-    print(json.dumps(report, indent=2))
-
-
-if __name__ == "__main__":
-    main()

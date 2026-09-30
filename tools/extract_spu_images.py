@@ -14,7 +14,7 @@ Size of each image = max(end of section table, end of last PT_LOAD), which is
 the maximum file offset referenced by the ELF header tables.
 
 Usage:
-    python extract_spu_images.py <ppu_elf> [--output DIR]
+    py -3 tools/extract_spu_images.py <ppu_elf> [-o DIR]
 """
 
 import argparse

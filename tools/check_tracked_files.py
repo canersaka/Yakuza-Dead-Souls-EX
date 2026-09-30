@@ -141,17 +141,17 @@ def main() -> int:
             violations.append(f"{reason} in reachable history: {relative_path}")
 
     if violations:
-        print("Repository hygiene check failed:", file=sys.stderr)
+        print("Tracked-file check failed:", file=sys.stderr)
         for violation in violations:
             print(f"  - {violation}", file=sys.stderr)
         print(
-            "Generated lifts, game/firmware payloads, captures, and local oracle data "
-            "must remain outside Git history.",
+            "Generated lifts and game or firmware files "
+            "must stay outside Git history.",
             file=sys.stderr,
         )
         return 1
 
-    print("Repository hygiene check passed.")
+    print("Tracked-file check passed.")
     return 0
 
 
