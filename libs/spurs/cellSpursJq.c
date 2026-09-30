@@ -1,14 +1,13 @@
 /*
  * ps3recomp - cellSpursJq HLE implementation
  *
- * SPURS Job Queue — manages job submission and tracking.
+ * SPURS Job Queue: manages job submission and tracking.
  * Jobs are accepted and immediately marked as complete (no SPU execution).
  * This satisfies games that check for job completion but don't depend
  * on SPU side effects.
  */
 
 #include "cellSpursJq.h"
-#include <stdio.h>
 #include <string.h>
 
 /* Internal state */
@@ -19,7 +18,6 @@ typedef struct {
     u32 jobCount;       /* number of pending (not-yet-completed) jobs */
     u32 nextJobId;
     u32 submitCount;    /* total jobs submitted over lifetime */
-    u32 completeCount;  /* total jobs completed over lifetime */
     /*
      * Per-job completion ring: tracks the last CELL_SPURS_JQ_MAX_JOBS
      * job IDs that have completed.  Wait/TryWait check this.
@@ -48,7 +46,6 @@ static void jq_mark_completed(JqState* q, CellSpursJobId id)
 {
     q->completedIds[q->completedHead] = id;
     q->completedHead = (q->completedHead + 1) % CELL_SPURS_JQ_MAX_JOBS;
-    q->completeCount++;
     if (q->jobCount > 0)
         q->jobCount--;
 }
@@ -89,8 +86,6 @@ s32 cellSpursCreateJobQueue(void* spurs, CellSpursJobQueue* jq,
                             void* buffer, u32 bufferSize)
 {
     (void)spurs; (void)buffer; (void)bufferSize;
-    printf("[cellSpursJq] CreateJobQueue()\n");
-
     if (!jq || !attr) return (s32)CELL_SPURS_JQ_ERROR_INVALID_ARGUMENT;
 
     int slot = jq_alloc();
@@ -102,7 +97,6 @@ s32 cellSpursCreateJobQueue(void* spurs, CellSpursJobQueue* jq,
     s_queues[slot].jobCount = 0;
     s_queues[slot].nextJobId = 1;
     s_queues[slot].submitCount = 0;
-    s_queues[slot].completeCount = 0;
     s_queues[slot].completedHead = 0;
 
     *jq = (u32)slot;
@@ -117,7 +111,6 @@ s32 cellSpursDestroyJobQueue(CellSpursJobQueue* jq)
     if (slot >= CELL_SPURS_JQ_MAX_QUEUES || !s_queues[slot].in_use)
         return (s32)CELL_SPURS_JQ_ERROR_INVALID_ARGUMENT;
 
-    printf("[cellSpursJq] DestroyJobQueue(%u)\n", slot);
     s_queues[slot].in_use = 0;
     return CELL_OK;
 }
@@ -146,7 +139,7 @@ s32 cellSpursJobQueuePush(CellSpursJobQueue* jq, const void* job,
 
     /*
      * Job is immediately "complete" since we don't execute SPU code,
-     * but we now record completion so Wait/TryWait can track it.
+     * and the completion is recorded so Wait/TryWait can track it.
      */
     jq_mark_completed(q, jobId);
 
@@ -199,7 +192,7 @@ s32 cellSpursJobQueueWait(CellSpursJobQueue* jq, CellSpursJobId id)
     const JqState* q = &s_queues[slot];
 
     /*
-     * If no jobs have ever been submitted, treat as an error —
+     * If no jobs have ever been submitted, treat as an error:
      * nothing can complete if nothing was pushed.
      */
     if (q->submitCount == 0)
@@ -221,7 +214,7 @@ s32 cellSpursJobQueueTryWait(CellSpursJobQueue* jq, CellSpursJobId id)
 
     const JqState* q = &s_queues[slot];
 
-    /* No jobs submitted yet — return BUSY */
+    /* No jobs submitted yet: return BUSY */
     if (q->submitCount == 0)
         return (s32)CELL_SPURS_JQ_ERROR_BUSY;
 

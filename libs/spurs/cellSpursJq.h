@@ -1,9 +1,9 @@
 /*
  * ps3recomp - cellSpursJq HLE
  *
- * SPURS Job Queue — advanced SPU job dispatch built on cellSpurs.
+ * SPURS Job Queue: advanced SPU job dispatch built on cellSpurs.
  * Provides job queue creation, enqueue, dequeue, and synchronization.
- * Stub — management APIs work, no actual SPU execution.
+ * Stub: management APIs work, no actual SPU execution.
  */
 
 #ifndef PS3RECOMP_CELL_SPURS_JQ_H
@@ -17,26 +17,14 @@ extern "C" {
 #endif
 
 /* Error codes */
-#define CELL_SPURS_JQ_ERROR_NOT_INITIALIZED     0x80410A01
-#define CELL_SPURS_JQ_ERROR_ALREADY_INITIALIZED 0x80410A02
 #define CELL_SPURS_JQ_ERROR_INVALID_ARGUMENT    0x80410A03
 #define CELL_SPURS_JQ_ERROR_OUT_OF_MEMORY       0x80410A04
 #define CELL_SPURS_JQ_ERROR_BUSY                0x80410A05
 #define CELL_SPURS_JQ_ERROR_JOB_NOT_FOUND       0x80410A06
 #define CELL_SPURS_JQ_ERROR_QUEUE_FULL          0x80410A07
-#define CELL_SPURS_JQ_ERROR_QUEUE_EMPTY         0x80410A08
-#define CELL_SPURS_JQ_ERROR_AGAIN               0x80410A09
-#define CELL_SPURS_JQ_ERROR_ABORT               0x80410A0A
-
-/* Job types */
-#define CELL_SPURS_JQ_JOB_TYPE_DEFAULT  0
-#define CELL_SPURS_JQ_JOB_TYPE_MEMORY   1
-#define CELL_SPURS_JQ_JOB_TYPE_GUARD    2
 
 /* Job priority */
-#define CELL_SPURS_JQ_PRIORITY_HIGH     0
 #define CELL_SPURS_JQ_PRIORITY_NORMAL   8
-#define CELL_SPURS_JQ_PRIORITY_LOW      15
 
 /* Limits */
 #define CELL_SPURS_JQ_MAX_QUEUES    16
@@ -44,7 +32,6 @@ extern "C" {
 
 /* Opaque handle types */
 typedef u32 CellSpursJobQueue;
-typedef u32 CellSpursJobQueueHandle;
 typedef u32 CellSpursJobId;
 
 /* Job descriptor */

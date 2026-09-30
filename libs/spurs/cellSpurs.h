@@ -18,8 +18,34 @@ extern "C" {
 #  define SPURS_ALIGNAS(n) _Alignas(n)
 #endif
 
-/* Cache optional host-side diagnostic outputs before SPURS workers start. */
-void cellSpursRuntimeConfigInit(void);
+int cellSpursNativeJobRangeValid(u32 ea, u32 size);
+/* Semantic job replacement before allocating an SPU context or loading code.
+ * Prepare may snapshot published inputs but must not write guest outputs.
+ * A successful prepare supplies an infallible, synchronous execute callback;
+ * its publications must finish before it returns. Unsupported inputs fall back.
+ * The request and descriptor are valid only for this prepare/execute pair. */
+typedef struct cellSpursNativeJobRequest {
+    const u8* descriptor;
+    u32 descriptor_ea, descriptor_size, binary_ea, binary_size;
+    u32 image_id, slot, spu_id;
+} cellSpursNativeJobRequest;
+typedef struct cellSpursNativeOperation {
+    void (*execute)(const cellSpursNativeJobRequest*, void*);
+    void* user;
+} cellSpursNativeOperation;
+typedef int (*cellSpursNativeJobPrepare)(const cellSpursNativeJobRequest*, cellSpursNativeOperation*);
+extern cellSpursNativeJobPrepare g_cell_spurs_native_job_prepare;
+int cellSpursNativeJobAcquire(const cellSpursNativeJobRequest*, u32 ea, void* output, u32 size);
+/* Validated output range; preserves GPU residency, reservation coherence and
+ * completion notifications, in the same order as a completed output transfer. */
+void cellSpursNativeJobPublish(const cellSpursNativeJobRequest*, u32 ea,
+                              const void* source, u32 size, u32 pc, u32 command);
+/* The title's GS polling yield (image 0 at 0x7C0C) keeps its task-owned LS
+ * across the handoff and parks on its journal word for at most 1 ms.  With
+ * the yield mode set it then gives up the host quantum instead of sleeping
+ * 1 ms.  WAIT_SIGNAL and every other task handoff keep full snapshots. */
+int cellSpursSetGsYieldMode(int enabled);
+u64 cellSpursGetGsPollYieldCalls(void);
 
 #define CELL_SPURS_CORE_ERROR_AGAIN        ((s32)0x80410701u)
 #define CELL_SPURS_CORE_ERROR_INVAL        ((s32)0x80410702u)
@@ -74,7 +100,6 @@ void cellSpursRuntimeConfigInit(void);
 #define CELL_SPURS_EVENT_FLAG_PPU2SPU 2
 #define CELL_SPURS_EVENT_FLAG_ANY2ANY 3
 
-typedef u32 CellSpursWorkloadId;
 typedef u32 CellSpursTaskId;
 typedef struct { SPURS_ALIGNAS(128) u8 bytes[4096]; } CellSpurs;
 typedef struct { SPURS_ALIGNAS(128) u8 bytes[8192]; } CellSpurs2;
@@ -84,7 +109,6 @@ typedef struct { SPURS_ALIGNAS(128) u8 bytes[CELL_SPURS_TASKSET2_SIZE]; } CellSp
 typedef struct { SPURS_ALIGNAS(8) u8 bytes[512]; } CellSpursTasksetAttribute;
 typedef struct { SPURS_ALIGNAS(8) u8 bytes[512]; } CellSpursTasksetAttribute2;
 typedef struct { SPURS_ALIGNAS(16) u8 bytes[256]; } CellSpursTaskAttribute;
-typedef struct { SPURS_ALIGNAS(16) u8 bytes[256]; } CellSpursTaskAttribute2;
 typedef struct { SPURS_ALIGNAS(128) u8 bytes[128]; } CellSpursEventFlag;
 typedef struct { SPURS_ALIGNAS(128) u8 bytes[128]; } CellSpursQueue;
 typedef struct { SPURS_ALIGNAS(128) u8 bytes[128]; } CellSpursLFQueue;
@@ -94,7 +118,6 @@ typedef struct { SPURS_ALIGNAS(128) u8 bytes[128]; } CellSpursBarrier;
 typedef struct { u8 bytes[272]; } CellSpursJobChain;
 typedef struct { SPURS_ALIGNAS(8) u8 bytes[512]; } CellSpursJobChainAttribute;
 typedef struct { SPURS_ALIGNAS(128) u8 bytes[128]; } CellSpursJobGuard;
-typedef struct { SPURS_ALIGNAS(8) u8 bytes[256]; } CellSpursWorkloadAttribute;
 typedef struct { SPURS_ALIGNAS(128) u8 bytes[128]; } CellSpursTaskExitCode;
 
 typedef union {
@@ -209,11 +232,8 @@ typedef int (*CellSpursImage4SignalInterceptor)(
     u64 image_fingerprint, u32 image_size, u32 entry_pc, s32 image_id);
 void cellSpursSetImage4SignalInterceptor(
     CellSpursImage4SignalInterceptor interceptor, void* user);
-/* Snapshot the five persistent image-4 task identities without changing any
- * taskset state.  This is used only by the default-off native graphics route
- * to prove that a complete EDGE MLAA parameter set is already published
- * before suppressing its producer readback.  Returns one on an exact live
- * five-task snapshot and zero otherwise. */
+/* Snapshot the five persistent image-4 tasks without changing taskset state.
+ * Returns 1 for an exact live five-task snapshot, 0 otherwise. */
 int cellSpursSnapshotImage4Taskset(
     u32 wid, u32 task_ids[5], u32 parameter_eas[5],
     u64* image_fingerprint, u32* image_size, u32* entry_pc, s32* image_id);
@@ -232,7 +252,7 @@ int yz_spurs_test_guest_write_route_overflow_alias(
     u32 source_ea, u32 alias_ea);
 #endif
 
-/* Compatibility surface used elsewhere in the generic runtime. */
+/* Legacy SDK entry points, resolved by name at import time. */
 s32 cellSpursInitialize(CellSpurs*, s32, s32, s32, u8);
 s32 cellSpursSendSignal(CellSpursTaskset*, CellSpursTaskId);
 s32 cellSpursJoinTask(CellSpursTaskset*, CellSpursTaskId, s32*);
