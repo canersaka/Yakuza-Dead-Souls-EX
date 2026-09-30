@@ -1,23 +1,19 @@
 /*
- * ps3recomp - NV4097 method dispatcher (Track B / LAYER 2)
+ * ps3recomp - NV4097 method dispatcher
  *
- * A clean-room register-file model of the RSX 3D engine's method interface:
+ * A register-file model of the RSX 3D engine's method interface:
  * dispatch(method, arg) stores every write into a 16 K-word register file
- * (mirroring the hardware, so a captured initial register state can seed it
- * with no side effects) and triggers execution callbacks for the handful of
- * methods that DO something (clear, begin/end, draw batches, program and
+ * (mirroring the hardware) and triggers execution callbacks for the handful
+ * of methods that DO something (clear, begin/end, draw batches, program and
  * constant uploads, flip).
  *
  * Consumers read decoded state through the rsx_dsp_* getters; the dispatcher
  * itself touches no GPU API and no guest memory, so the same code can drive
- * the offline capture-replay harness and, later, the live FIFO consumer.
+ * the live FIFO consumer.
  *
- * Method numbers and bitfield layouts come from MIT sources only: the
- * envytools rnndb NV30-40 3D register database (tools/nv40_methods.py is
- * generated from it), Mesa's nv30 driver headers, and the psdevwiki RSX
- * notes (docs/PSDEVWIKI_REFS.md). RPCS3 was consulted as a read-only
- * semantics oracle (e.g. transform-program load auto-advance); no code
- * was copied.
+ * Method numbers and bitfield layouts come from public register
+ * documentation: the envytools rnndb NV30-40 3D register database, Mesa's
+ * nv30 driver headers and the psdevwiki RSX notes.
  */
 
 #ifndef PS3RECOMP_RSX_DISPATCH_H
@@ -73,7 +69,8 @@ extern "C" {
 #define RSX_LOCATION_LOCAL      0
 #define RSX_LOCATION_MAIN       1
 
-/* Coverage classification for the report */
+/* Method classification. Methods of class TODO are not handled; the prepared
+ * packet path accepts every other class. */
 #define RSX_DSP_CLASS_TODO      0   /* stored in the register file only     */
 #define RSX_DSP_CLASS_STATE     1   /* decoded by a getter the pipeline uses */
 #define RSX_DSP_CLASS_EXEC      2   /* triggers an execution callback        */
@@ -104,8 +101,11 @@ struct rsx_dispatch {
 
     int in_begin_end;                 /* between BEGIN_END(prim) and (0)    */
     u32 current_primitive;
+    /* SET_RENDER_ENABLE latches the report DMA at that method, independently
+     * of later DMA writes. A raw register seed cannot reconstruct this history. */
+    u32 condition_known,condition_enabled,condition_dma,condition_offset;
 
-    /* coverage accounting */
+    /* method tracking */
     u32 seen[RSX_DSP_NUM_REGS];       /* per-register write count           */
     u8  klass[RSX_DSP_NUM_REGS];      /* RSX_DSP_CLASS_*                    */
 };
@@ -113,22 +113,24 @@ struct rsx_dispatch {
 /* ---- lifecycle -------------------------------------------------------- */
 
 void rsx_dispatch_init(rsx_dispatch* rsx, const rsx_dispatch_sink* sink);
+/* Ordered state effect used also by compiled groups; no register/counter write. */
+void rsx_dispatch_render_condition(rsx_dispatch* rsx,u32 argument);
 
 /* Seed the register file / transform program from a captured initial state.
- * No side effects, no callbacks — mirrors loading hardware context. */
+ * No side effects, no callbacks; mirrors loading hardware context. */
 void rsx_dispatch_seed_registers(rsx_dispatch* rsx, const u32* regs, u32 count);
 void rsx_dispatch_seed_transform_program(rsx_dispatch* rsx, const u32* words, u32 count);
 void rsx_dispatch_seed_transform_constants(rsx_dispatch* rsx, const u32* words, u32 count);
 
-/* Replace only the architectural RSX state.  Sink bindings, coverage tables,
- * and method classifications belong to the destination instance and remain
- * intact.  This lets a late-starting transactional decoder join the exact
- * state of an established decoder without replaying already-consumed work. */
-void rsx_dispatch_copy_architectural_state(
-    rsx_dispatch* dst, const rsx_dispatch* src);
-
 /* Dispatch one register write. */
 void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg);
+/* Shared action semantics after a prepared group has published exact state. */
+void rsx_dispatch_execute_action(rsx_dispatch* rsx, u32 method, u32 arg);
+
+/* Host-endian data-only upload packet. Returns 1 when completely applied,
+ * 0 without mutation for unsupported ranges/counts/subchannels. */
+int rsx_dispatch_upload_packet(rsx_dispatch* rsx, u32 method,
+                               const u32* words, u32 count, u32 noninc);
 
 /* ---- decoded state getters -------------------------------------------- */
 
@@ -139,8 +141,6 @@ static inline u32 rsx_dsp_reg(const rsx_dispatch* rsx, u32 method)
 
 /* CLEAR_COLOR_VALUE: A8R8G8B8 */
 u32  rsx_dsp_clear_color(const rsx_dispatch* rsx);
-/* CLEAR_DEPTH_VALUE: depth [8:31], stencil [0:7] */
-u32  rsx_dsp_clear_zstencil(const rsx_dispatch* rsx);
 
 /* Surface (render target) state */
 typedef struct rsx_dsp_surface {
@@ -247,12 +247,6 @@ typedef struct rsx_dsp_vertex_texture {
 void rsx_dsp_get_vertex_texture(const rsx_dispatch* rsx, u32 unit,
                                 rsx_dsp_vertex_texture* out);
 
-/* Transform constants as floats (vec4 slot) */
-static inline const u32* rsx_dsp_constant(const rsx_dispatch* rsx, u32 slot)
-{
-    return rsx->constants[slot < RSX_DSP_NUM_CONSTANTS ? slot : 0];
-}
-
 /* Fragment program: SHADER_PROGRAM register (offset | dma-context in [1:0],
  * 1 = local, 2 = main). Returns the byte offset, *location gets RSX_LOCATION_*. */
 u32 rsx_dsp_fragment_program(const rsx_dispatch* rsx, u32* location);
@@ -264,11 +258,10 @@ u32 rsx_dsp_shader_control(const rsx_dispatch* rsx);
 u32 rsx_dsp_vp_start(const rsx_dispatch* rsx);
 
 /* Primitive restart (NV4097_SET_RESTART_INDEX_ENABLE/_INDEX): a sentinel
- * index value that ends the current TRIANGLE_STRIP/FAN run with NO
+ * index value that ends the current TRIANGLE_STRIP/FAN run with no
  * connecting triangle to whatever comes next. index_is_u32 selects which
- * width rule applies (RPCS3 oracle: rsx_methods.h restart_index_enabled()
- * disables restart for 16-bit index buffers if the configured value
- * doesn't fit in 16 bits). */
+ * width rule applies: restart is disabled for 16-bit index buffers if the
+ * configured value doesn't fit in 16 bits. */
 int rsx_dsp_restart_index_enabled(const rsx_dispatch* rsx, int index_is_u32);
 u32 rsx_dsp_restart_index(const rsx_dispatch* rsx);
 

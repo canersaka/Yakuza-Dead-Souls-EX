@@ -1,14 +1,14 @@
 /*
- * ps3recomp - RSX Vertex Program (NV40 ISA) → HLSL decompiler
+ * ps3recomp - RSX Vertex Program (NV40 ISA) -> HLSL decompiler
  *
  * Translates an RSX vertex shader (NVIDIA NV40 "nvfx" vertex program, a VLIW
  * that co-issues one vector ALU op and one scalar ALU op per instruction) into
  * an HLSL vertex shader.
  *
- * Encoding reference: RPCS3 RSXVertexProgram.h (D0..D3 bitfields) + Mesa
- * nouveau nvfx_shader.h opcode tables. Words are stored little-endian (RPCS3
- * native order), 4 words / 16 bytes per instruction, no inline constants
- * (VP constants live in a separate bank), program ends at the D3.end bit.
+ * Encoding: D0..D3 bitfields, with opcode tables as in Mesa nouveau
+ * nvfx_shader.h. Words are stored little-endian, 4 words / 16 bytes per
+ * instruction, no inline constants (VP constants live in a separate bank),
+ * program ends at the D3.end bit.
  *
  * Self-contained: no D3D12 dependency, build/test standalone.
  */
@@ -41,10 +41,9 @@ typedef struct rsx_vp_native_support_analysis {
     u32 terminated;
 } rsx_vp_native_support_analysis;
 
-/* Low-level coherent-section option. A caller may enable this only when the
- * complete render section (including its depth and later color work) has
- * been preflighted and will execute through one renderer. Ordinary callers
- * retain the captured mixed-ownership flow+vertex-texture safety gate. */
+/* Option for rsx_vp_analyze_native_support_control_options: accept programs
+ * that combine BRI/BRB flow with vertex-texture fetches. Without it such
+ * programs are reported as unsupported. */
 #define RSX_VP_NATIVE_COHERENT_SECTION_FLOW_TXL 1u
 
 /* Report the guest input registers statically read by the program.  `exact`
@@ -69,8 +68,7 @@ int rsx_vp_program_is_native_supported_ex(const u8* ucode, u32 max_bytes,
 
 /* Start-slot-aware form used by live programs. It additionally accepts
  * exact forward BRI/BRB control flow whose absolute targets remain inside
- * the captured program. Other flow opcodes and cyclic/backward targets stay
- * on the ordered legacy fallback. */
+ * the program. Other flow opcodes and cyclic/backward targets are rejected. */
 int rsx_vp_program_is_native_supported_control_ex(
     const u8* ucode, u32 max_bytes, u32 vtex_mask, u32 start_slot);
 
@@ -89,7 +87,7 @@ int rsx_vp_analyze_native_support_control_options(
     u32 options, rsx_vp_native_support_analysis* analysis);
 
 /* Decompile an NV40 vertex program into an HLSL vertex shader.
- *   ucode    : VP bytecode (little-endian words, as in RPCS3's shader cache).
+ *   ucode    : VP bytecode (little-endian words).
  *   max_bytes: safety bound.
  *   out      : caller buffer for generated HLSL (NUL-terminated).
  *   out_size : size of out in bytes.
@@ -110,6 +108,11 @@ int rsx_vp_decompile(const u8* ucode, u32 max_bytes, char* out, u32 out_size);
  * Unmasked units retain the defined-zero fallback. */
 int rsx_vp_decompile_ex(const u8* ucode, u32 max_bytes, u32 vtex_mask,
                         char* out, u32 out_size);
+/* Like rsx_vp_decompile_ex, and also accepts forward BRI/BRB flow combined
+ * with TXL. Branch targets are absolute RSX instruction slots. */
+int rsx_vp_decompile_control_ex(
+    const u8* ucode, u32 max_bytes, u32 vtex_mask, u32 start_slot,
+    char* out, u32 out_size);
 
 /* Compact-input variant.  The generated VSInput declares only the original
  * ATTRn semantics selected by input_mask.  The mask is checked against a
@@ -118,34 +121,9 @@ int rsx_vp_decompile_ex(const u8* ucode, u32 max_bytes, u32 vtex_mask,
 int rsx_vp_decompile_compact_ex(
     const u8* ucode, u32 max_bytes, u32 vtex_mask, u32 input_mask,
     char* out, u32 out_size);
-
-/* Vertex-pulling variant (true GPU vertex fetch, rsx_vertex_pull.h): no
- * VSInput struct and no input layout — main() receives only
- * `uint yz_sysvid : SV_VertexID`.  `pull_globals` is emitted at global
- * scope (guest-memory SRVs, the pull cbuffer, fetch helpers) and
- * `pull_loads` inside main() to fill v[0..15]; attributes the loads block
- * skips read the register default (0,0,0,1).  Both blocks come from
- * rsx_vertex_pull_emit_globals/_loads.  The program body, constants,
- * vertex textures and varyings are identical to rsx_vp_decompile_ex. */
-int rsx_vp_decompile_pull_ex(
-    const u8* ucode, u32 max_bytes, u32 vtex_mask,
-    const char* pull_globals, const char* pull_loads,
-    char* out, u32 out_size);
-
-/* Live start-slot-aware vertex-pulling form. The generated cbuffer includes
- * the dynamic TRANSFORM_BRANCH_BITS word, so BRB does not alter PSO identity. */
-int rsx_vp_decompile_pull_control_ex(
-    const u8* ucode, u32 max_bytes, u32 vtex_mask, u32 start_slot,
-    const char* pull_globals, const char* pull_loads,
-    char* out, u32 out_size);
-int rsx_vp_decompile_pull_control_options_ex(
-    const u8* ucode, u32 max_bytes, u32 vtex_mask, u32 start_slot,
-    u32 options, const char* pull_globals, const char* pull_loads,
-    char* out, u32 out_size);
-
-/* Mnemonics for the vector / scalar opcode fields ("?" if unknown). */
-const char* rsx_vp_vec_name(u32 op);
-const char* rsx_vp_sca_name(u32 op);
+int rsx_vp_decompile_compact_control_ex(
+    const u8* ucode, u32 max_bytes, u32 vtex_mask, u32 input_mask,
+    u32 start_slot, char* out, u32 out_size);
 
 #ifdef __cplusplus
 }

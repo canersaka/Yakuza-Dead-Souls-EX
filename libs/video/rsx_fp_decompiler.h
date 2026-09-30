@@ -1,11 +1,11 @@
 /*
- * ps3recomp - RSX Fragment Program (NV40 ISA) → HLSL decompiler
+ * ps3recomp - RSX Fragment Program (NV40 ISA) to HLSL decompiler
  *
  * Translates an RSX fragment shader (NVIDIA NV40 "nvfx" fragment program
  * encoding) into an HLSL pixel shader source string suitable for D3DCompile.
  *
- * See docs/RSX_FRAGMENT_PROGRAM.md for the instruction encoding reference
- * (sourced from Mesa/nouveau nvfx_shader.h). This module is self-contained:
+ * Encoding: NV40 fragment program, four words per instruction; a CONST source
+ * is followed by a 16-byte inline constant slot. This module is self-contained:
  * it has no D3D12 dependency and can be built/tested standalone.
  */
 
@@ -30,6 +30,18 @@ typedef struct rsx_fp_constant_block {
     u32 count;
     u32 values[RSX_FP_MAX_INLINE_CONSTANTS][4];
 } rsx_fp_constant_block;
+/* Immutable interpretation of one program. Offsets identify inline payloads,
+ * never instructions. Use only after validating the instruction bytes against
+ * the program from which this layout was built. */
+typedef struct rsx_fp_constant_layout {
+    u32 bytes, count;
+    u32 offsets[RSX_FP_MAX_INLINE_CONSTANTS];
+} rsx_fp_constant_layout;
+int rsx_fp_plan_constants(const u8* ucode,u32 max_bytes,rsx_fp_constant_layout* out);
+int rsx_fp_refresh_constants(const u8* ucode,u32 bytes,
+    const rsx_fp_constant_layout* layout,rsx_fp_constant_block* out);
+int rsx_fp_structure_matches(const u8* source,const u8* snapshot,u32 bytes,
+    const rsx_fp_constant_layout* layout);
 
 /* Read one fragment-program word from guest (PS3) memory: big-endian load
  * followed by a 16-bit half-word swap, yielding a host-order instruction
@@ -39,7 +51,7 @@ u32 rsx_fp_read_word(const u8* p);
 /* Decompile an NV40 fragment program into an HLSL pixel shader.
  *
  *   ucode     : pointer to the fragment-program bytecode in guest memory
- *               (big-endian, half-word-swapped — i.e. exactly as the RSX
+ *               (big-endian, half-word-swapped, i.e. exactly as the RSX
  *               reads it; this function applies rsx_fp_read_word internally).
  *   max_bytes : safety bound on how far to read (program stops at PROGRAM_END
  *               or when this many bytes are consumed).
@@ -49,18 +61,17 @@ u32 rsx_fp_read_word(const u8* p);
  * Returns the number of instructions decoded (>=0) on success, or -1 on
  * error (null args, output overflow). The emitted entry point is
  * `float4 main(PSInput input) : SV_TARGET`, matching the backend's
- * placeholder PSInput { float4 position : SV_POSITION; float4 col : COLOR; }.
+ * PSInput { position, col0, col1, fog, tc0..tc7 }.
  *
- * Texture sampling and full input plumbing are partial — see the doc's
- * "Integration TODO". Unhandled opcodes emit a comment and a safe default so
- * the shader still compiles.
+ * Unhandled opcodes emit a comment and a safe default so the shader still
+ * compiles.
  *
  *   ctrl : the NV4097_SET_SHADER_CONTROL word (reg 0x1D60) for this program.
  *          Bit 0x40 (CELL_GCM_SHADER_CONTROL_32_BITS_EXPORTS) selects the
  *          fragment-output register set: clear => fp16 output (color = h0),
  *          set => fp32 output (color = r0). Pass RSX_FP_CTRL_AUTO when no
  *          control word is available (standalone tests) to fall back to the
- *          legacy "whichever of r0/h0 was written" heuristic. */
+ *          "whichever of r0/h0 was written" heuristic. */
 #define RSX_FP_CTRL_AUTO 0xFFFFFFFFu
 int rsx_fp_decompile(const u8* ucode, u32 max_bytes, u32 ctrl, char* out, u32 out_size);
 
@@ -83,14 +94,10 @@ float rsx_fp_alpha_ref(u32 raw, u32 surface_color_format);
  *   tex_cube_mask : bit N set => texture unit N is a CUBEMAP. Cube units are
  *                   declared `TextureCube` and sampled with the full
  *                   3-component direction (a.xyz); 2D units keep `Texture2D`
- *                   and a.xy sampling. Pass 0 for the legacy all-2D behavior
- *                   (rsx_fp_decompile forwards 0, so its output is unchanged
- *                   byte-for-byte).
+ *                   and a.xy sampling. Pass 0 when no unit is a cubemap.
  *
  * The mask must match what the backend actually binds: a cube unit needs a
- * TextureCube SRV at register tN, and a 2D unit a Texture2D SRV. See the
- * fragment lane report (scratch/a010_reports/fragment.md) for replay_main.c
- * call-site guidance. */
+ * TextureCube SRV at register tN, and a 2D unit a Texture2D SRV. */
 int rsx_fp_decompile_ex(const u8* ucode, u32 max_bytes, u32 ctrl,
                         u32 tex_cube_mask, char* out, u32 out_size);
 
@@ -111,12 +118,6 @@ int rsx_fp_collect_constants(
  * order are hashed; inline CONST payload bytes are skipped. Returns zero for
  * malformed input. */
 u64 rsx_fp_structural_hash(const u8* ucode, u32 max_bytes, u64 seed);
-
-/* Hash the exact legacy HLSL literal spellings (%g) for a program while also
- * retaining structural identity. This is intended for aggregate diagnostics;
- * PSO identity should use rsx_fp_structural_hash in buffered mode. */
-u64 rsx_fp_literal_source_hash(
-    const u8* ucode, u32 max_bytes, u64 seed);
 
 /* Buffered-alpha counterpart to rsx_fp_apply_alpha_test. It emits the compare
  * against fp_alpha.x from PSConstants instead of embedding a numeric value. */
@@ -159,6 +160,9 @@ const char* rsx_fp_opcode_name(u32 opcode);
  * walk logic so callers (e.g. a shader cache hashing the bytecode) agree with
  * the decompiler on where a program ends. */
 u32 rsx_fp_program_size(const u8* ucode, u32 max_bytes);
+/* Validate structured IF/ELSE and bounded LOOP targets against instruction
+ * boundaries, including literal payloads and nested scope limits. */
+int rsx_fp_validate_control_flow(const u8* ucode,u32 max_bytes);
 
 #ifdef __cplusplus
 }

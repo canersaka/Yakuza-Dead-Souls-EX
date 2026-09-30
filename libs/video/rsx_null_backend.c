@@ -1,9 +1,9 @@
 /*
  * ps3recomp - Null RSX Backend (Win32 window + color clear)
  *
- * Implements rsx_backend callbacks using a simple Win32 GDI window.
- * No GPU rendering — just clears to the RSX clear color and presents.
- * Used for debugging command buffer flow before a real backend exists.
+ * Owns the Win32 window, counts flips, forwards keyboard events to cellPad
+ * and updates the title statistics; rendering is done by rsx_live_draw. When
+ * no GPU renderer owns the window it paints the RSX clear color with GDI.
  */
 
 #include "rsx_null_backend.h"
@@ -12,13 +12,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-/* Real game-frame counter from the Track B live-draw engine (rsx_live_draw.c).
- * Lets the title show frames-actually-rendered next to the raw flip/present
- * count, so a stall (frames frozen while flips keep climbing) is visible. */
-extern u32 rsx_live_draw_get_frames(void);
-extern u32 rsx_live_draw_get_last_draws(void);
-extern double rsx_live_draw_get_present_fps(void);
 
 #ifdef _WIN32
 
@@ -34,23 +27,36 @@ extern double rsx_live_draw_get_present_fps(void);
 typedef struct {
     HWND     hwnd;
     HDC      hdc;
-    u32      width;
-    u32      height;
 
     /* Current clear color (ARGB -> COLORREF) */
     COLORREF clear_color;
 
     /* Frame counter */
-    u64      frame_count;
+    volatile LONG64 frame_count;
     u64      last_fps_time;
+    u64      frames_at_mark;
     u32      fps;
+    int      title_ui_timer;
 
     int      window_closed;
 } NullBackendState;
 
 static NullBackendState s_state;
 
-/* When a GPU backend (Track B live draw) owns a flip-model swap chain on our
+static u64 null_frame_count(void)
+{
+    return (u64)InterlockedCompareExchange64(&s_state.frame_count, 0, 0);
+}
+
+#define NULL_TITLE_TIMER_ID 0x4A31u
+static void null_update_title(void);
+
+static int null_start_title_timer(HWND hwnd)
+{
+    return SetTimer(hwnd, NULL_TITLE_TIMER_ID, 1000u, NULL) != 0;
+}
+
+/* When a GPU backend (live draw) owns a flip-model swap chain on our
  * HWND, GDI painting corrupts the swap-chain surface -- suppress both. */
 static int s_present_suppressed = 0;
 
@@ -61,17 +67,19 @@ static int s_present_suppressed = 0;
 static LRESULT CALLBACK null_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     switch (msg) {
-    case RSX_LIVE_DRAW_WM_A010_PROBE:
-        rsx_live_draw_a010_probe_begin();
-        return 0;
-
+    case WM_TIMER:
+        if (wp == NULL_TITLE_TIMER_ID && s_state.title_ui_timer) {
+            null_update_title();
+            return 0;
+        }
+        break;
     case WM_CLOSE:
         s_state.window_closed = 1;
         DestroyWindow(hwnd);
         return 0;
 
     case WM_DESTROY:
-        rsx_live_draw_dump_present_samples();
+        KillTimer(hwnd, NULL_TITLE_TIMER_ID);
         PostQuitMessage(0);
         return 0;
 
@@ -94,7 +102,7 @@ static LRESULT CALLBACK null_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             SetTextColor(hdc, RGB(255, 255, 255));
             char buf[128];
             snprintf(buf, sizeof(buf), "ps3recomp null backend | %u FPS | frame %llu",
-                     s_state.fps, (unsigned long long)s_state.frame_count);
+                     s_state.fps, (unsigned long long)null_frame_count());
             TextOutA(hdc, 10, 10, buf, (int)strlen(buf));
 
             char buf2[64];
@@ -134,14 +142,14 @@ static LRESULT CALLBACK null_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 static int null_init(void* ud, u32 width, u32 height)
 {
     (void)ud;
-    printf("[RSX null] init(%ux%u)\n", width, height);
+    (void)width;
+    (void)height;
     return 0;
 }
 
 static void null_shutdown(void* ud)
 {
     (void)ud;
-    printf("[RSX null] shutdown\n");
 }
 
 static void null_begin_frame(void* ud)
@@ -149,32 +157,36 @@ static void null_begin_frame(void* ud)
     (void)ud;
 }
 
+static void null_update_title(void)
+{
+    /* Refresh the window title at most once per second. */
+    const u64 frames = null_frame_count();
+    s_state.fps = (u32)(frames - s_state.frames_at_mark);
+    s_state.frames_at_mark = frames;
+    s_state.last_fps_time = GetTickCount64();
+    if (s_state.hwnd) {
+        char title[224];
+        snprintf(title, sizeof(title),
+                 "Yakuza: Dead Souls  |  flips %llu  |  frames %u  |  draws %u  |  %.2f presented FPS",
+                 (unsigned long long)frames,
+                 rsx_live_draw_get_frames(),
+                 rsx_live_draw_get_last_draws(),
+                 rsx_live_draw_get_present_fps());
+        SetWindowTextA(s_state.hwnd, title);
+    }
+}
+
 static void null_end_frame(void* ud)
 {
     (void)ud;
-    s_state.frame_count++;
-
-    /* Update the informational title no more than once per second. Presented
-     * FPS comes from a 15-30 second / about-30-present QPC window so sub-1-FPS
-     * operation does not quantize to zero. Benchmark results use the raw CSV,
-     * not this title value. */
-    static u64 frames_at_mark = 0;
-    ULONGLONG now = GetTickCount64();
-    if (now - s_state.last_fps_time >= 1000) {
-        s_state.fps = (u32)(s_state.frame_count - frames_at_mark);
-        frames_at_mark = s_state.frame_count;
-        s_state.last_fps_time = now;
-        if (s_state.hwnd) {
-            char title[224];
-            snprintf(title, sizeof(title),
-                     "Yakuza: Dead Souls  |  flips %llu  |  frames %u  |  draws %u  |  %.2f presented FPS",
-                     (unsigned long long)s_state.frame_count,
-                     rsx_live_draw_get_frames(),
-                     rsx_live_draw_get_last_draws(),
-                     rsx_live_draw_get_present_fps());
-            SetWindowTextA(s_state.hwnd, title);
-        }
-    }
+    InterlockedIncrement64(&s_state.frame_count);
+    /* A cross-thread SetWindowText sends synchronously to the UI thread.
+     * A window timer normally owns all title work on the UI thread, so a
+     * delayed message pump cannot hold up flip retirement or the next host
+     * vblank tick; this path only runs if the timer could not be created. */
+    if (!s_state.title_ui_timer &&
+        GetTickCount64() - s_state.last_fps_time >= 1000u)
+        null_update_title();
 }
 
 static void null_present(void* ud, u32 buffer_id)
@@ -204,49 +216,6 @@ static void null_clear(void* ud, u32 flags, u32 color, float depth, u8 stencil)
     s_state.clear_color = RGB(r, g, b);
 }
 
-static void null_set_render_target(void* ud, const rsx_state* state)
-{
-    (void)ud;
-    static u32 log_count = 0;
-    if (log_count++ < 64) {
-        printf("[RSX null] set_render_target(format=0x%X, %ux%u)\n",
-               state->surface_format, state->surface_clip_w, state->surface_clip_h);
-    }
-}
-
-static void null_set_viewport(void* ud, const rsx_state* state)
-{
-    (void)ud;
-    static u32 log_count = 0;
-    if (log_count++ < 64) {
-        printf("[RSX null] set_viewport(%u,%u %ux%u)\n",
-               state->viewport_x, state->viewport_y,
-               state->viewport_w, state->viewport_h);
-    }
-}
-
-static void null_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
-{
-    (void)ud;
-    static int s_draw_log_count = 0;
-    if (s_draw_log_count < 20) {
-        printf("[RSX null] draw_arrays(prim=%u, first=%u, count=%u)\n",
-               primitive, first, count);
-        s_draw_log_count++;
-    }
-}
-
-static void null_draw_indexed(void* ud, u32 primitive, u32 offset, u32 count)
-{
-    (void)ud;
-    static int s_draw_log_count = 0;
-    if (s_draw_log_count < 20) {
-        printf("[RSX null] draw_indexed(prim=%u, offset=%u, count=%u)\n",
-               primitive, offset, count);
-        s_draw_log_count++;
-    }
-}
-
 /* ---------------------------------------------------------------------------
  * Backend registration
  * -----------------------------------------------------------------------*/
@@ -258,13 +227,13 @@ static rsx_backend s_null_backend = {
     .begin_frame       = null_begin_frame,
     .end_frame         = null_end_frame,
     .present           = null_present,
-    .set_render_target = null_set_render_target,
-    .set_viewport      = null_set_viewport,
+    .set_render_target = NULL,
+    .set_viewport      = NULL,
     .set_blend         = NULL,
     .set_depth_stencil = NULL,
     .clear             = null_clear,
-    .draw_arrays       = null_draw_arrays,
-    .draw_indexed      = null_draw_indexed,
+    .draw_arrays       = NULL,
+    .draw_indexed      = NULL,
     .bind_texture      = NULL,
 };
 
@@ -275,8 +244,6 @@ static rsx_backend s_null_backend = {
 int rsx_null_backend_init(u32 width, u32 height, const char* title)
 {
     memset(&s_state, 0, sizeof(s_state));
-    s_state.width = width;
-    s_state.height = height;
     s_state.clear_color = RGB(0, 0, 64); /* dark blue default */
 
     /* Register window class */
@@ -312,18 +279,13 @@ int rsx_null_backend_init(u32 width, u32 height, const char* title)
     }
     /*
      * CreateWindowEx(... WS_VISIBLE ...) performs the process's first show
-     * request, which Windows may replace with STARTUPINFO.wShowWindow.  A
-     * diagnostic launched through a hidden parent can therefore inherit
-     * SW_HIDE even though this window requested WS_VISIBLE.  The opt-in second
-     * request is authoritative and keeps normal/headless launchers unchanged.
+     * request, which Windows may replace with STARTUPINFO.wShowWindow; a
+     * launch through a hidden parent would inherit SW_HIDE.  A second show
+     * request is authoritative.
      */
-    if (getenv("YZ_FORCE_VISIBLE")) {
-        ShowWindow(s_state.hwnd, SW_SHOW);
-        UpdateWindow(s_state.hwnd);
-        printf("[RSX null] YZ_FORCE_VISIBLE: window explicitly shown\n");
-    }
-    {   /* WM_SETICON beats the shell's per-app taskbar icon cache (see the
-         * d3d12 backend's create_window). */
+    ShowWindow(s_state.hwnd, SW_SHOW);
+    UpdateWindow(s_state.hwnd);
+    {   /* WM_SETICON beats the shell's per-app taskbar icon cache. */
         HICON big = (HICON)LoadImageA(GetModuleHandle(NULL), MAKEINTRESOURCEA(1),
                                       IMAGE_ICON, GetSystemMetrics(SM_CXICON),
                                       GetSystemMetrics(SM_CYICON), 0);
@@ -336,11 +298,13 @@ int rsx_null_backend_init(u32 width, u32 height, const char* title)
 
     s_state.hdc = GetDC(s_state.hwnd);
     s_state.last_fps_time = GetTickCount64();
+    s_state.title_ui_timer = null_start_title_timer(s_state.hwnd);
+    if (!s_state.title_ui_timer)
+        fprintf(stderr, "[window-title] timer creation failed: %lu; falling back to flip-thread updates\n",
+                GetLastError());
 
     /* Register as the active RSX backend */
     rsx_set_backend(&s_null_backend);
-
-    printf("[RSX null] Window created: %ux%u\n", width, height);
     return 0;
 }
 
@@ -352,8 +316,6 @@ void rsx_null_backend_shutdown(void)
         s_state.hwnd = NULL;
     }
     rsx_set_backend(NULL);
-    printf("[RSX null] Backend shut down after %llu frames\n",
-           (unsigned long long)s_state.frame_count);
 }
 
 int rsx_null_backend_pump_messages(void)
@@ -377,10 +339,14 @@ void rsx_null_backend_suppress_present(int on)
 {
     s_present_suppressed = on;
 }
+int rsx_null_backend_graphics_suppressed(void)
+{
+    return s_present_suppressed && rsx_get_backend()==&s_null_backend;
+}
 
 #else /* !_WIN32 */
 
-/* Stub for non-Windows platforms — TODO: SDL2 or X11 backend */
+/* Not supported on this platform. */
 
 int rsx_null_backend_init(u32 width, u32 height, const char* title)
 {
@@ -398,5 +364,6 @@ int rsx_null_backend_pump_messages(void)
 
 void* rsx_null_backend_get_hwnd(void) { return 0; }
 void  rsx_null_backend_suppress_present(int on) { (void)on; }
+int rsx_null_backend_graphics_suppressed(void) { return 0; }
 
 #endif /* _WIN32 */

@@ -7,7 +7,6 @@
 
 #include "cellVideoOut.h"
 #include "ps3emu/endian.h"
-#include <stdio.h>
 #include <string.h>
 
 /* ---------------------------------------------------------------------------
@@ -18,23 +17,6 @@ static u8  s_resolution_id  = CELL_VIDEO_OUT_RESOLUTION_720;
 static u8  s_color_format   = CELL_VIDEO_OUT_BUFFER_COLOR_FORMAT_X8R8G8B8;
 static u8  s_aspect         = CELL_VIDEO_OUT_ASPECT_16_9;
 static u32 s_pitch          = 1280 * 4;
-
-static void get_resolution_wh(u32 resId, u16* w, u16* h);
-
-/* ---------------------------------------------------------------------------
- * Configuration
- * -----------------------------------------------------------------------*/
-
-void cellVideoOut_set_resolution(u8 resolutionId)
-{
-    s_resolution_id = resolutionId;
-
-    /* Update pitch based on resolution (host-endian helper; the public
-     * cellVideoOutGetResolution writes guest big-endian now) */
-    u16 w, h;
-    get_resolution_wh(resolutionId, &w, &h);
-    s_pitch = (u32)w * 4;
-}
 
 /* ---------------------------------------------------------------------------
  * Helpers
@@ -70,26 +52,20 @@ static void get_resolution_wh(u32 resId, u16* w, u16* h)
 
 s32 cellVideoOutGetState(u32 videoOut, u32 deviceIndex, CellVideoOutState* state)
 {
-    printf("[cellVideoOut] GetState(videoOut=%u, deviceIndex=%u)\n",
-           videoOut, deviceIndex);
-
     if (!state)
         return CELL_VIDEO_OUT_ERROR_ILLEGAL_PARAMETER;
 
-    /* Reference p.14/p.28: only the primary output is supported; SECONDARY
-     * is rejected like every sibling entry point (the old code accepted it
-     * and advertised it ENABLED). */
+    /* Only the primary output is supported; SECONDARY is rejected like every
+     * sibling entry point. */
     if (videoOut != CELL_VIDEO_OUT_PRIMARY)
         return CELL_VIDEO_OUT_ERROR_UNSUPPORTED_VIDEO_OUT;
 
     memset(state, 0, sizeof(CellVideoOutState));
 
-    /* 2026-08-04 doc-conformance audit: state values were inverted (we
-     * reported 2, which is PREPARING, as "enabled" -- Reference p.35 says
-     * in PREPARING no other member is even valid, and a spec-following
-     * boot polls for ENABLED=0). displayMode is the 8-byte struct, not a
-     * packed u32, and Reference p.4 guarantees at least one refreshRates
-     * bit in the mode returned here. */
+    /* ENABLED is 0 (2 is PREPARING, in which no other member is valid), and
+     * a spec-following boot polls for ENABLED. displayMode is the 8-byte
+     * struct, not a packed u32, and at least one refreshRates bit must be
+     * set in the mode returned here. */
     state->state      = CELL_VIDEO_OUT_OUTPUT_STATE_ENABLED;
     state->colorSpace = CELL_VIDEO_OUT_COLOR_SPACE_RGB;
     state->displayMode.resolutionId = (u8)s_resolution_id;
@@ -109,16 +85,12 @@ s32 cellVideoOutGetResolution(u32 resolutionId, CellVideoOutResolution* resoluti
     if (!resolution)
         return CELL_VIDEO_OUT_ERROR_ILLEGAL_PARAMETER;
 
-    /* The out-struct lives in guest memory: fields are big-endian.
-     * (Host-endian writes here fed the game byte-swapped width/height —
-     * 0xD002x0xE001 instead of 720x480 — which wrecked its display-buffer
-     * setup.) */
+    /* The out-struct lives in guest memory: fields are big-endian (a
+     * host-endian write would hand the game byte-swapped width/height). */
     u16 w, h;
     get_resolution_wh(resolutionId, &w, &h);
     resolution->width  = ps3_bswap16(w);
     resolution->height = ps3_bswap16(h);
-
-    printf("[cellVideoOut] GetResolution(id=%u) -> %ux%u\n", resolutionId, w, h);
 
     return CELL_OK;
 }
@@ -126,8 +98,6 @@ s32 cellVideoOutGetResolution(u32 resolutionId, CellVideoOutResolution* resoluti
 s32 cellVideoOutConfigure(u32 videoOut, CellVideoOutConfiguration* config,
                             void* option, u32 waitForEvent)
 {
-    printf("[cellVideoOut] Configure(videoOut=%u)\n", videoOut);
-
     if (!config)
         return CELL_VIDEO_OUT_ERROR_ILLEGAL_PARAMETER;
 
@@ -147,17 +117,12 @@ s32 cellVideoOutConfigure(u32 videoOut, CellVideoOutConfiguration* config,
         s_pitch = (u32)w * 4;
     }
 
-    printf("[cellVideoOut] Configure: resId=%u, format=%u, aspect=%u, pitch=%u\n",
-           s_resolution_id, s_color_format, s_aspect, s_pitch);
-
     return CELL_OK;
 }
 
 s32 cellVideoOutGetConfiguration(u32 videoOut, CellVideoOutConfiguration* config,
                                    void* option)
 {
-    printf("[cellVideoOut] GetConfiguration(videoOut=%u)\n", videoOut);
-
     if (!config)
         return CELL_VIDEO_OUT_ERROR_ILLEGAL_PARAMETER;
 
@@ -176,9 +141,6 @@ s32 cellVideoOutGetConfiguration(u32 videoOut, CellVideoOutConfiguration* config
 s32 cellVideoOutGetDeviceInfo(u32 videoOut, u32 deviceIndex,
                                CellVideoOutDeviceInfo* info)
 {
-    printf("[cellVideoOut] GetDeviceInfo(videoOut=%u, deviceIndex=%u)\n",
-           videoOut, deviceIndex);
-
     if (!info)
         return CELL_VIDEO_OUT_ERROR_ILLEGAL_PARAMETER;
 
@@ -190,8 +152,8 @@ s32 cellVideoOutGetDeviceInfo(u32 videoOut, u32 deviceIndex,
     info->portType       = CELL_VIDEO_OUT_OUTPUT_HDMI;
     info->colorSpace     = CELL_VIDEO_OUT_COLOR_SPACE_RGB;
     info->latency        = 0;
-    /* Reference p.38: CellVideoOutDeviceState is UNAVAILABLE=0/AVAILABLE=1;
-     * the old value 2 is out of range and could read as "no display". */
+    /* CellVideoOutDeviceState is UNAVAILABLE=0/AVAILABLE=1; any other value
+     * is out of range and could read as "no display". */
     info->state          = 1; /* CELL_VIDEO_OUT_DEVICE_STATE_AVAILABLE */
     info->rgbOutputRange = 1;
 
@@ -233,8 +195,6 @@ s32 cellVideoOutGetDeviceInfo(u32 videoOut, u32 deviceIndex,
 
 s32 cellVideoOutGetNumberOfDevice(u32 videoOut)
 {
-    printf("[cellVideoOut] GetNumberOfDevice(videoOut=%u)\n", videoOut);
-
     if (videoOut == CELL_VIDEO_OUT_PRIMARY)
         return 1;
 

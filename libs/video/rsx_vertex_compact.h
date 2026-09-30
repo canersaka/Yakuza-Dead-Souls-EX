@@ -1,11 +1,9 @@
 /*
  * ps3recomp - compact CPU vertex-fetch planning for the live RSX renderer
  *
- * The legacy renderer expands every guest attribute into a 16 x float4
- * vertex.  This helper preserves the same conversion rules while allowing a
- * caller to fetch only the attributes statically read by the active vertex
- * program.  It is D3D12-independent so format/bounds behavior can be tested
- * without creating a device.
+ * Fetch only the attributes the active vertex program reads, each converted
+ * to a float4 slot in ascending ATTR order.  It is D3D12-independent so
+ * format/bounds behavior can be tested without creating a device.
  */
 #ifndef PS3RECOMP_RSX_VERTEX_COMPACT_H
 #define PS3RECOMP_RSX_VERTEX_COMPACT_H
@@ -18,6 +16,12 @@ extern "C" {
 
 typedef const u8* (*rsx_vertex_guest_ptr_fn)(
     void* user, u32 location, u32 offset, u32 min_bytes);
+
+/* Default is scalar. Configure before decoding, or between frames on the sole
+ * renderer thread. Never change concurrently with a decode. */
+void rsx_vertex_decode_set_simd_unorm8(int enabled);
+/* Same serialization contract; reuse identical element ranges within a draw. */
+void rsx_vertex_fetch_set_reuse_ranges(int enabled);
 
 typedef struct rsx_vertex_layout_plan {
     u32 mask;
@@ -76,18 +80,37 @@ void rsx_vertex_fetch_plan_init(
     const rsx_vertex_layout_plan* layout,
     rsx_vertex_guest_ptr_fn guest_ptr, void* guest_user);
 
+/* Decoded-state form used when the caller already holds the attribute state.
+ * It uses the same CPU conversion contract as rsx_vertex_fetch_plan_init:
+ * compact float4 slots in ascending ATTR order, including disabled/default
+ * attributes and the ATTR3 neutral-white quirk. */
+void rsx_vertex_fetch_plan_init_decoded(
+    rsx_vertex_fetch_plan* plan, const rsx_dsp_vertex_attr* attrs,
+    const float defaults[][4], u32 base_offset, u32 divider_mask,
+    const rsx_vertex_layout_plan* layout,
+    rsx_vertex_guest_ptr_fn guest_ptr, void* guest_user);
+
 /* Attempt one bounds-checked contiguous mapping per used attribute.  Any
  * attribute whose complete span is not contiguous safely falls back to the
- * legacy per-element resolver in rsx_vertex_fetch_one. */
+ * per-element resolver in rsx_vertex_fetch_one. */
 void rsx_vertex_fetch_plan_prepare(
     rsx_vertex_fetch_plan* plan, const rsx_vertex_ref* refs, u32 count);
 
 /* Fetch one compact vertex in layout order.  Disabled attributes use their
  * RSX current/default value.  Enabled non-position attributes retain the
- * legacy fallback-to-default behavior on an unsupported/invalid fetch; an
+ * fallback-to-default behavior on an unsupported/invalid fetch; an
  * invalid enabled ATTR0 remains fatal. */
 int rsx_vertex_fetch_one(
     const rsx_vertex_fetch_plan* plan, const rsx_vertex_ref* ref, u8* out);
+
+/* Same output/failure contract across count vertices with layout.stride bytes
+ * per output vertex. Common formats with fully validated stable spans use
+ * attribute-major conversion; every other case retains fetch_one order. */
+int rsx_vertex_fetch_batch(
+    const rsx_vertex_fetch_plan* plan, const rsx_vertex_ref* refs,
+    u32 count, u8* out);
+/* Cumulative renderer-thread diagnostic counts; query on that same thread. */
+void rsx_vertex_fetch_batch_stats(u64* fast, u64* fallback);
 
 /* Collapse repeated (vertex_id, base_index) references in first-use order.
  * refs is rewritten in place with the unique prefix.  The occurrence map
@@ -111,6 +134,15 @@ int rsx_vertex_topology_plan(
 /* Public for focused format/endian tests. */
 int rsx_vertex_decode_element(
     u32 type, u32 size, const u8* source, float out[4]);
+
+/* Finalize the decoded index stream for one RSX triangle-list BEGIN/END.
+ * DRAW_INDEX_ARRAY/DRAW_ARRAYS method batches are transport chunks, not
+ * topology boundaries, so callers must concatenate every batch first.
+ * Restart words follow RSX triangle-list behavior:
+ * they are removed without resetting the running group of three.  The final
+ * incomplete triangle, if any, is discarded once for the complete action. */
+u32 rsx_vertex_triangle_list_finalize(
+    u32* indices, u32 count, int restart_enable, u32 restart_index);
 
 #ifdef __cplusplus
 }

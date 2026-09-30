@@ -5,6 +5,21 @@
 #include <limits.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(_M_X64) || defined(__x86_64__)
+#include <emmintrin.h>
+#define RSX_COMPACT_SSE2 1
+#endif
+
+static int rsx_compact_simd_unorm8;
+static int rsx_compact_reuse_ranges;
+void rsx_vertex_fetch_set_reuse_ranges(int enabled)
+{
+    rsx_compact_reuse_ranges = enabled != 0;
+}
+void rsx_vertex_decode_set_simd_unorm8(int enabled)
+{
+    rsx_compact_simd_unorm8 = enabled != 0;
+}
 
 static float rsx_compact_be_f32(const u8* p)
 {
@@ -40,31 +55,51 @@ int rsx_vertex_decode_element(
         return 0;
     out[0] = out[1] = out[2] = 0.0f;
     out[3] = 1.0f;
-    for (u32 component = 0; component < size && component < 4;
-         component++) {
-        switch (type) {
+    const u32 components = size < 4u ? size : 4u;
+    /* Format is constant for the entire element. Dispatch once rather than
+     * repeating the format switch for every component of every attribute. */
+    if (!components)
+        return 1;
+    switch (type) {
         case RSX_VTX_TYPE_FLOAT:
+            for (u32 component = 0; component < components; component++)
             out[component] = rsx_compact_be_f32(source + component * 4);
             break;
         case RSX_VTX_TYPE_HALF:
+            for (u32 component = 0; component < components; component++)
             out[component] = rsx_compact_be_f16(source + component * 2);
             break;
         case RSX_VTX_TYPE_UNORM8:
+#if defined(RSX_COMPACT_SSE2)
+            if (rsx_compact_simd_unorm8 && components == 4) {
+                const __m128 values = _mm_set_ps(
+                    (float)source[3], (float)source[2],
+                    (float)source[1], (float)source[0]);
+                _mm_storeu_ps(out, _mm_div_ps(values, _mm_set1_ps(255.0f)));
+                return 1;
+            }
+#endif
+            for (u32 component = 0; component < components; component++)
             out[component] = source[component] / 255.0f;
             break;
         case RSX_VTX_TYPE_UINT8:
+            for (u32 component = 0; component < components; component++)
             out[component] = (float)source[component];
             break;
         case RSX_VTX_TYPE_SNORM16: {
+            for (u32 component = 0; component < components; component++) {
             const s16 value = (s16)(
                 (source[component * 2] << 8) | source[component * 2 + 1]);
             out[component] = value / 32767.0f;
+            }
             break;
         }
         case RSX_VTX_TYPE_SINT16: {
+            for (u32 component = 0; component < components; component++) {
             const s16 value = (s16)(
                 (source[component * 2] << 8) | source[component * 2 + 1]);
             out[component] = (float)value;
+            }
             break;
         }
         case RSX_VTX_TYPE_CMP32: {
@@ -85,7 +120,6 @@ int rsx_vertex_decode_element(
         }
         default:
             return 0;
-        }
     }
     return 1;
 }
@@ -107,6 +141,21 @@ void rsx_vertex_layout_plan_init(
         plan->slot_by_attr[attr] = (s8)slot;
     }
     plan->stride = (u32)plan->count * 16u;
+}
+
+u32 rsx_vertex_triangle_list_finalize(
+    u32* indices, u32 count, int restart_enable, u32 restart_index)
+{
+    if (!indices && count)
+        return 0u;
+    u32 write = 0u;
+    for (u32 read = 0u; read < count; ++read) {
+        const u32 value = indices[read];
+        if (restart_enable && value == restart_index)
+            continue;
+        indices[write++] = value;
+    }
+    return write - write % 3u;
 }
 
 void rsx_vertex_fetch_plan_init(
@@ -142,9 +191,106 @@ void rsx_vertex_fetch_plan_init(
     }
 }
 
+void rsx_vertex_fetch_plan_init_decoded(
+    rsx_vertex_fetch_plan* plan, const rsx_dsp_vertex_attr* attrs,
+    const float defaults[][4], u32 base_offset, u32 divider_mask,
+    const rsx_vertex_layout_plan* layout,
+    rsx_vertex_guest_ptr_fn guest_ptr, void* guest_user)
+{
+    if (!plan || !attrs || !defaults || !layout)
+        return;
+    memset(plan, 0, sizeof(*plan));
+    plan->layout = *layout;
+    plan->base_offset = base_offset;
+    plan->divider_mask = divider_mask;
+    plan->guest_ptr = guest_ptr;
+    plan->guest_user = guest_user;
+    for (u32 attr = 0; attr < RSX_DSP_NUM_VERTEX_ATTR; ++attr) {
+        rsx_vertex_fetch_attr* fetch = &plan->attr[attr];
+        fetch->desc = attrs[attr];
+        fetch->elem_size =
+            rsx_vertex_attrib_size(fetch->desc.type, fetch->desc.size);
+        fetch->stride =
+            fetch->desc.stride ? fetch->desc.stride : fetch->elem_size;
+        memcpy(fetch->default_value, defaults[attr], 16u);
+        if (attr == 3u &&
+            fetch->default_value[0] == 0.0f &&
+            fetch->default_value[1] == 0.0f &&
+            fetch->default_value[2] == 0.0f &&
+            fetch->default_value[3] == 1.0f) {
+            fetch->default_value[0] = 1.0f;
+            fetch->default_value[1] = 1.0f;
+            fetch->default_value[2] = 1.0f;
+        }
+    }
+}
+
+static void rsx_vertex_fetch_plan_prepare_ranges(
+    rsx_vertex_fetch_plan* plan, const rsx_vertex_ref* refs, u32 count)
+{
+    if (!plan)
+        return;
+    struct range_entry { u32 frequency, modulo, first, last; } ranges[RSX_DSP_NUM_VERTEX_ATTR];
+    u32 range_count = 0;
+    for (u32 slot = 0; slot < plan->layout.count; slot++) {
+        const u32 attr = plan->layout.attrs[slot];
+        rsx_vertex_fetch_attr* fetch = &plan->attr[attr];
+        fetch->stable_base = NULL;
+        fetch->stable_first = 0;
+        fetch->stable_last = 0;
+        if (!refs || !count || !plan->guest_ptr ||
+            !fetch->desc.type || !fetch->desc.size || !fetch->elem_size)
+            continue;
+
+        const u32 frequency = fetch->desc.frequency <= 1 ? 0 : fetch->desc.frequency;
+        const u32 modulo = frequency ? (plan->divider_mask >> attr) & 1u : 0;
+        u32 range = 0;
+        while (range < range_count &&
+               (ranges[range].frequency != frequency || ranges[range].modulo != modulo))
+            ++range;
+        if (range == range_count) {
+            u32 first = UINT_MAX, last = 0;
+            for (u32 i = 0; i < count; ++i) {
+                const u32 element = rsx_vertex_element_index(
+                    refs[i].vertex_id, refs[i].base_index, frequency, modulo);
+                if (element < first) first = element;
+                if (element > last) last = element;
+            }
+            ranges[range].frequency = frequency;
+            ranges[range].modulo = modulo;
+            ranges[range].first = first;
+            ranges[range].last = last;
+            ++range_count;
+        }
+        const u32 first = ranges[range].first, last = ranges[range].last;
+
+        const u64 prefix =
+            (u64)plan->base_offset + (u64)fetch->desc.offset;
+        const u64 start = prefix + (u64)first * fetch->stride;
+        const u64 end =
+            prefix + (u64)last * fetch->stride + fetch->elem_size;
+        if (start > UINT_MAX || end > 0x100000000ull || end <= start ||
+            end - start > UINT_MAX)
+            continue;
+
+        const u8* base = plan->guest_ptr(
+            plan->guest_user, fetch->desc.location, (u32)start,
+            (u32)(end - start));
+        if (!base)
+            continue;
+        fetch->stable_base = base;
+        fetch->stable_first = first;
+        fetch->stable_last = last;
+    }
+}
+
 void rsx_vertex_fetch_plan_prepare(
     rsx_vertex_fetch_plan* plan, const rsx_vertex_ref* refs, u32 count)
 {
+    if (rsx_compact_reuse_ranges) {
+        rsx_vertex_fetch_plan_prepare_ranges(plan, refs, count);
+        return;
+    }
     if (!plan)
         return;
     for (u32 slot = 0; slot < plan->layout.count; slot++) {
@@ -225,6 +371,74 @@ int rsx_vertex_fetch_one(
         if (attr == 0)
             return 0;
         memcpy(value, fetch->default_value, 16);
+    }
+    return 1;
+}
+
+/* Common stable-span formats: decide the format once per attribute. */
+static u64 rsx_batch_fast_calls, rsx_batch_fallback_calls;
+void rsx_vertex_fetch_batch_stats(u64* fast, u64* fallback)
+{
+    if (fast) *fast = rsx_batch_fast_calls;
+    if (fallback) *fallback = rsx_batch_fallback_calls;
+}
+
+static int rsx_vertex_batch_reference(const rsx_vertex_fetch_plan* plan,
+                           const rsx_vertex_ref* refs,u32 count,u8* out)
+{
+    if(!plan || (!refs && count) || (!out && count && plan->layout.stride)) return 0;
+    for(u32 i=0;i<count;i++)
+        if(!rsx_vertex_fetch_one(plan,&refs[i],out ? out+(u64)i*plan->layout.stride : NULL)) return 0;
+    return 1;
+}
+int rsx_vertex_fetch_batch(const rsx_vertex_fetch_plan* plan,
+                           const rsx_vertex_ref* refs,u32 count,u8* out)
+{
+    if(!plan || (!refs && count) || (!out && count && plan->layout.stride)) return 0;
+    if(!count) return 1;
+    u32 first=UINT_MAX,last=0;
+    for(u32 i=0;i<count;i++) {
+        u32 e=rsx_vertex_element_index(refs[i].vertex_id,refs[i].base_index,1,0);
+        if(e<first) first=e; if(e>last) last=e;
+    }
+    for(u32 slot=0;slot<plan->layout.count;slot++) {
+        const rsx_vertex_fetch_attr* f=&plan->attr[plan->layout.attrs[slot]];
+        if(!f->desc.type || !f->desc.size) continue;
+        const u32 n=f->desc.size<4 ? f->desc.size : 4;
+        const int supported=(f->desc.type==RSX_VTX_TYPE_FLOAT && n==3) ||
+            (f->desc.type==RSX_VTX_TYPE_HALF && n==2) ||
+            ((f->desc.type==RSX_VTX_TYPE_UNORM8 || f->desc.type==RSX_VTX_TYPE_UINT8) && n==4);
+        if(!supported || f->desc.frequency>1 || !f->stable_base ||
+           first<f->stable_first || last>f->stable_last) {
+            rsx_batch_fallback_calls++;
+            return rsx_vertex_batch_reference(plan,refs,count,out);
+        }
+    }
+    rsx_batch_fast_calls++;
+    /* All source spans are proven and no resolver callbacks occur. Transposing
+     * these loops permits one format dispatch per draw attribute. */
+    for(u32 slot=0;slot<plan->layout.count;slot++) {
+        const rsx_vertex_fetch_attr* f=&plan->attr[plan->layout.attrs[slot]];
+        if(!f->desc.type || !f->desc.size) {
+            for(u32 i=0;i<count;i++) memcpy(out+(u64)i*plan->layout.stride+slot*16u,f->default_value,16);
+            continue;
+        }
+#define BATCH_LOOP(BODY) for(u32 i=0;i<count;i++) { \
+        const u32 e=rsx_vertex_element_index(refs[i].vertex_id,refs[i].base_index,1,0); \
+        const u8* source=f->stable_base+(u64)(e-f->stable_first)*f->stride; \
+        float* value=(float*)(out+(u64)i*plan->layout.stride+slot*16u); \
+        BODY; }
+        switch(f->desc.type) {
+        case RSX_VTX_TYPE_FLOAT:
+            BATCH_LOOP(value[0]=rsx_compact_be_f32(source); value[1]=rsx_compact_be_f32(source+4); value[2]=rsx_compact_be_f32(source+8); value[3]=1.0f); break;
+        case RSX_VTX_TYPE_HALF:
+            BATCH_LOOP(value[0]=rsx_compact_be_f16(source); value[1]=rsx_compact_be_f16(source+2); value[2]=0.0f; value[3]=1.0f); break;
+        case RSX_VTX_TYPE_UNORM8:
+            BATCH_LOOP(value[0]=source[0]/255.0f; value[1]=source[1]/255.0f; value[2]=source[2]/255.0f; value[3]=source[3]/255.0f); break;
+        case RSX_VTX_TYPE_UINT8:
+            BATCH_LOOP(value[0]=(float)source[0]; value[1]=(float)source[1]; value[2]=(float)source[2]; value[3]=(float)source[3]); break;
+        }
+#undef BATCH_LOOP
     }
     return 1;
 }

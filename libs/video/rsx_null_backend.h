@@ -1,14 +1,9 @@
 /*
  * ps3recomp - Null RSX Backend (Win32 window + color clear)
  *
- * Minimal graphics backend that:
- * - Creates a Win32 window
- * - Clears to the RSX clear color on each frame
- * - Presents via GDI (no GPU acceleration)
- *
- * This is the first step toward rendering — it proves the RSX command
- * processor is receiving commands and the game loop is running. Replace
- * with D3D12 or Vulkan backend for actual rendering.
+ * Owns the Win32 window, counts flips, forwards keyboard events to cellPad
+ * and updates the title statistics; rendering is done by rsx_live_draw. When
+ * no GPU renderer owns the window it paints the RSX clear color with GDI.
  */
 
 #ifndef PS3RECOMP_RSX_NULL_BACKEND_H
@@ -37,10 +32,13 @@ int rsx_null_backend_pump_messages(void);
  * chain to the existing present window. NULL before init. */
 void* rsx_null_backend_get_hwnd(void);
 
-/* Suppress the GDI clear-color present + WM_PAINT fill. A GPU backend (Track B
- * live draw) that owns a flip-model swap chain on this HWND calls this with 1
+/* Suppress the GDI clear-color present + WM_PAINT fill. A GPU backend (live
+ * draw) that owns a flip-model swap chain on this HWND calls this with 1
  * so the two don't fight over the window surface. Default: not suppressed. */
 void rsx_null_backend_suppress_present(int on);
+/* True only while this registered backend is a window/flip counter, with its
+ * GDI output disabled because a live GPU renderer owns the window. */
+int rsx_null_backend_graphics_suppressed(void);
 
 #ifdef __cplusplus
 }

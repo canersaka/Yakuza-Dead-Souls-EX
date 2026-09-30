@@ -44,7 +44,7 @@ static inline uint32_t yz_fifo_registered_island_resume(
         data_end_ea >= fifo_base + fifo_size)
         return 0u;
 
-    /* func_00EAB3DC aligns a bounded allocation inside the FIFO.  Refuse a
+    /* The title's allocator aligns a bounded allocation inside the FIFO.  Refuse a
      * stale/corrupt record that would skip an implausibly large region. */
     const uint32_t span = data_end_ea - stopper_ea;
     if (span < 4u || span > 0x10000u)
@@ -60,7 +60,7 @@ static inline uint32_t yz_fifo_registered_island_resume(
 }
 
 /* Validate the exact forward-JUMP/data/end triple published by the title's
- * inline FIFO allocator (func_00EAB3DC).  The command jumps from the current
+ * inline FIFO allocator.  The command jumps from the current
  * command cursor to an aligned data payload; execution must resume at the
  * separately published allocation end, not at the payload bytes.  Keeping
  * this distinct from the older stopper helper above prevents an ambiguous
@@ -173,8 +173,8 @@ static inline uint32_t yz_fifo_registered_inline_island_interior_resume(
  * preceding packet identity, committed prologue extent, and independently
  * validated prologue must all agree before the cursor may advance.
  *
- * The caller re-reads the guest witnesses and PUT after a barrier.  Keeping
- * this pure helper separate makes the fail-closed layout proof deterministic
+ * The caller re-reads the guest words and PUT after a barrier.  Keeping
+ * this pure helper separate makes the fail-closed layout check deterministic
  * and prevents it from becoming a generic malformed-command skip. */
 static inline uint32_t yz_fifo_generated_vp_constant_tail_resume(
     uint32_t previous_command, uint32_t tail_word,
@@ -204,14 +204,14 @@ static inline uint32_t yz_fifo_generated_vp_constant_tail_resume(
     const uint32_t mask = fifo_size - 1u;
     const uint32_t resume = (get + 8u) & mask;
     const uint32_t ahead = (put - get) & mask;
-    /* The exact prologue witness reads through resume+0x28 inclusive. */
+    /* The exact prologue check reads through resume+0x28 inclusive. */
     if (ahead < 0x34u || resume == 0u)
         return 0u;
     return resume;
 }
 
-/* Validate the exact generated vertex-program upload tail seen on the
- * Frontier transition. The producer emits a run of 32-word incrementing
+/* Validate the exact generated vertex-program upload tail published by
+ * the title. The producer emits a run of 32-word incrementing
  * SET_TRANSFORM_PROGRAM packets (0x00800B80), leaves one final three-word
  * instruction/data fragment, then publishes SET_BEGIN_END(0). The fragment
  * is not FIFO: its first word can alias an absolute CALL by chance.
@@ -219,7 +219,7 @@ static inline uint32_t yz_fifo_generated_vp_constant_tail_resume(
  * Admission therefore requires the owner's exact preceding packet boundary,
  * at least four independently reread consecutive upload packets, an unmapped
  * CALL-shaped first data word, the exact draw-end pair, and PUT covering the
- * whole pair. The caller repeats every witness after a barrier. */
+ * whole pair. The caller repeats every check after a barrier. */
 static inline uint32_t yz_fifo_generated_vp_program_tail_resume(
     uint32_t previous_get, uint32_t previous_command,
     uint32_t tail_word, uint32_t get, uint32_t put, uint32_t fifo_size,
@@ -243,17 +243,17 @@ static inline uint32_t yz_fifo_generated_vp_program_tail_resume(
     return resume && ahead >= 0x14u ? resume : 0u;
 }
 
-/* Validate a complete generated-VP inline data gap.  EDGE leaves one primary
+/* Validate a complete generated-VP inline data gap.  The title leaves one primary
  * ring NOOP immediately before a bounded producer-owned payload, followed by
  * the next exact generated draw prologue.  The payload length varies with the
  * vertex program (captured legal spans are 0x28, 0x38, and 0x100 bytes), and its
  * words can satisfy the method-header mask by chance.  Packet shape is never
- * an ownership proof: admission requires the exact sequential NOOP boundary,
+ * an ownership check: acceptance requires the exact sequential NOOP boundary,
  * the first independently identified prologue within max_gap, and a complete
  * draw-balanced prefix at that candidate. Real flow words are never bypassed.
  *
  * The caller finds the first exact prologue, proves its command chain, then
- * re-reads all witnesses and repeats this pure proof after a barrier. */
+ * re-reads all of these words and repeats this pure check after a barrier. */
 static inline uint32_t yz_fifo_generated_vp_inline_candidate_resume(
     uint32_t previous_get, uint32_t previous_command,
     uint32_t gap_word, uint32_t get, uint32_t put, uint32_t candidate,
@@ -284,7 +284,7 @@ static inline uint32_t yz_fifo_generated_vp_inline_candidate_resume(
     const uint32_t mask = fifo_size - 1u;
     const uint32_t distance = (candidate - get) & mask;
     const uint32_t ahead = (put - get) & mask;
-    /* The exact prologue witness reads through candidate+0x28 inclusive. */
+    /* The exact prologue check reads through candidate+0x28 inclusive. */
     if (!candidate || distance < 4u || distance > max_gap ||
         ahead < distance + 0x2Cu)
         return 0u;
@@ -335,8 +335,7 @@ static inline uint32_t yz_fifo_generated_vp_post_draw_candidate_resume(
     return candidate;
 }
 
-/* Retain the original fixed-shape helper as a source-compatible specialization
- * for its standalone regressions and any older callers. */
+/* Fixed-shape specialization of the helper above. */
 static inline uint32_t yz_fifo_generated_vp_inline_gap_resume(
     uint32_t previous_get, uint32_t previous_command,
     uint32_t gap_word, uint32_t get, uint32_t put, uint32_t fifo_size,
@@ -350,7 +349,7 @@ static inline uint32_t yz_fifo_generated_vp_inline_gap_resume(
         balanced_prefix_ready);
 }
 
-/* Validate the EDGE generated-list block-boundary publication shape.  The
+/* Validate the generated-list block-boundary publication shape.  The
  * title links the primary FIFO to the final word of a fixed-size generated
  * block; that word is producer-owned flow storage and can still contain
  * recycled vertex/constant payload when the source JUMP becomes visible.
@@ -360,7 +359,7 @@ static inline uint32_t yz_fifo_generated_vp_inline_gap_resume(
  * block boundary and the first finalized prologue.
  *
  * This helper intentionally accepts packet-shaped recycled words: that is the
- * failure this boundary proof exists to distinguish.  A real flow word is
+ * failure this boundary check exists to distinguish.  A real flow word is
  * never bypassed, and no arbitrary scan result can satisfy the contract. */
 static inline uint32_t yz_fifo_generated_block_candidate_resume(
     uint32_t tail, uint32_t tail_word, uint32_t candidate,

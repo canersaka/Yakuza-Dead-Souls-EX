@@ -1,6 +1,7 @@
 #ifndef PS3RECOMP_RSX_RESTART_CUTS_H
 #define PS3RECOMP_RSX_RESTART_CUTS_H
 
+#include "ps3emu/ps3types.h"
 #include <stdlib.h>
 
 /* A draw may contain one primitive-restart marker for every tiny strip.

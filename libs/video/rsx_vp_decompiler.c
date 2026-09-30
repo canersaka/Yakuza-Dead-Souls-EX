@@ -4,10 +4,9 @@
  * See rsx_vp_decompiler.h. The 4-word instruction encoding (D0..D3 fields,
  * source operand layout, opcode numbers) follows the public NV40 vertex
  * program layout as documented in the NV_vertex_program3 extension spec and
- * the envytools rnndb; RPCS3 was consulted as a READ-ONLY semantics oracle
- * for the field positions and the dest-write rules (no code copied).
+ * the envytools rnndb (no code copied).
  *
- * Field facts used (verified against the oracle 2026-07-03):
+ * Field facts used:
  *   D0: mask_w/z/y/x pairs [2:9] are the CC swizzle, cond [10:12],
  *       cond_test_enable [13], dst_tmp [15:20], src0/1/2_abs [21:23],
  *       addr_reg_sel [24], saturate [26], vec_result [30]
@@ -20,7 +19,7 @@
  *   SRC (17 bits): reg_type [0:1] (1 = temp, 2 = input, 3 = constant),
  *       tmp_src [2:7], swz w/z/y/x [8:15] (2 bits each), neg [16]
  *   Dest rules: the VEC result goes to output o[D3.dst] when D0.vec_result
- *       (dst 0x1F = none) AND to temp r[D0.dst_tmp] (0x3F = none); the SCA
+ *       (dst 0x1F = none) and to temp r[D0.dst_tmp] (0x3F = none); the SCA
  *       result goes to o[D3.dst] when !D0.vec_result, else to
  *       r[D3.sca_dst_tmp]. The SCA unit reads SRC2.
  *   VEC ADD reads src0 + src2 (not src1).
@@ -32,24 +31,9 @@
 #include <stdio.h>
 #include <string.h>
 
-/* ---- little-endian word read (RPCS3-capture native order) --------------- */
+/* ---- little-endian 32-bit word read (vertex programs are stored little-endian) ---- */
 static u32 rd_le(const u8* p)
 { return (u32)p[0] | ((u32)p[1]<<8) | ((u32)p[2]<<16) | ((u32)p[3]<<24); }
-
-/* ---- opcode names ------------------------------------------------------ */
-const char* rsx_vp_vec_name(u32 op)
-{
-    static const char* n[] = {"NOP","MOV","MUL","ADD","MAD","DP3","DPH","DP4",
-        "DST","MIN","MAX","SLT","SGE","ARL","FRC","FLR","SEQ","SFL","SGT","SLE",
-        "SNE","STR","SSG","?","?","TXL"};
-    return op < 26 ? n[op] : "?";
-}
-const char* rsx_vp_sca_name(u32 op)
-{
-    static const char* n[] = {"NOP","MOV","RCP","RCC","RSQ","EXP","LOG","LIT",
-        "BRA","BRI","CAL","CLI","RET","LG2","EX2","SIN","COS","BRB","CLB","PSH","POP"};
-    return op < 21 ? n[op] : "?";
-}
 
 u32 rsx_vp_program_size_instrs(const u8* ucode, u32 max_bytes)
 {
@@ -363,8 +347,8 @@ int rsx_vp_analyze_native_support_control_options(
         /* Vector 0..22 are implemented exactly. TXL(25) is exact only when
          * its encoded unit has a live descriptor; 23/24 remain unsupported.
          * The scalar ALU owns 0..7 and 13..16. BRI/BRB are accepted only as
-         * exact forward in-program transfers; every other flow family keeps
-         * the complete owning section on legacy. */
+         * exact forward in-program transfers; every other flow family is
+         * rejected. */
         const u32 txl_unit = (d2 >> 8) & 3u;
         if (vec_op == 25u)
             has_vertex_texture = 1;
@@ -389,13 +373,9 @@ int rsx_vp_analyze_native_support_control_options(
         if (cond_test && cond != 7u)
             analysis->conditional_tests++;
     }
-    /* The title's large skinned-character ubershaders combine BRI/BRB with
-     * twelve dependent vertex-texture fetches.  Straight-line TXL and exact
-     * flow are independently covered by WARP, but their combined live data
-     * path produced black character silhouettes in the captured Hana frame.
-     * Until a captured-program execution oracle proves the interaction, keep
-     * the complete owning pass on legacy.  This is a semantic admission gate,
-     * not a hash/title exception. */
+    /* BRI/BRB flow combined with vertex-texture fetches is reported as
+     * unsupported unless the caller passes
+     * RSX_VP_NATIVE_COHERENT_SECTION_FLOW_TXL. */
     if (has_flow && has_vertex_texture &&
         !(options & RSX_VP_NATIVE_COHERENT_SECTION_FLOW_TXL))
         analysis->unsupported_vec_mask |= 1u << 25;
@@ -408,8 +388,7 @@ static int rsx_vp_decompile_impl(
     const u8* ucode, u32 max_bytes, u32 vtex_mask, u32 start_slot,
     u32 options,
     int compact_inputs,
-    u32 input_mask, const char* pull_globals, const char* pull_loads,
-    char* out, u32 out_size);
+    u32 input_mask, char* out, u32 out_size);
 
 int rsx_vp_decompile(const u8* ucode, u32 max_bytes, char* out, u32 out_size)
 {
@@ -419,14 +398,31 @@ int rsx_vp_decompile(const u8* ucode, u32 max_bytes, char* out, u32 out_size)
 int rsx_vp_decompile_ex(const u8* ucode, u32 max_bytes, u32 vtex_mask,
                         char* out, u32 out_size)
 {
+    return rsx_vp_decompile_control_ex(
+        ucode, max_bytes, vtex_mask, 0u, out, out_size);
+}
+
+int rsx_vp_decompile_control_ex(
+    const u8* ucode, u32 max_bytes, u32 vtex_mask, u32 start_slot,
+    char* out, u32 out_size)
+{
     return rsx_vp_decompile_impl(
-        ucode, max_bytes, vtex_mask, 0u, 0u, 0, 0xFFFFu,
-        NULL, NULL, out, out_size);
+        ucode, max_bytes, vtex_mask, start_slot,
+        RSX_VP_NATIVE_COHERENT_SECTION_FLOW_TXL, 0, 0xFFFFu,
+        out, out_size);
 }
 
 int rsx_vp_decompile_compact_ex(
     const u8* ucode, u32 max_bytes, u32 vtex_mask, u32 input_mask,
     char* out, u32 out_size)
+{
+    return rsx_vp_decompile_compact_control_ex(
+        ucode, max_bytes, vtex_mask, input_mask, 0u, out, out_size);
+}
+
+int rsx_vp_decompile_compact_control_ex(
+    const u8* ucode, u32 max_bytes, u32 vtex_mask, u32 input_mask,
+    u32 start_slot, char* out, u32 out_size)
 {
     rsx_vp_input_analysis analysis;
     if (rsx_vp_analyze_inputs(ucode, max_bytes, &analysis) < 0 ||
@@ -436,48 +432,16 @@ int rsx_vp_decompile_compact_ex(
     else
         input_mask = analysis.input_mask;
     return rsx_vp_decompile_impl(
-        ucode, max_bytes, vtex_mask, 0u, 0u, 1, input_mask, NULL, NULL,
+        ucode, max_bytes, vtex_mask, start_slot,
+        RSX_VP_NATIVE_COHERENT_SECTION_FLOW_TXL, 1, input_mask,
         out, out_size);
-}
-
-int rsx_vp_decompile_pull_ex(
-    const u8* ucode, u32 max_bytes, u32 vtex_mask,
-    const char* pull_globals, const char* pull_loads,
-    char* out, u32 out_size)
-{
-    return rsx_vp_decompile_pull_control_ex(
-        ucode, max_bytes, vtex_mask, 0u, pull_globals, pull_loads,
-        out, out_size);
-}
-
-int rsx_vp_decompile_pull_control_ex(
-    const u8* ucode, u32 max_bytes, u32 vtex_mask, u32 start_slot,
-    const char* pull_globals, const char* pull_loads,
-    char* out, u32 out_size)
-{
-    return rsx_vp_decompile_pull_control_options_ex(
-        ucode, max_bytes, vtex_mask, start_slot, 0u,
-        pull_globals, pull_loads, out, out_size);
-}
-
-int rsx_vp_decompile_pull_control_options_ex(
-    const u8* ucode, u32 max_bytes, u32 vtex_mask, u32 start_slot,
-    u32 options, const char* pull_globals, const char* pull_loads,
-    char* out, u32 out_size)
-{
-    if (!pull_globals || !pull_loads)
-        return -1;
-    return rsx_vp_decompile_impl(
-        ucode, max_bytes, vtex_mask, start_slot, options, 0, 0xFFFFu,
-        pull_globals, pull_loads, out, out_size);
 }
 
 static int rsx_vp_decompile_impl(
     const u8* ucode, u32 max_bytes, u32 vtex_mask, u32 start_slot,
     u32 options,
     int compact_inputs,
-    u32 input_mask, const char* pull_globals, const char* pull_loads,
-    char* out, u32 out_size)
+    u32 input_mask, char* out, u32 out_size)
 {
     if (!ucode || !out || out_size < 256) return -1;
 
@@ -508,8 +472,6 @@ static int rsx_vp_decompile_impl(
         emit(&b, "    uint _vp_pc = 0u;\n");
     }
 
-    int n_flow_skipped = 0;
-
     u32 off = 0; int instrs = 0;
     while (off + 16 <= max_bytes) {
         const u32 instruction = (u32)instrs;
@@ -538,8 +500,6 @@ static int rsx_vp_decompile_impl(
         u32 addr_sel = (d0 >> 24) & 1;
         u32 addr_swz = d0 & 3;
         int saturate = (d0 >> 26) & 1;
-        int cond_test = (d0 >> 13) & 1;
-        u32 cond = (d0 >> 10) & 7;
 
         char A[96], B[96], C[96];
         emit_src(src0, a0, input_src, const_src, index_const, addr_sel, addr_swz, A, sizeof(A));
@@ -553,9 +513,6 @@ static int rsx_vp_decompile_impl(
 
         int vmx=(d3>>16)&1, vmy=(d3>>15)&1, vmz=(d3>>14)&1, vmw=(d3>>13)&1;
         int smx=(d3>>20)&1, smy=(d3>>19)&1, smz=(d3>>18)&1, smw=(d3>>17)&1;
-
-        (void)cond_test;
-        (void)cond;
 
         /* ---- vector ALU ---- */
         if ((vmx|vmy|vmz|vmw) && vec_op != 0x00) {
@@ -606,7 +563,6 @@ static int rsx_vp_decompile_impl(
                 handled = 0;
                 break;
             default:
-                n_flow_skipped++;
                 emit(&b, "    /* TODO: unhandled VP vec op */\n");
                 handled = 0;
                 break;
@@ -659,7 +615,6 @@ static int rsx_vp_decompile_impl(
                 rhs[0] = '\0';
                 break;
             default:
-                n_flow_skipped++;
                 emit(&b, "    /* TODO: VP flow-control op skipped */\n");
                 rhs[0]='\0';
                 break;
@@ -716,12 +671,9 @@ static int rsx_vp_decompile_impl(
 
     /* ---- assemble full shader ---- */
     Out o = { out, out_size, 0, 0 };
-    if (pull_loads) {
-        /* Vertex pulling: no VSInput struct, no input layout; inputs are
-         * fetched from raw guest memory by the pull_globals helpers. */
-    } else if (!compact_inputs) {
+    if (!compact_inputs) {
         emit(&o,
-            /* All 16 RSX vertex attributes arrive as float4 (the harness
+            /* All 16 RSX vertex attributes arrive as float4 (the renderer
              * fetches and converts them on the CPU). */
             "struct VSInput {\n"
             "    float4 a0:ATTR0;  float4 a1:ATTR1;  float4 a2:ATTR2;  float4 a3:ATTR3;\n"
@@ -750,7 +702,7 @@ static int rsx_vp_decompile_impl(
         "    float4 t4:TEXCOORD4; float4 t5:TEXCOORD5; float4 t6:TEXCOORD6; float4 t7:TEXCOORD7;\n"
         "};\n"
         /* b0: 512 vec4 transform constants + the RSX viewport transform,
-         * pre-mapped by the harness to D3D clip space:
+         * pre-mapped by the renderer to D3D clip space:
          *   ndc.xyz = clip.xyz * vp_posscale.xyz + clip.w * vp_posoffset.xyz */
         "cbuffer VPConst : register(b0) {\n"
         "    float4 vp_c[512];\n"
@@ -770,19 +722,8 @@ static int rsx_vp_decompile_impl(
         emit(&o, decl);
     }
 
-    if (pull_loads)
-        emit(&o, pull_globals);
-
-    if (pull_loads)
-        emit(&o, "VSOutput main(uint yz_sysvid : SV_VertexID) {\n");
-    else
-        emit(&o, "VSOutput main(VSInput input) {\n");
-    if (pull_loads) {
-        emit(&o,
-            "    float4 v[16];\n"
-            "    [unroll] for (int _k=0;_k<16;_k++) v[_k]=float4(0,0,0,1);\n");
-        emit(&o, pull_loads);
-    } else if (!compact_inputs) {
+    emit(&o, "VSOutput main(VSInput input) {\n");
+    if (!compact_inputs) {
         emit(&o,
             "    float4 v[16];\n"
             "    v[0]=input.a0;  v[1]=input.a1;  v[2]=input.a2;  v[3]=input.a3;\n"
@@ -822,7 +763,6 @@ static int rsx_vp_decompile_impl(
         "    return Out;\n"
         "}\n");
 
-    (void)n_flow_skipped;
     if (o.overflow) return -1;
     return instrs;
 }

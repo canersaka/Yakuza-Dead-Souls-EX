@@ -1,10 +1,10 @@
 /*
- * ps3recomp - NV4097 method dispatcher (Track B / LAYER 2)
+ * ps3recomp - NV4097 method dispatcher
  *
- * See rsx_dispatch.h for the design and the clean-room source list.
+ * See rsx_dispatch.h for the design and the register sources.
  *
  * Register/method facts used here (envytools rnndb nv30-40_3d + Mesa nv30
- * + psdevwiki; RPCS3 consulted as a read-only semantics oracle):
+ * + psdevwiki):
  *
  *   0x0194 DMA_COLOR0, 0x018C DMA_COLOR1, 0x01B4/0x01B8 DMA_COLOR2/3,
  *   0x0198 DMA_ZETA                DMA handle 0xFEED0000 = RSX local memory,
@@ -33,13 +33,15 @@
  *   0x1D8C CLEAR_DEPTH_VALUE  0x1D90 CLEAR_COLOR_VALUE (A8R8G8B8)
  *   0x1D94 CLEAR_BUFFERS     Z=0x01 S=0x02 R=0x10 G=0x20 B=0x40 A=0x80
  *   0x1E9C VP_UPLOAD_FROM_ID (transform program load pointer)
- *   0x1EFC VP_UPLOAD_CONST_ID (transform constant load pointer; NOT
- *          auto-advancing — every burst re-reads it)
+ *   0x1EFC VP_UPLOAD_CONST_ID (transform constant load pointer; not
+ *          auto-advancing: every burst re-reads it)
  *   0x1F00..0x1F7C VP_UPLOAD_CONST window: word i -> slot load + i/4, lane i%4
- *   0xE944 gcm driver-queue flip (established empirically from this title)
+ *   0xE944 GCM queue-buffer method for head 1 (see yakuza/yz_gcm_hle.inc);
+ *          the sink's flip callback fires on it
  */
 
 #include "rsx_dispatch.h"
+#include "rsx_upload_packet.h"
 
 #include <string.h>
 
@@ -92,19 +94,17 @@
 #define M_VP_UPLOAD_CONST       0x1F00
 #define M_GCM_DRIVER_FLIP       0xE944
 /* Primitive restart: a sentinel index value that breaks a TRIANGLE_STRIP/
- * FAN mid-draw with no connecting triangle (RPCS3 oracle: gcm_enums.h
- * NV4097_SET_RESTART_INDEX_ENABLE/NV4097_SET_RESTART_INDEX; semantics in
- * rsx_methods.h restart_index_enabled()/restart_index() -- enabled only
- * when the enable bit is set AND, for 16-bit index buffers, the configured
- * value fits in 16 bits). */
+ * FAN mid-draw with no connecting triangle. Enabled only when the enable
+ * bit is set and, for 16-bit index buffers, the configured value fits in
+ * 16 bits. */
 #define M_RESTART_INDEX_ENABLE  0x1DAC
 #define M_RESTART_INDEX         0x1DB0
 
-/* Render state consumed directly by the replay harness's PSO builder
- * (rsx_dsp_reg reads straight out of the register file, so these already
- * took effect before being classified here; this fixes the coverage report
- * to match reality instead of showing them as TODO). Addresses from
- * tools/nv40_methods.py (envytools rnndb). */
+/* Render state consumed directly by the renderer's PSO builder
+ * (rsx_dsp_reg reads straight out of the register file, so these take
+ * effect without a dispatcher handler; classifying them marks the methods as
+ * handled). Addresses from the envytools rnndb NV30-40 3D register
+ * database. */
 #define M_ALPHA_FUNC_ENABLE     0x0304
 #define M_ALPHA_FUNC_FUNC       0x0308
 #define M_ALPHA_FUNC_REF        0x030C
@@ -115,6 +115,7 @@
 #define M_STENCIL_WRITE_MASK    0x032C
 #define M_STENCIL_FUNC_MASK     0x0338
 #define M_MRT_COLOR_MASK        0x0370
+#define M_MRT_BLEND_ENABLE      0x036C
 #define M_DEPTH_BOUNDS_ENABLE   0x0380
 #define M_DEPTH_BOUNDS_MIN      0x0384
 #define M_DEPTH_BOUNDS_MAX      0x0388
@@ -163,41 +164,39 @@ void rsx_dispatch_init(rsx_dispatch* rsx, const rsx_dispatch_sink* sink)
     if (sink)
         rsx->sink = *sink;
 
-    /* s31 (scratch/s31_blue_emitter.md): the nv40 RESET DEFAULT for
-     * COLOR_MASK is all-channels-on (RPCS3 rsx_methods.cpp:345,983 seeds
-     * registers[NV4097_SET_COLOR_MASK]=0x1010101). Seeding it here makes a
-     * raw register read trustworthy for every consumer: a game-written 0 is
-     * a REAL "write no color channels" (the character shadow-mask
-     * depth-prime pass), distinguishable from never-initialized. Without
-     * the seed, consumers substituted mask=ALL for 0 and force-wrote the
-     * depth-only pass's garbage FP output (the blue-character class). */
+    /* The nv40 reset default for COLOR_MASK is all-channels-on (0x01010101).
+     * Seeding it here makes a raw register read trustworthy for every
+     * consumer: a game-written 0 is a real "write no color channels" (the
+     * character shadow-mask depth-prime pass), distinguishable from
+     * never-initialized, so consumers must not substitute an all-channels
+     * mask for 0. */
     rsx->regs[M_COLOR_MASK >> 2] = 0x01010101u;
 
-    /* NV40 resets both stencil masks to all bits enabled.  Native state
-     * folding reads these registers directly, so retain the hardware defaults
-     * until the guest explicitly changes them. */
+    /* NV40 resets both stencil masks to all bits enabled.  The renderer reads
+     * these registers directly, so keep the hardware defaults until the guest
+     * explicitly changes them. */
     rsx->regs[M_STENCIL_WRITE_MASK >> 2] = 0xFFu;
     rsx->regs[M_STENCIL_FUNC_MASK >> 2] = 0xFFu;
     rsx->regs[M_BACK_STENCIL_MASK >> 2] = 0xFFu;
     rsx->regs[M_BACK_STENCIL_FUNC_MASK >> 2] = 0xFFu;
     rsx->regs[M_DEPTH_BOUNDS_MAX >> 2] = 0x3F800000u;
 
-    /* NV40 reset state is counter-clockwise front winding.  Leaving this
-     * register zero made a live stream that relied on the hardware default
-     * cull the exterior of orphanage meshes, while captured replay was correct
-     * because its seeded register image already contained 0x901. */
+    /* NV40 reset state is counter-clockwise front winding.  A command stream
+     * that relies on the hardware default needs this seeded, otherwise it
+     * culls the exterior of meshes. */
     rsx->regs[M_FRONT_FACE >> 2] = 0x0901u;
 
     /* NV40 reset ZSTENCIL_CLEAR_VALUE (Z24S8: depth24<<8 | stencil8) is
-     * 0xFFFFFF00 = depth 1.0, stencil 0 (RPCS3 rsx_methods.cpp reset image
-     * as numbering oracle). Seeded so a raw register read is trustworthy for
-     * clear consumers, mirroring COLOR_MASK/FRONT_FACE above. */
+     * 0xFFFFFF00 = depth 1.0, stencil 0. Seeded so a raw register read is
+     * trustworthy for clear consumers, mirroring COLOR_MASK/FRONT_FACE
+     * above. */
     rsx->regs[0x1D8C >> 2] = 0xFFFFFF00u;
 
     /* NV40 reset shader-window convention: bottom origin, half-pixel center,
      * zero height until the guest selects the active surface convention. */
     rsx->regs[M_SHADER_WINDOW >> 2] = 0x1000u;
     rsx->regs[M_RENDER_ENABLE >> 2] = 0x01000000u;
+    rsx->condition_known = 1;
 
     /* Execution methods */
     mark_class(rsx, M_VERTEX_BEGIN_END,  1, RSX_DSP_CLASS_EXEC);
@@ -232,13 +231,14 @@ void rsx_dispatch_init(rsx_dispatch* rsx, const rsx_dispatch_sink* sink)
     mark_class(rsx, M_VTX_ATTR_4F,      64, RSX_DSP_CLASS_STATE);
 
     /* Alpha test / blend / color-mask / depth / cull: rsx_dsp_reg reads these
-     * straight from the register file (replay_main.c's decode_render_state,
-     * color-mask application), so they were already live; this only corrects
-     * the coverage report. */
+     * straight from the register file (decoded in rsx_ld_render_state.inc),
+     * so they take effect without a handler; classifying them marks the
+     * methods as handled. */
     mark_class(rsx, M_ALPHA_FUNC_ENABLE, 3, RSX_DSP_CLASS_STATE); /* ..FUNC_REF */
     mark_class(rsx, M_BLEND_FUNC_ENABLE, 5, RSX_DSP_CLASS_STATE); /* ..BLEND_EQUATION */
     mark_class(rsx, M_COLOR_MASK,        1, RSX_DSP_CLASS_STATE);
     mark_class(rsx, M_MRT_COLOR_MASK,    1, RSX_DSP_CLASS_STATE);
+    mark_class(rsx, M_MRT_BLEND_ENABLE,  1, RSX_DSP_CLASS_STATE);
     mark_class(rsx, M_DEPTH_BOUNDS_ENABLE, 3, RSX_DSP_CLASS_STATE);
     mark_class(rsx, M_TWO_SIDED_STENCIL, 8, RSX_DSP_CLASS_STATE);
     mark_class(rsx, M_POLY_OFFSET_POINT_EN, 3, RSX_DSP_CLASS_STATE);
@@ -252,10 +252,10 @@ void rsx_dispatch_init(rsx_dispatch* rsx, const rsx_dispatch_sink* sink)
     mark_class(rsx, M_RENDER_ENABLE,     1, RSX_DSP_CLASS_STATE);
 
     /* Explicit no-ops: the vertex cache invalidate hint and the reserved
-     * NOP method carry no state the replay harness needs (there is no CPU
+     * NOP method carry no state the renderer needs (there is no CPU
      * vertex cache to invalidate; every draw re-fetches from guest memory
-     * each time). Classifying them EXEC removes them from the TODO count
-     * without pretending they do anything. */
+     * each time). Classifying them EXEC marks them as handled without
+     * pretending they do anything. */
     mark_class(rsx, M_VTX_CACHE_INVALIDATE, 1, RSX_DSP_CLASS_EXEC);
     mark_class(rsx, M_NV4097_NOP,           1, RSX_DSP_CLASS_EXEC);
 }
@@ -265,6 +265,10 @@ void rsx_dispatch_seed_registers(rsx_dispatch* rsx, const u32* regs, u32 count)
     if (count > RSX_DSP_NUM_REGS)
         count = RSX_DSP_NUM_REGS;
     memcpy(rsx->regs, regs, count * sizeof(u32));
+    if(count > (M_RENDER_ENABLE >> 2)) {
+        rsx->condition_enabled=rsx->condition_dma=rsx->condition_offset=0;
+        rsx->condition_known=(rsx->regs[M_RENDER_ENABLE >> 2] >> 24)==1;
+    }
 }
 
 void rsx_dispatch_seed_transform_program(rsx_dispatch* rsx, const u32* words, u32 count)
@@ -282,28 +286,79 @@ void rsx_dispatch_seed_transform_constants(rsx_dispatch* rsx, const u32* words, 
     memcpy(rsx->constants, words, count * sizeof(u32));
 }
 
-void rsx_dispatch_copy_architectural_state(
-    rsx_dispatch* dst, const rsx_dispatch* src)
+int rsx_dispatch_upload_packet(rsx_dispatch* rsx, u32 method,
+                               const u32* words, u32 count, u32 noninc)
 {
-    if (!dst || !src || dst == src)
-        return;
-    memcpy(dst->regs, src->regs, sizeof(dst->regs));
-    memcpy(dst->vp, src->vp, sizeof(dst->vp));
-    memcpy(dst->constants, src->constants, sizeof(dst->constants));
-    dst->in_begin_end = src->in_begin_end;
-    dst->current_primitive = src->current_primitive;
+    if (!rsx || !words || !rsx_upload_packet_supported(method, count, noninc))
+        return 0;
+    const u32 step = noninc ? 0u : 4u;
+    /* Published linear upload blocks have no intermediate callbacks. Copy the
+     * payload and register image directly; unusual lanes, wrap and invalid
+     * loads retain the scalar hardware semantics below. */
+    if(!noninc){
+        if(method<0x0C00u && !(method&15u) && !(count&3u)){
+            u32* load=&rsx->regs[M_VP_UPLOAD_FROM_ID>>2];
+            if(*load<RSX_DSP_VP_INSTR && count<=RSX_DSP_VP_WORDS-*load*4u){
+                memcpy(rsx->vp+*load*4u,words,count*4u);
+                memcpy(rsx->regs+(method>>2),words,count*4u);
+                for(u32 i=0;i<count;i++)++rsx->seen[(method>>2)+i];
+                *load+=count/4u;return 1;
+            }
+        }else if(method>=0x1F00u){
+            const u32 load=rsx->regs[M_VP_UPLOAD_CONST_ID>>2];
+            const u32 offset=(method-M_VP_UPLOAD_CONST)>>2;
+            if(load<RSX_DSP_NUM_CONSTANTS && offset+count<=RSX_DSP_NUM_CONSTANTS*4u-load*4u){
+                memcpy((u32*)rsx->constants+load*4u+offset,words,count*4u);
+                memcpy(rsx->regs+(method>>2),words,count*4u);
+                for(u32 i=0;i<count;i++)++rsx->seen[(method>>2)+i];
+                return 1;
+            }
+        }
+    }
+    if (method < 0x0C00u) {
+        u32* load = &rsx->regs[M_VP_UPLOAD_FROM_ID >> 2];
+        for (u32 i = 0; i < count; ++i, method += step) {
+            const u32 lane = ((method - M_VP_UPLOAD_INST) >> 2) & 3u;
+            const u32 pos = *load * 4u + lane;
+            rsx->seen[method >> 2]++;
+            rsx->regs[method >> 2] = words[i];
+            if (pos < RSX_DSP_VP_WORDS) rsx->vp[pos] = words[i];
+            if (lane == 3u) (*load)++;
+        }
+    } else {
+        const u32 load = rsx->regs[M_VP_UPLOAD_CONST_ID >> 2];
+        for (u32 i = 0; i < count; ++i, method += step) {
+            const u32 word = (method - M_VP_UPLOAD_CONST) >> 2;
+            const u32 slot = load + (word >> 2);
+            rsx->seen[method >> 2]++;
+            rsx->regs[method >> 2] = words[i];
+            if (slot < RSX_DSP_NUM_CONSTANTS)
+                rsx->constants[slot][word & 3u] = words[i];
+        }
+    }
+    return 1;
 }
 
+void rsx_dispatch_render_condition(rsx_dispatch* rsx,u32 arg)
+{
+    if((arg>>24)==1) {
+        rsx->condition_known=1;rsx->condition_enabled=rsx->condition_dma=rsx->condition_offset=0;
+    } else if((arg>>24)==2) {
+        rsx->condition_known=rsx->condition_enabled=1;
+        rsx->condition_dma=rsx->regs[0x01a8u>>2];rsx->condition_offset=arg&0xffffffu;
+    } /* Unknown modes preserve the previous latch, matching the typed adapter. */
+}
 void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
 {
     method &= 0xFFFFC;
     const u32 idx = method >> 2;
     rsx->seen[idx]++;
     rsx->regs[idx] = arg;
+    if(method==M_RENDER_ENABLE) rsx_dispatch_render_condition(rsx,arg);
 
     /* Transform program upload window: word goes to instruction slot
      * VP_UPLOAD_FROM_ID; the load pointer advances after every completed
-     * vec4 (hardware auto-increment, confirmed against the RPCS3 oracle). */
+     * vec4 (hardware auto-increment). */
     if (method >= M_VP_UPLOAD_INST && method < M_VP_UPLOAD_INST + 32 * 4) {
         const u32 lane = ((method - M_VP_UPLOAD_INST) >> 2) & 3;
         u32* load = &rsx->regs[M_VP_UPLOAD_FROM_ID >> 2];
@@ -316,7 +371,7 @@ void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
     }
 
     /* Transform constant upload window: word i of the burst writes
-     * constants[VP_UPLOAD_CONST_ID + i/4][i%4]; the load pointer does NOT
+     * constants[VP_UPLOAD_CONST_ID + i/4][i%4]; the load pointer does not
      * advance. */
     if (method >= M_VP_UPLOAD_CONST && method < M_VP_UPLOAD_CONST + 32 * 4) {
         const u32 word = (method - M_VP_UPLOAD_CONST) >> 2;
@@ -326,6 +381,11 @@ void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
         return;
     }
 
+    rsx_dispatch_execute_action(rsx, method, arg);
+}
+
+void rsx_dispatch_execute_action(rsx_dispatch* rsx, u32 method, u32 arg)
+{
     switch (method) {
     case M_CLEAR_BUFFERS:
         if (rsx->sink.clear)
@@ -372,11 +432,6 @@ void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
 u32 rsx_dsp_clear_color(const rsx_dispatch* rsx)
 {
     return rsx_dsp_reg(rsx, M_CLEAR_COLOR_VALUE);
-}
-
-u32 rsx_dsp_clear_zstencil(const rsx_dispatch* rsx)
-{
-    return rsx_dsp_reg(rsx, M_CLEAR_DEPTH_VALUE);
 }
 
 void rsx_dsp_get_surface(const rsx_dispatch* rsx, rsx_dsp_surface* out)
@@ -528,9 +583,8 @@ int rsx_dsp_restart_index_enabled(const rsx_dispatch* rsx, int index_is_u32)
 {
     if (!rsx_dsp_reg(rsx, M_RESTART_INDEX_ENABLE))
         return 0;
-    /* RPCS3 oracle (rsx_methods.h restart_index_enabled()): a 16-bit index
-     * buffer disables restart entirely if the configured sentinel doesn't
-     * fit in 16 bits, rather than truncating it. */
+    /* A 16-bit index buffer disables restart entirely if the configured
+     * sentinel doesn't fit in 16 bits, rather than truncating it. */
     if (!index_is_u32 && rsx_dsp_reg(rsx, M_RESTART_INDEX) > 0xFFFFu)
         return 0;
     return 1;

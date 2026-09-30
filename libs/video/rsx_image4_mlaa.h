@@ -17,8 +17,8 @@ enum {
     RSX_IMAGE4_MLAA_THRESHOLD_BASE = 10,
     RSX_IMAGE4_MLAA_THRESHOLD_SCALE = 89,
     RSX_IMAGE4_MLAA_IMAGE_ID = 4,
-    /* Native SPURS classifies the complete live ELF image: the 0x8420 code
-     * payload plus its 0x34-byte ELF header. */
+    /* Image size is the whole loaded ELF: 0x8420 bytes of code plus the
+     * 0x34-byte header. */
     RSX_IMAGE4_MLAA_IMAGE_SIZE = 0x8454,
     RSX_IMAGE4_MLAA_ENTRY_PC = 0x3050
 };
@@ -99,44 +99,38 @@ typedef enum rsx_image4_mlaa_offer_result {
     RSX_IMAGE4_MLAA_OFFER_CONFLICT
 } rsx_image4_mlaa_offer_result;
 
-/* Parse the big-endian EDGE 1.2 EdgePostMlaaTaskParameters ABI. */
+/* Parse a 64-byte big-endian MLAA task record. */
 int rsx_image4_mlaa_parse_task(
     const uint8_t record[RSX_IMAGE4_MLAA_RECORD_BYTES],
     rsx_image4_mlaa_task* out);
 
 /* Admit only the exact five-task game route. Records may arrive in any task
- * order; spu_id is the semantic identity. Unknown EDGE modes and variants
- * deliberately reject so the persistent SPURS tasks remain authoritative. */
+ * order; spu_id is the semantic identity. Unknown modes and variants are
+ * rejected. */
 rsx_image4_mlaa_reject rsx_image4_mlaa_validate(
     const uint8_t records[RSX_IMAGE4_MLAA_TASKS]
                          [RSX_IMAGE4_MLAA_RECORD_BYTES],
     uint32_t expected_image_ea, uint32_t expected_label_ea,
     uint32_t expected_label_value, rsx_image4_mlaa_contract* out);
 
-const char* rsx_image4_mlaa_reject_name(rsx_image4_mlaa_reject reject);
-
-/* Exact lifted-image identity. This is deliberately independent of image_id:
- * the registry id is useful routing metadata, while fingerprint+size+entry
- * are the fail-closed executable identity. */
+/* Image identity: fingerprint, size and entry point must all match. The
+ * image_id field is not part of the comparison. */
 int rsx_image4_mlaa_image_matches(const rsx_image4_mlaa_image* image);
-/* This title uses a monotonic tasksReady epoch: before a round, the counter
- * equals that round's label value; task 0 increments it after publishing the
- * completed output. */
+/* Nonzero when the counter equals the contract's label value. */
 int rsx_image4_mlaa_counter_ready(
     const rsx_image4_mlaa_contract* contract, uint32_t counter_value);
 
-/* Allocation-free admission state machine. Callers provide synchronization.
- * Once the first exact signal is consumed, an inconsistent later signal is a
- * conflict rather than a partial fallback: some SPURS work has already been
- * replaced and mixing execution would violate the task barrier contract. */
+/* Allocation-free round state machine. Callers provide synchronization.
+ * Once the first matching signal is consumed, an inconsistent later signal is
+ * a conflict rather than a partial fallback, since mixing the two execution
+ * paths would break the five-task barrier. */
 void rsx_image4_mlaa_round_init(rsx_image4_mlaa_round* round, int enabled);
 void rsx_image4_mlaa_round_reset(rsx_image4_mlaa_round* round);
 rsx_image4_mlaa_offer_result rsx_image4_mlaa_round_offer(
     rsx_image4_mlaa_round* round, uint32_t generation,
     const rsx_image4_mlaa_contract* contract, uint32_t spu_id);
 /* Return nonzero when an invalid later wake belongs to a round whose first
- * wake was already consumed. Such a round must fail closed; falling only the
- * later task back to SPURS would strand the five-task EDGE barrier. */
+ * wake was already consumed; such a round must be abandoned as a whole. */
 int rsx_image4_mlaa_round_reject(
     rsx_image4_mlaa_round* round, uint32_t generation);
 int rsx_image4_mlaa_round_claim(

@@ -106,17 +106,6 @@ rsx_image4_mlaa_reject rsx_image4_mlaa_validate(
     return RSX_IMAGE4_MLAA_ACCEPT;
 }
 
-const char* rsx_image4_mlaa_reject_name(rsx_image4_mlaa_reject reject)
-{
-    static const char* const names[] = {
-        "accept", "argument", "record", "task-id", "task-count",
-        "shape", "mode", "threshold", "image", "sync",
-        "publication", "reserved"
-    };
-    return (unsigned)reject < sizeof(names) / sizeof(names[0])
-        ? names[reject] : "unknown";
-}
-
 int rsx_image4_mlaa_image_matches(const rsx_image4_mlaa_image* image)
 {
     return image &&

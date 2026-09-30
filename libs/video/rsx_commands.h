@@ -5,24 +5,23 @@
  * rendering commands through a ring buffer. Games write NV47xx method
  * calls to this buffer via cellGcm, and the RSX processes them.
  *
- * In recompilation, we intercept the command buffer and translate
- * NV47xx methods to the host graphics API (D3D12 on Windows, Vulkan
- * on Linux/macOS).
+ * In recompilation, the command buffer is intercepted and NV47xx methods
+ * are decoded into rsx_state, with clear and draw forwarded to a registered
+ * rsx_backend.
  *
  * Architecture:
- *   Game code → cellGcmSys (state tracking) → command buffer → RSX processor
- *                                                                  ↓
+ *   Game code -> cellGcmSys (state tracking) -> command buffer -> RSX processor
+ *                                                                  |
+ *                                                                  v
  *                                                          Host GPU backend
  *
- * Reference: NV47xx method registers documented in envytools/rnndb
- * and RPCS3's RSX module (rpcs3/Emu/RSX/).
+ * Reference: NV47xx method registers documented in envytools/rnndb.
  */
 
 #ifndef PS3RECOMP_RSX_COMMANDS_H
 #define PS3RECOMP_RSX_COMMANDS_H
 
 #include "ps3emu/ps3types.h"
-#include "ps3emu/error_codes.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -68,26 +67,22 @@ extern "C" {
 #define NV4097_SET_ZSTENCIL_CLEAR_VALUE        0x00001D8C
 #define NV4097_CLEAR_SURFACE                   0x00001D94
 
-/* Reports / ZCULL — writes land in guest memory (unlike most of this file's
+/* Reports / ZCULL: writes land in guest memory (unlike most of this file's
  * other state-tracking methods), at the location selected by
- * NV4097_SET_CONTEXT_DMA_REPORT. Method addresses + DMA context ids per
- * RPCS3 (semantics-only oracle): Emu/RSX/gcm_enums.h:549 (0x1a8), :664
- * (0x17c8), :666 (0x1800); Emu/RSX/NV47/HW/nv4097.cpp:577-623
- * (get_report/clear_report_value); record layout = CellGcmReportData
+ * NV4097_SET_CONTEXT_DMA_REPORT. The record layout is CellGcmReportData
  * (libs/video/cellGcmSys.h). */
 #define NV4097_SET_CONTEXT_DMA_REPORT           0x000001A8
 #define NV4097_CLEAR_REPORT_VALUE               0x000017C8
 #define NV4097_GET_REPORT                       0x00001800
 
-/* context_dma_report values this register can carry (gcm_enums.h:496-499,
- * 518-519, 1828-1843). LOCAL/FRAME_BUFFER classes select the local report
- * area; MAIN/HOST_BUFFER classes select io-mapped main memory. */
+/* context_dma_report values this register can carry. LOCAL/FRAME_BUFFER
+ * classes select the local report area; MAIN/HOST_BUFFER classes select
+ * io-mapped main memory. */
 #define RSX_DMA_REPORT_LOCATION_LOCAL           0x66626660u
 #define RSX_DMA_REPORT_LOCATION_MAIN            0xBAD68000u
 #define RSX_DMA_MEMORY_FRAME_BUFFER             0xFEED0000u /* local, generic alias */
 #define RSX_DMA_MEMORY_HOST_BUFFER              0xFEED0001u /* main, generic alias */
-/* RPCS3's register file resets NV4097_SET_CONTEXT_DMA_REPORT to LOCAL before
- * any FIFO command runs (rsx_methods.cpp:173,811) — match that default so
+/* NV4097_SET_CONTEXT_DMA_REPORT is LOCAL before any FIFO command runs, so
  * NV4097_GET_REPORT works even if a game never issues an explicit
  * NV4097_SET_CONTEXT_DMA_REPORT. */
 #define RSX_DMA_REPORT_DEFAULT                  RSX_DMA_REPORT_LOCATION_LOCAL
@@ -95,13 +90,9 @@ extern "C" {
 /* Guest-memory window this module writes local-area reports into. This
  * generic FIFO-method processor has no io-map table of its own (that lives
  * in yakuza/import_overrides.cpp, out of scope here), so it owns a small,
- * independent guest window sized to match the real report region.
- * 2026-08-05 item-K fix 10: the window was 0x1000 (256 slots), silently
- * dropping every GET_REPORT at offset >= 0x1000 -- the contract allows 2048
- * local report slots x 16-byte CellGcmReportData = 0x8000
- * (ORACLE(SDK cell/gcm/gcm_enum.h:554
- * CELL_GCM_INDEX_RANGE_REPORT_LOCAL_COUNT=2048); the 2026-08-04 audit noted
- * the title already reads at offset 0xFE0, one slot below the old cliff).
+ * independent guest window sized to match the real report region: 2048
+ * local report slots (CELL_GCM_INDEX_RANGE_REPORT_LOCAL_COUNT) x 16-byte
+ * CellGcmReportData = 0x8000.
  * The RSX context reports allocation contains labels/semaphores first,
  * notify slots at +0x1000, and the hardware report array at +0x1400.
  * Therefore a GET_REPORT offset is relative to 0x10201400, not the base of
@@ -110,27 +101,13 @@ extern "C" {
 #define RSX_REPORT_AREA_SIZE                    0x8000u
 
 /* NV4097_GET_REPORT's arg packs a report "type" into the top byte and a
- * 24-bit offset in the rest (nv4097.cpp:579-580). type values matching
- * gcm_enums.h:483-487 select a ZCULL/occlusion statistic instead of an
- * ordinary GPU timestamp. */
+ * 24-bit offset in the rest. The type values below select a ZCULL/occlusion
+ * statistic instead of an ordinary GPU timestamp. */
 #define RSX_REPORT_TYPE_ZPASS_PIXEL_CNT          1
 #define RSX_REPORT_TYPE_ZCULL_STATS              2
 #define RSX_REPORT_TYPE_ZCULL_STATS1             3
 #define RSX_REPORT_TYPE_ZCULL_STATS2             4
 #define RSX_REPORT_TYPE_ZCULL_STATS3             5
-
-/* No host occlusion-query accumulator exists yet. The established legacy
- * renderer executes conditional geometry unconditionally, so strict native
- * uses a conservative-visible ZPASS fallback (one visible sample) instead of
- * synthesizing a zero and then suppressing every dependent draw. Other ZCULL
- * statistics remain zero. Keeping this policy explicit lets the generic
- * report model preserve its legacy-shaped zero records. */
-static inline u32 rsx_report_unmodeled_value(u32 type,
-                                             int conservative_visible)
-{
-    return conservative_visible &&
-           type == RSX_REPORT_TYPE_ZPASS_PIXEL_CNT ? 1u : 0u;
-}
 
 /* Draw commands */
 #define NV4097_SET_BEGIN_END                    0x00001808
@@ -208,7 +185,7 @@ static inline u32 rsx_report_unmodeled_value(u32 type,
 #define RSX_PRIMITIVE_POLYGON            10
 
 /* ---------------------------------------------------------------------------
- * RSX State — tracked as methods are processed
+ * RSX State: tracked as methods are processed
  * -----------------------------------------------------------------------*/
 
 #define RSX_MAX_TEXTURES          16
@@ -258,7 +235,7 @@ typedef struct rsx_state {
     u32 color_clear_value;
     u32 zstencil_clear_value;
 
-    /* Report / ZCULL context — selects where NV4097_GET_REPORT writes
+    /* Report / ZCULL context: selects where NV4097_GET_REPORT writes
      * (NV4097_SET_CONTEXT_DMA_REPORT). See RSX_DMA_REPORT_* above. */
     u32 context_dma_report;
 
@@ -283,7 +260,7 @@ typedef struct rsx_state {
     u32 cull_face;
     u32 front_face;
 
-    /* Color mask — bits: [0] B, [8] G, [16] R, [24] A */
+    /* Color mask, bits: [0] B, [8] G, [16] R, [24] A */
     u32 color_mask;
     int color_mask_dirty;
 
@@ -311,12 +288,12 @@ typedef struct rsx_state {
     u32 transform_constant_load;
     int shader_dirty;
 
-    /* Vertex transform constants — written by NV4097_SET_TRANSFORM_CONSTANT.
+    /* Vertex transform constants, written by NV4097_SET_TRANSFORM_CONSTANT.
      * Each constant is a vec4 (4 floats). Games typically place the MVP
      * matrix in the first few slots. Used by the backend as the vertex
      * shader constant buffer when no RSX vertex program is translated. */
     float vertex_constants[RSX_MAX_VERTEX_CONSTANTS][4];
-    /* Lowest and highest slot touched since last reset — used to push only
+    /* Lowest and highest slot touched since last reset; used to push only
      * the dirty range to the host CBV. */
     u32 vertex_constants_lo;
     u32 vertex_constants_hi;
@@ -352,7 +329,8 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data);
 int rsx_process_command_buffer(rsx_state* state, const u32* buf, u32 size);
 
 /* ---------------------------------------------------------------------------
- * Backend callbacks — implemented per-platform (D3D12, Vulkan, null)
+ * Backend callbacks; the only implementation is the null backend
+ * (rsx_null_backend.c)
  * -----------------------------------------------------------------------*/
 
 typedef struct rsx_backend {

@@ -1,28 +1,22 @@
 /*
- * ps3recomp - Track B live NV4097 draw path (LAYER 2 -> live backend)
+ * ps3recomp - live NV4097 draw path
  *
- * The offline capture-replay harness (libs/video/tests/replay_main.c) proved a
- * full NV4097 -> D3D12 draw pipeline: the rsx_dispatch register-file model
+ * A full NV4097 -> D3D12 draw pipeline: the rsx_dispatch register-file model
  * feeds an NV40 VP/FP -> HLSL decompiler and a PSO/sampler/texture engine that
- * renders real geometry into a color surface. This module lifts that engine out
- * of the harness so the LIVE FIFO consumer (yakuza/import_overrides.cpp
- * yz_rsx_method) can drive it with the game's own method stream, rendering into
- * a D3D12 present surface.
+ * renders the game's geometry. The live FIFO consumer (yz_rsx_method in
+ * yakuza/yz_rsx_methods.inc) drives it with the game's own method stream,
+ * rendering into a D3D12 present surface.
  *
  * Data flow (live):
  *   game (t1) writes NV methods to the FIFO ring
- *     -> yz_rsx_method(method, arg)                         [existing hook]
+ *     -> yz_rsx_method(method, arg)                         [FIFO consumer hook]
  *        -> rsx_live_draw_method(method, arg)               [this module]
  *           -> rsx_dispatch_method(...)  (register file + BEGIN/END/DRAW/FLIP)
  *              -> sink callbacks -> D3D12 PSO + draw into the flip surface
  *   flip method (0xE944) -> rsx_live_draw_present(buffer_id) -> Present()
  *
- * The whole path is gated by the YZ_RSX_DRAW env flag (see docs/FLAGS.md): when
- * unset/"0" the live draw engine is inert and the runtime keeps its existing
- * (null / clear-color) present, so this is a pure add-on with a kill switch.
- *
- * Clean-room: method numbers/semantics from envytools rnndb + Mesa nv30 +
- * psdevwiki; RPCS3 consulted only as a read-only fact oracle. No GPL code.
+ * Clean-room: method numbers/semantics from envytools rnndb, Mesa nv30 and
+ * psdevwiki. No GPL code.
  *
  * Windows/D3D12 only; a no-op stub compiles elsewhere.
  */
@@ -35,59 +29,24 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
+/* Caller owns serialization and publication. This entry consumes renderer
+ * state only: external FIFO/guest side effects must be split out by the caller.
+ * A refused group changes nothing and must follow the ordinary method path. */
+struct rsx_state;
+int rsx_live_draw_prepared_packet_supported(u32 header);
+int rsx_live_draw_graphics_packet(u32 header,const u32* arguments,struct rsx_state* protocol);
 
 /* Guest-memory resolver: given an RSX location (0 = RSX local VRAM,
  * 1 = main/IO memory) and a byte offset, return a host pointer to at least
  * `min_bytes` of readable guest memory, or NULL if the region is invalid.
  * The runtime supplies this (it owns the vm_base map + the gcm local carve).
- * The replay harness supplies its own arena-backed version. */
+ */
 typedef const u8* (*rsx_live_guest_ptr_fn)(void* user, u32 location, u32 offset,
                                            u32 min_bytes);
-struct rsx_nir_pipeline;
-struct rsx_nir_clear;
-struct rsx_dispatch;
 
-typedef struct rsx_live_draw_dispatch_diff {
-    u32 mask;
-    u32 first_reg;
-    u32 first_vp_word;
-    u32 first_constant_word;
-} rsx_live_draw_dispatch_diff;
+int rsx_live_draw_set_early_geometry_cache(int enabled);
 
-typedef struct rsx_live_draw_timeline_state {
-    u64 recording_fence;
-    u64 completed_fence;
-    u64 oldest_incomplete_fence;
-    u64 allocator_waits;
-    u64 allocator_wait_ticks;
-    u32 allocator_slot;
-} rsx_live_draw_timeline_state;
-
-/* Default-off Hana shadow-resource oracle context.  The vertical section
- * scanner supplies this only for the exact two-map consumer family.  The live
- * renderer owns the bounded GPU readback and emits the first occurrence once
- * at shutdown, so ordinary draws pay no diagnostic work. */
-typedef struct rsx_live_draw_shadow_oracle_context {
-    u64 section_identity;
-    u64 section_generation;
-    u32 native_owner;
-    u32 fragment_location;
-    u32 fragment_offset;
-    u32 texture_unit[2];
-    u32 texture_location[2];
-    u32 texture_offset[2];
-    u32 texture_format[2];
-    u32 texture_width[2];
-    u32 texture_height[2];
-    u32 texture_pitch[2];
-    u32 texture_wrap[2];
-    u32 texture_remap[2];
-    u32 texture_filter[2];
-    u32 texture_control0[2];
-    u32 texture_border_color[2];
-} rsx_live_draw_shadow_oracle_context;
-
-/* Whether the live draw path is enabled this run (reads YZ_RSX_DRAW once).
+/* Whether the live draw path is available (always on Windows).
  * Cheap; safe to call from the hot method hook. */
 int  rsx_live_draw_enabled(void);
 
@@ -104,11 +63,6 @@ void rsx_live_draw_seed_registers(const u32* regs, u32 count);
 void rsx_live_draw_seed_transform_program(const u32* words, u32 count);
 void rsx_live_draw_seed_transform_constants(const u32* words, u32 count);
 
-/* Join a late-starting shadow decoder to the exact architectural state of
- * the established live renderer.  The destination retains its own callbacks,
- * classifications, and coverage counters. Returns zero on success. */
-int rsx_live_draw_sync_dispatch_state(struct rsx_dispatch* shadow);
-
 /* Register a scanout buffer from sys_rsx_context_attribute(0x104). A flip's
  * argument indexes this table; it is not necessarily the current render
  * target when the frame is submitted. */
@@ -118,119 +72,8 @@ void rsx_live_draw_set_display_buffer(u32 buffer_id, u32 location, u32 offset,
 /* Feed one NV method write. No-op when disabled or uninitialized. */
 void rsx_live_draw_method(u32 method, u32 arg);
 
-/* Update only the dormant legacy register/BEGIN-END state after a complete
- * transactional native section commits. Execution callbacks are suppressed,
- * so this can never clear, draw, transfer, or present a second time. */
-void rsx_live_draw_mirror_state_method(u32 method, u32 arg);
-
-/* Native-render flip-family bridge.  This deliberately re-enters the
- * existing E944 dispatch path so movie handoff, renderer serialization,
- * presentation counters, and swap-chain behavior stay identical while the
- * typed backend owns the action's ordering. */
-void rsx_live_draw_native_present(u32 buffer_id);
-
-/* Producer-boundary typed flip action. Runs sink_flip directly under the
- * same movie/debug serialization as a FIFO E944 method, but does not route
- * through rsx_dispatch_method or decode a legacy packet. */
-void rsx_live_draw_typed_present(u32 buffer_id);
-
-/* Borrow the initialized live D3D12 device for the default-off vertical
- * backend. The pointer remains owned by rsx_live_draw and is NULL until the
- * window/device is ready. A native queue may submit on this same device.
- * present_external copies a fully retired native RENDER_TARGET resource into
- * the existing swap chain, restores its state, and records the normal QPC
- * present sample without routing through rsx_dispatch or the legacy sink. */
-void* rsx_live_draw_get_d3d12_device(void);
-int rsx_live_draw_present_external(void* texture, u32 dxgi_format,
-                                   u32 width, u32 height, u32 buffer_id);
-
-/* Shared content-addressed D3D shader/PSO cache for live renderers.  Shader
- * identity is the exact generated source, stage, and compiler flags; the
- * returned ID3DBlob is opaque here and carries one caller-owned COM ref.
- * Driver PSO blobs are additionally keyed by the complete native PSO key and
- * both compiled shader bytecode hashes.  A stale/driver-incompatible PSO blob
- * is safe to reject and rebuild through the caller's ordinary D3D12 path. */
-void* rsx_live_draw_compile_cached_shader(
-    u32 stage, const char* source, u32 source_length, u32 compiler_flags,
-    int* cache_hit, int* compiled);
-int rsx_live_draw_load_cached_pso(
-    u64 pso_key, u64 vertex_bytecode_hash, u64 pixel_bytecode_hash,
-    void** data, u32* size);
-int rsx_live_draw_store_cached_pso(
-    u64 pso_key, u64 vertex_bytecode_hash, u64 pixel_bytecode_hash,
-    const void* data, u32 size);
-void rsx_live_draw_free_cached_pso(void* data);
-
-/* Ordered native/legacy recording broker.  acquire() excludes the host movie
- * producer until release() and returns the live DIRECT list plus the exact
- * generation/fence values governing native upload and mirror lifetimes.
- * timeline_flush() is the only operation which may retire that borrowed
- * generation.  present_shared() records the scanout copy on the same list and
- * performs the ordinary synchronous present retirement. */
-int rsx_live_draw_timeline_acquire(
-    void** command_list, u64* generation, u64* recording_fence,
-    u64* completed_fence);
-int rsx_live_draw_timeline_acquire_full_native(
-    void** command_list, u64* generation, u64* recording_fence,
-    u64* completed_fence);
-void rsx_live_draw_timeline_release(void);
-int rsx_live_draw_timeline_flush(void);
-int rsx_live_draw_timeline_flush_full_native(void);
-int rsx_live_draw_present_shared(void* texture, u32 dxgi_format,
-                                 u32 width, u32 height, u32 buffer_id);
-int rsx_live_draw_present_shared_full_native(
-    void* texture, u32 dxgi_format, u32 width, u32 height, u32 buffer_id);
-void rsx_live_draw_set_benchmark_invariants(
-    u64 methods, u64 draws, u64 game_updates, u64 image4_rounds);
-int rsx_live_draw_get_timeline_state(
-    rsx_live_draw_timeline_state* state);
-
-/* Shared-resource broker for the vertical renderer. Returned resources carry
- * one COM reference owned by the caller and are left in RENDER_TARGET or
- * DEPTH_WRITE state. This preserves framebuffer history when ordered native
- * and legacy actions alternate; it does not invoke the legacy decoder. */
-int rsx_live_draw_borrow_color(u32 location, u32 offset, u32 width,
-                               u32 height, int create, void** resource,
-                               u32* dxgi_format, u32* resource_width,
-                               u32* resource_height);
-int rsx_live_draw_borrow_depth(u32 location, u32 offset, u32 depth_format,
-                               u32 width, u32 height, int create,
-                               void** resource,
-                               u32* resource_format, u32* dsv_format,
-                               u32* srv_format, void** sample_resource,
-                               u32* sample_srv_format,
-                               int* publication_required);
-int rsx_live_draw_resolve_depth_sample(u32 location, u32 offset,
-                                       u32 width, u32 height);
-
-/* Publish the exact Hana shadow consumer that owns the next resolve. The
- * function is a no-op unless YZ_NR_HANA_DEPTH_ORACLE was selected at startup. */
-void rsx_live_draw_set_shadow_oracle_context(
-    const rsx_live_draw_shadow_oracle_context* context);
-
-/* Native-render clear-family bridge, preserving the original live renderer's
- * state/register ownership and serialization while the typed backend owns the
- * ordered CLEAR action. */
-void rsx_live_draw_native_clear(u32 mask);
-
-/* Native-render draw-family bridge.  Prior BEGIN/batch/state methods have
- * already populated the legacy live renderer; this invokes only its END
- * action after typed ordering/state validation. */
-void rsx_live_draw_native_end(void);
-
-/* Publish the FIFO bounds associated with the next flip method.  The live
- * consumer calls this only for driver-queue methods; ordinary method traffic
- * pays no extra synchronization cost. */
-void rsx_live_draw_set_fifo_position(u32 get, u32 put);
-
-/* Record an NV308A inline-to-memory write that overlaps a registered color
- * surface.  Guest memory changes are deliberately tracked separately from
- * actual D3D render-target mutations. */
-void rsx_live_draw_note_inline_transfer(u32 dma, u32 offset, u32 value);
-
 /* Block until the GPU finishes all queued draws (RSX SET_REFERENCE / sync
- * fence). Mirrors RPCS3 nv406e::set_reference's sync() so REF advances only
- * after the GPU has really caught up. */
+ * fence), so REF advances only after the GPU has really caught up. */
 void rsx_live_draw_flush(void);
 
 /* Present the given display buffer id (called from the flip path). */
@@ -240,102 +83,30 @@ void rsx_live_draw_present(u32 buffer_id);
  * movie can own the window without the guest's draws racing g.list. */
 void rsx_live_draw_set_movie_mode(int on);
 
-/* True only while live gameplay may be owned by the vertical native queue.
- * Host movie playback deliberately suppresses guest rendering; an active
- * terminal interceptor must fall through to that established suppression
- * instead of submitting shared resources from a second queue. */
-int rsx_live_draw_native_actions_allowed(void);
-
-/* True when non-composited host movie ownership intentionally discards guest
- * graphics methods. Shadow/native register models must make the same choice
- * or their first post-movie terminal action will target stale, divergent
- * state. */
-int rsx_live_draw_guest_graphics_suppressed(void);
-
-/* Compare a shadow dispatcher's architectural state with the dormant/live
- * legacy renderer at a transactional section boundary.  The mismatch mask is
- * 1=register file, 2=vertex program, 4=transform constants, 8=BEGIN/control.
- * This is a read-only, allocation-free diagnostic; callers gate it behind a
- * default-off aggregate flag and never invoke it per draw or method. */
-u32 rsx_live_draw_dispatch_contract_mismatch(
-    const struct rsx_dispatch* shadow,
-    rsx_live_draw_dispatch_diff* diff);
-
-/* Validate and publish one typed CLEAR against the exact state owned by the
- * live fallback renderer. The mismatch mask is 1=surface, 2=scissor,
- * 4=value. Commit updates only resource-lifetime metadata after the native
- * queue accepts the clear; it never decodes or executes a legacy method. */
-u32 rsx_live_draw_native_clear_contract_mismatch(
-    const struct rsx_nir_pipeline* state,
-    const struct rsx_nir_clear* clear);
-void rsx_live_draw_native_clear_commit(
-    const struct rsx_nir_pipeline* state,
-    const struct rsx_nir_clear* clear);
-/* Publish the depth-resource side effect of one successfully recorded native
- * draw to the shared legacy resource registry. This is metadata only: it
- * neither decodes nor executes a legacy draw. */
-void rsx_live_draw_native_draw_commit(
-    const struct rsx_nir_pipeline* state);
-
 /* Present a host-decoded RGBA8 frame (w*h*4, row pitch w*4) straight to the
  * swap-chain backbuffer. Call from one thread with movie mode on. */
 void rsx_live_draw_present_rgba(const uint8_t* rgba, u32 w, u32 h);
 
-/* Count of REAL game frames the live-draw engine has presented (the game's own
+/* Count of real game frames the live-draw engine has presented (the game's own
  * 0xE944 flips carrying accumulated draws) -- distinct from the null backend's
- * per-vblank "flips" present count, which keeps ticking even when t1 has stalled
- * and stopped producing. Cheap; safe to poll from the title path. */
+ * per-vblank flip count, which advances every vblank even when the game is not
+ * producing frames. Cheap; safe to poll from the title path. */
 u32  rsx_live_draw_get_frames(void);
 
 /* Monotonic count of draw groups actually submitted by the live renderer.
  * Used by the optional FIFO wait aggregate; no synchronization or reset. */
 u64  rsx_live_draw_get_completed_draws(void);
 
-/* Profile-only access to the host thread that consumes the live FIFO and
- * presents game frames. Returns NULL outside the instrumented sampler build.
- * The opaque handle keeps windows.h out of this public header. */
-void* rsx_live_draw_get_present_thread_handle(void);
-
 /* Draws in the last completed frame (title-bar telemetry). */
 u32  rsx_live_draw_get_last_draws(void);
 
-/* Informational rolling presented FPS for the window title. The benchmark
- * recomputes its selected interval from the preserved raw QPC samples. */
+/* Informational rolling presented FPS for the window title. */
 double rsx_live_draw_get_present_fps(void);
-
-/* End-only persistence hook used by the window-close path. Safe to call more
- * than once; it writes the fixed QPC ring at most once per renderer run. */
-void rsx_live_draw_dump_present_samples(void);
-
-/* Bounded live AUTH diagnostic. The null-backend window starts it from a
- * private WM_APP message immediately before New Game is confirmed. */
-#define RSX_LIVE_DRAW_WM_A010_PROBE (0x8000u + 0x2A0u)
-void rsx_live_draw_a010_probe_begin(void);
-
-/* Supply/clear a010's reconstructed view-projection matrix. The live backend
- * uses it only when a draw's c108..c111 rows are NaNs, preserving finite
- * constant uploads and all rendering outside the scoped AUTH repair. */
-void rsx_live_draw_set_a010_camera_matrix(const float* matrix16);
-int  rsx_live_draw_a010_probe_active(void);
-/* Becomes true after the first real orphanage character mesh has reached the
- * live draw sink. AUTH playback uses this to avoid outrunning asynchronous
- * model submission while the scene is still visually empty. */
-int  rsx_live_draw_a010_world_ready(void);
-
-/* Offline differential-test hook.  Dumps one tracked render surface without
- * changing its state/lifetime contract.  The production title never calls
- * this; capture replay uses it to compare the live backend against the
- * independent replay renderer at the same guest surface boundary. */
-int  rsx_live_draw_debug_dump_surface(u32 location, u32 offset,
-                                      const char* path);
 
 /* Release all D3D12 resources. */
 void rsx_live_draw_shutdown(void);
-/* Emit the default-off fixed-memory submit/fence attribution once without
- * draining or releasing the shared renderer.  Strict-native production
- * teardown uses this because renderer objects intentionally remain alive
- * until process reclamation. */
-void rsx_live_draw_dump_submit_attribution(void);
+int rsx_live_draw_set_geometry_cache(int enabled);
+void rsx_live_draw_dump_geometry_cache(void);
 
 #ifdef __cplusplus
 }

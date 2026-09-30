@@ -15,7 +15,6 @@ extern "C" {
 #endif
 
 /* RSX vertex attribute type values (from NV4097_SET_VERTEX_DATA_ARRAY_FORMAT) */
-#define RSX_VERTEX_TYPE_NONE           0  /* disabled */
 #define RSX_VERTEX_TYPE_S1             1  /* signed normalized 16-bit */
 #define RSX_VERTEX_TYPE_F              2  /* float32 */
 #define RSX_VERTEX_TYPE_SF             3  /* half-float (float16) */
