@@ -9,8 +9,8 @@ The project translates the game's PowerPC PPU code and Cell SPU programs into na
 ## Current Status
 
 <p align="center">
-  <a href="https://www.youtube.com/watch?v=Y3LBx3jeiLc">
-    <img src="https://img.youtube.com/vi/Y3LBx3jeiLc/maxresdefault.jpg" width="600">
+  <a href="https://www.youtube.com/watch?v=ZuF8j5ozNis">
+    <img src="https://img.youtube.com/vi/ZuF8j5ozNis/maxresdefault.jpg" width="600">
   </a>
 </p>
 
@@ -22,9 +22,9 @@ The port currently:
 - Boots without any PS3 firmware, using a native SPURS scheduler, a native gcm/RSX driver layer and native lv2 system calls.
 - Plays the intro movies with audio, reaches the title screen, starts a new game and plays through the opening into gameplay.
 - Renders the game's own RSX command stream through a live Direct3D 12 renderer, with its vertex and fragment programs translated to HLSL.
-- Runs lighter scenes, such as the Continue tutorial, at the game's 30 FPS cap.
+- Runs lighter scenes, such as the indoor gun tutorial in Akiyama's office, at the game's 30 FPS cap.
 
-The main open problem is performance in heavy scenes: the crowded New Game opening runs at roughly 19 to 21 FPS. The game's main PPU thread, the renderer and the lifted SPU work that feeds it each take longer than a 33 ms frame, so no single change reaches 30 FPS.
+The main open problem is performance in heavy scenes: the crowded outdoor New Game opening runs at roughly 20 FPS. Performance improvements are being actively worked on.
 
 ## What you need
 
