@@ -1,0 +1,17 @@
+{
+  "$schema": "https://recomp.fyi/schema/v1.json",
+  "game": "Yakuza: Dead Souls",
+  "wikidata": "Q2423348",
+  "system": "PS3",
+  "type": "recomp",
+  "original": { "region": "USA", "revision": "1.00", "serial": "BLUS30826" },
+  "project": "Yakuza: Dead Souls EX",
+  "status": "in-progress",
+  "targets": ["Windows"],
+  "toolchain": "Ps3recomp",
+  "approach": "Static recompilation of the PPU and SPU code onto a native, firmware-free runtime with a Direct3D 12 renderer",
+  "maintainers": [{ "name": "canersaka", "link": "https://github.com/canersaka" }],
+  "links": [{ "label": "Video", "url": "https://www.youtube.com/watch?v=ZuF8j5ozNis&t=96s" }],
+  "help": ["Renderer performance", "Main-thread performance"],
+  "notes": "Boots without PS3 firmware, plays the intro movie, starts a new game or loads into an autosaved game, and plays into gameplay rendering mostly correctly. Lighter/indoor scenes hold 30 FPS, heavy scenes still run around 20 FPS."
+}
