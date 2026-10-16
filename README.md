@@ -1,3 +1,4 @@
+[![Discord](https://img.shields.io/badge/Discord-Join%20the%20server-5865F2?logo=discord&logoColor=white)](https://discord.gg/99RTacvd3)
 # Yakuza: Dead Souls Recompiled
 
 A work-in-progress native PC port of **Yakuza: Dead Souls**, built by statically recompiling the original PlayStation 3 executable.
