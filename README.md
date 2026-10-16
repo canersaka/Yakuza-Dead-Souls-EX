@@ -1,4 +1,4 @@
-# Yakuza: Dead Souls EX
+# Yakuza: Dead Souls Recompiled
 
 A work-in-progress native PC port of **Yakuza: Dead Souls**, built by statically recompiling the original PlayStation 3 executable.
 
